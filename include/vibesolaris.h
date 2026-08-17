@@ -2,7 +2,7 @@
 #ifndef VIBESOLARIS_H
 #define VIBESOLARIS_H
 
-#define VS_VERSION "0.10.6"
+#define VS_VERSION "0.10.7"
 
 #include <stddef.h>
 
@@ -10,9 +10,8 @@
 #define VS_MAX_PATH 1024
 #define VS_MAX_TEXT (1024*1024)
 #define VS_MAX_TOOL_ROUNDS 64
-#define VS_MAX_PLAN_CONTINUES 8
-#define VS_MAX_TOOL_RECOVERIES 8
-#define VS_MAX_TOOL_RECOVERIES 8
+#define VS_MAX_PLAN_CONTINUES 16
+#define VS_MAX_TOOL_RECOVERIES 12
 #define VS_ACTIVE_TASK_MAX (16U*1024U)
 #define VS_LONG_TASK_CHECKPOINT 16
 #define VS_MAX_HISTORY 48
@@ -247,6 +246,7 @@ void vs_history_add(VSContext *ctx, const char *role, const char *content);
 void vs_history_clear(VSContext *ctx);
 int  vs_write_file(const char *path, const char *text);
 char *vs_run_command(const char *cmd, int *exit_code);
+const char *vs_command_shell_name(void);
 char *vs_chat(VSContext *ctx, const char *user_text);
 char *vs_agent_turn(VSContext *ctx, const char *user_text);
 char *vs_build_system_prompt(const VSContext *ctx);

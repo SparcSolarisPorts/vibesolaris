@@ -26,7 +26,7 @@ static int ascii_contains_ci(const char *s,const char *needle){
     return 0;
 }
 static int execution_intent(const char *s){
-    static const char *k[]={" add "," make "," fix "," edit "," update "," modify "," implement "," build "," create "," write "," change "," run "," test "," debug "," compile "," install "," remove "," replace "," refactor "," convert ",0};
+    static const char *k[]={" add "," make "," fix "," edit "," update "," modify "," implement "," build "," create "," write "," change "," run "," test "," debug "," compile "," install "," remove "," replace "," refactor "," convert "," do all "," do that "," do it "," go ahead "," proceed "," continue "," keep going "," carry on ",0};
     char *q;size_t n;int i;if(!s)return 0;n=strlen(s);q=(char*)malloc(n+3);if(!q)return 0;q[0]=' ';memcpy(q+1,s,n);q[n+1]=' ';q[n+2]=0;
     for(i=0;k[i];i++)if(ascii_contains_ci(q,k[i])){free(q);return 1;}
     free(q);return 0;
@@ -52,8 +52,14 @@ static int false_tool_unavailable_claim(const char *s){
         "re-enable the workspace tool bridge","reenable the workspace tool bridge",
         "re-enable the tool bridge","reenable the tool bridge",
         "workspace tool bridge","tool bridge is broken","tool bridge unavailable",
+        "tool bridge stopped","tool bridge has stopped","bridge stopped returning",
+        "tool stopped returning","tools stopped returning","command results stopped",
+        "no results after","results are not coming back","results are no longer",
         "please restore the tool bridge","provide the command results so i can continue",0
-    };int i;if(!s)return 0;for(i=0;k[i];i++)if(ascii_contains_ci(s,k[i]))return 1;return 0;
+    };int i,toolish,blocked;if(!s)return 0;for(i=0;k[i];i++)if(ascii_contains_ci(s,k[i]))return 1;
+    toolish=ascii_contains_ci(s,"tool")||ascii_contains_ci(s,"command")||ascii_contains_ci(s,"vs_tool")||ascii_contains_ci(s,"tool_result")||ascii_contains_ci(s,"workspace bridge");
+    blocked=ascii_contains_ci(s,"not returning")||ascii_contains_ci(s,"stopped returning")||ascii_contains_ci(s,"no result")||ascii_contains_ci(s,"no results")||ascii_contains_ci(s,"unavailable")||ascii_contains_ci(s,"cannot continue")||ascii_contains_ci(s,"can't continue")||ascii_contains_ci(s,"unable to continue")||ascii_contains_ci(s,"restore")||ascii_contains_ci(s,"re-enable")||ascii_contains_ci(s,"reenable")||ascii_contains_ci(s,"broken");
+    return toolish&&blocked;
 }
 static int should_auto_continue(const char *original,const char *answer){
     if(!execution_intent(original)||!prospective_language(answer))return 0;
@@ -66,7 +72,7 @@ static char *strip_marker(const char *s,const char *marker){
 
 static char *continuation_prompt(const char *task,const char *result,int planning_only){
     const char *tail="Continue executing the ACTIVE_TASK autonomously. TOOL_RESULT is ordinary text delivered in this continuation message; there is no separate hidden tool-result transport/channel that the user must restore. If COMMAND_RUNNER_STATUS is operational, the local command runner is confirmed working even when COMMAND_EXIT_STATUS is non-zero, the shell reports a syntax error, a compiler fails, or a command times out. Inspect the result, correct the command/problem, and run another command when useful. Do not stop merely to describe what you will do next and do not ask the user to send another prompt just to continue. Use VS_TOOL or VS_MCP directives as needed. Ask the user only if genuinely blocked by task information, credentials, or permission, using [[VS_NEED_USER question=\"YOUR QUESTION\"]]. When the requested task is actually complete, emit [[VS_FINAL]] followed by the concise result. Never combine VS_FINAL with VS_TOOL or VS_MCP in one response; pending executable directives always run first.";
-    const char *lead=planning_only?"AUTONOMY_CONTINUE: the previous response described future work without executing it. Execute the next concrete step now.":"TOOL_RESULT (delivered successfully by the host):";
+    const char *lead=planning_only?"AUTONOMY_CONTINUE: the previous response did not complete the execution protocol. Do not return prose-only status. Either execute the next concrete step with VS_TOOL/VS_MCP, emit VS_NEED_USER for a genuine blocker, or emit VS_FINAL only if the requested work is actually complete.":"TOOL_RESULT (delivered successfully by the host):";
     size_t n=strlen(task?task:"")+strlen(result?result:"")+strlen(lead)+strlen(tail)+192;
     char *o=(char*)malloc(n);
     if(!o)return NULL;
@@ -87,13 +93,14 @@ static char *tool_channel_recovery_prompt(const char *task,const char *last_resu
 
 
 char *vs_agent_turn(VSContext *c,const char *user){
-    char *prompt=dupstr(user),*ans=0,*original=dupstr(user),*task_anchor=0,*last_tool_result=0;int round,plan_continues=0,tool_recoveries=0,command_runner_confirmed=0,actual_tool_seen=0,max_rounds=VS_MAX_TOOL_ROUNDS;
+    char *prompt=dupstr(user),*ans=0,*original=dupstr(user),*task_anchor=0,*last_tool_result=0;int round,plan_continues=0,tool_recoveries=0,command_runner_confirmed=0,actual_tool_seen=0,execution_mode=0,max_rounds=VS_MAX_TOOL_ROUNDS;
     char step[512];
     {const char *mr=getenv("VIBESOLARIS_MAX_AGENT_ROUNDS");if(mr&&*mr){char *ep=0;long v=strtol(mr,&ep,10);if(ep&&*ep==0&&v>=8&&v<=256)max_rounds=(int)v;}}
     if(!prompt||!original){free(prompt);free(original);return dupstr("out of memory");}
     task_anchor=vs_compact_text_limit(original,VS_ACTIVE_TASK_MAX,"active task anchor compacted");
     if(!task_anchor)task_anchor=dupstr(original);
     if(!task_anchor){free(prompt);free(original);return dupstr("out of memory");}
+    execution_mode=execution_intent(original);
     vs_trace_clear(c);
     vs_trace(c,"agent","starting agent turn");
     if(c->mcp_server_count>0){int n=vs_mcp_refresh_all(c,0);snprintf(step,sizeof(step),"MCP catalogue ready: %d tool(s)",n<0?0:n);vs_trace(c,"mcp",step);}
@@ -120,7 +127,7 @@ char *vs_agent_turn(VSContext *c,const char *user){
            VS_TOOL directive.  Only run the independent health-probe path when
            there is NO executable directive waiting in this same response.  If
            there is a directive, execute it and let its real result speak. */
-        if(!tool && !mcp && execution_intent(original) && false_tool_unavailable_claim(ans) && tool_recoveries<VS_MAX_TOOL_RECOVERIES){
+        if(!tool && !mcp && (execution_mode||actual_tool_seen) && false_tool_unavailable_claim(ans) && tool_recoveries<VS_MAX_TOOL_RECOVERIES){
             char *probe=0,*recover=0;int pst=-1;
             tool_recoveries++;
             snprintf(step,sizeof(step),"model claimed tool channel unavailable%s; probing command runner (%d/%d)",actual_tool_seen?" after tool use":" without issuing a tool directive",tool_recoveries,VS_MAX_TOOL_RECOVERIES);vs_trace(c,"tool-health",step);
@@ -157,6 +164,18 @@ char *vs_agent_turn(VSContext *c,const char *user){
             break;
         }
         if(!tool && !mcp){
+            /* Once the user asked for execution, or once this turn has actually
+               used a tool, prose alone is NOT a completion signal.  Requiring
+               VS_FINAL/VS_NEED_USER removes a whole class of model-specific
+               "tool bridge stopped" hallucinations and premature status exits. */
+            if(execution_mode||actual_tool_seen){
+                plan_continues++;
+                snprintf(step,sizeof(step),"execution turn returned no directive/final marker; automatically continuing (%d, bounded by overall %d-round ceiling)",plan_continues,max_rounds);vs_trace(c,"auto-continue",step);
+                vs_history_add(c,"user",prompt);vs_history_add(c,"assistant",ans);
+                next=continuation_prompt(task_anchor,last_tool_result,1);
+                free(prompt);prompt=next;if(!prompt){vs_trace(c,"memory-error","could not allocate autonomy continuation prompt");break;}
+                continue;
+            }
             if(plan_continues<VS_MAX_PLAN_CONTINUES && should_auto_continue(original,ans)){
                 plan_continues++;
                 snprintf(step,sizeof(step),"planning-only response detected; automatically continuing (%d/%d)",plan_continues,VS_MAX_PLAN_CONTINUES);vs_trace(c,"auto-continue",step);
@@ -165,11 +184,12 @@ char *vs_agent_turn(VSContext *c,const char *user){
                 free(prompt);prompt=next;if(!prompt){vs_trace(c,"memory-error","could not allocate autonomy continuation prompt");break;}
                 continue;
             }
-            vs_history_add(c,"user",prompt);vs_history_add(c,"assistant",ans);vs_trace(c,"agent","completed without further tool calls");break;
+            vs_history_add(c,"user",prompt);vs_history_add(c,"assistant",ans);vs_trace(c,"agent","completed informational turn without tool work");break;
         }
 
         plan_continues=0;
         actual_tool_seen=1;
+        execution_mode=1;
         if(mcp && (!tool || mcp<tool)){
             char *server=attr(mcp,"server"),*name=attr(mcp,"tool"),*args=attr(mcp,"args");
             if(args)unesc(args);
@@ -190,10 +210,10 @@ char *vs_agent_turn(VSContext *c,const char *user){
             snprintf(step,sizeof(step),"run command %.430s",cmd?cmd:"?");vs_trace(c,"tool-run",step);
             raw=cmd?vs_run_command(cmd,&st):0;
             if(raw){
-                size_t z=strlen(raw)+320;
+                size_t z=strlen(raw)+640;
                 command_runner_confirmed=1;
                 result=(char*)malloc(z);
-                if(result)snprintf(result,z,"TOOL_RESULT_DELIVERED: yes\nCOMMAND_RUNNER_STATUS: operational\nCOMMAND_EXIT_STATUS: %d\nCOMMAND_TOOL_AVAILABLE: yes\nRECOVERY_RULE: A non-zero status, syntax error, compiler error, or timeout is a normal command result. Correct it and continue; do not ask the user to restore VS_TOOL/TOOL_RESULT.\nOUTPUT:\n%s",st,raw);
+                if(result)snprintf(result,z,"TOOL_RESULT_DELIVERED: yes\nCOMMAND_RUNNER_STATUS: operational\nCOMMAND_SHELL: %s\nCOMMAND_EXIT_STATUS: %d\nCOMMAND_TOOL_AVAILABLE: yes\nRECOVERY_RULE: A non-zero status, syntax error, compiler error, or timeout is a normal command result. Correct it and continue; do not ask the user to restore VS_TOOL/TOOL_RESULT.\nOUTPUT:\n%s",vs_command_shell_name(),st,raw);
                 free(raw);
             }else{
                 command_runner_confirmed=0;
@@ -221,7 +241,7 @@ char *vs_agent_turn(VSContext *c,const char *user){
     }
     if(round>=max_rounds){
         snprintf(step,sizeof(step),"maximum autonomous agent rounds reached (%d); local command execution is not disabled and remains available on the next turn",max_rounds);vs_trace(c,"limit",step);
-        if(ans && (strstr(ans,"[[VS_TOOL ")||strstr(ans,"[[VS_MCP "))){free(ans);ans=dupstr("The single-turn autonomous safety ceiling was reached while work was still in progress. Local command execution is still available. For unusually large jobs, raise VIBESOLARIS_MAX_AGENT_ROUNDS (up to 256) and continue from the existing files and conversation state.");}
+        if(execution_mode || (ans && (strstr(ans,"[[VS_TOOL ")||strstr(ans,"[[VS_MCP ")))){free(ans);ans=dupstr("The single-turn autonomous safety ceiling was reached while work was still in progress. Local command execution is still available; the task was not marked complete. For unusually large jobs, raise VIBESOLARIS_MAX_AGENT_ROUNDS (up to 256) and continue from the existing files and conversation state.");}
     }
     free(prompt);free(original);free(task_anchor);free(last_tool_result);return ans;
 }

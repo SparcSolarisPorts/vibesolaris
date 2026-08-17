@@ -1,4 +1,4 @@
-# VibeSolaris 0.10.6
+# VibeSolaris 0.10.7
 
 VibeSolaris is a lightweight local AI coding client intended to run on old and new Unix systems without requiring Electron, Qt, GTK, Java, Node.js, or a browser engine.
 
@@ -1088,6 +1088,13 @@ VibeSolaris 0.10.5 also handles a model that claims the tool bridge is broken **
 
 This prevents a model from confusing *describing a command* with *actually asking VibeSolaris to execute it*. A user prompt is required only when the host probe itself fails or the task truly needs missing information, credentials, destructive-action permission, or an unsafe-to-infer decision.
 
+
+
+## 0.10.7 — strict execution lifecycle and Solaris shell hardening
+
+Execution turns no longer end merely because a model returns prose without a tool directive. Once any real tool has been used, this strict execution state remains active for the rest of the turn even when the original user acknowledgement was short or ambiguous. Once the original request is an execution request, or once a tool/MCP call has occurred in the current turn, VibeSolaris requires one of three explicit outcomes on subsequent model rounds: another `VS_TOOL`/`VS_MCP` action, `VS_NEED_USER` for a genuine blocker, or `VS_FINAL` for actual completion. Prose-only status and unsupported claims that the tool bridge stopped returning results are automatically continued instead of being shown as the final answer. Phrases such as `do all that`, `go ahead`, `proceed`, `continue`, `keep going`, and `carry on` are recognised as execution intent.
+
+On Solaris, command execution now prefers `/usr/xpg4/bin/sh` when available because the historical `/bin/sh` is an older Bourne shell. The actual shell path is reported back to the model with every command result. Set `VIBESOLARIS_SHELL=/path/to/sh` to override the shell explicitly. Other systems continue to use `/bin/sh` unless an override is supplied.
 
 ## 0.10.6 — executable directives take precedence over final markers
 

@@ -238,6 +238,19 @@ int vs_write_file(const char *path, const char *text) {
     fclose(f); return 0;
 }
 
+
+const char *vs_command_shell_name(void)
+{
+    const char *e=getenv("VIBESOLARIS_SHELL");
+    if(e&&*e&&access(e,X_OK)==0)return e;
+    /* Solaris /bin/sh is historically a very old Bourne shell.  The XPG4
+       shell is the POSIX-oriented choice and handles agent-generated portable
+       shell syntax much more predictably when present. */
+    if(access("/usr/xpg4/bin/sh",X_OK)==0)return "/usr/xpg4/bin/sh";
+    if(access("/bin/sh",X_OK)==0)return "/bin/sh";
+    return "sh";
+}
+
 char *vs_run_command(const char *cmd, int *exit_code) {
     int fds[2], flags, status=0, child_done=0, eof_seen=0, timed_out=0, detached_output=0;
     pid_t pid;
@@ -250,9 +263,11 @@ char *vs_run_command(const char *cmd, int *exit_code) {
     long timeout_sec=1800;
     time_t started,child_done_at=0;
     const char *te;
+    const char *shell;
 
     if(exit_code)*exit_code=-1;
     if(!cmd||!*cmd)return dupstr("ERROR: empty command");
+    shell=vs_command_shell_name();
     te=getenv("VIBESOLARIS_COMMAND_TIMEOUT");
     if(te&&*te){char *ep=0;long v=strtol(te,&ep,10);if(ep&&*ep==0&&v>=10&&v<=86400)timeout_sec=v;}
 
@@ -271,7 +286,7 @@ char *vs_run_command(const char *cmd, int *exit_code) {
         if(fds[1]>STDERR_FILENO)close(fds[1]);
         devnull=open("/dev/null",O_RDONLY);
         if(devnull>=0){(void)dup2(devnull,STDIN_FILENO);if(devnull>STDERR_FILENO)close(devnull);}
-        execl("/bin/sh","sh","-c",cmd,(char*)0);
+        execl(shell,"sh","-c",cmd,(char*)0);
         _exit(127);
     }
 
