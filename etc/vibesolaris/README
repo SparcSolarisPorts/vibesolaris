@@ -24,7 +24,7 @@ Administrators who deliberately want several users to share the same global
 credentials should grant access through a dedicated OS group/ACL rather than
 making master.key world-readable.
 
-VibeSolaris 0.10.1 autosaves provider selection, per-provider models and API
+VibeSolaris 0.10.2 autosaves provider selection, per-provider models and API
 credentials, protocol URLs, cache setting, and MCP server definitions to
 config.enc whenever those settings change and this directory is writable.
 MCP remote bearer tokens are therefore encrypted at rest with the same system

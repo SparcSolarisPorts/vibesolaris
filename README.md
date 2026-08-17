@@ -1,4 +1,4 @@
-# VibeSolaris 0.10.1
+# VibeSolaris 0.10.2
 
 VibeSolaris is a lightweight local AI coding client intended to run on old and new Unix systems without requiring Electron, Qt, GTK, Java, Node.js, or a browser engine.
 
@@ -591,6 +591,27 @@ Exit:
 /quit
 ```
 
+
+## Autonomous continuation
+
+For execution requests such as fixing code, editing files, building, testing, debugging, or modifying a project, VibeSolaris does not treat a planning-only model response as completion. If a model says that it *will* inspect, edit, build, or test something without actually issuing a local/MCP tool directive, the host automatically sends a continuation instruction and the agent keeps working.
+
+The portable text-agent protocol also recognises two lifecycle markers:
+
+```text
+[[VS_FINAL]]
+```
+
+means the requested work is actually complete.
+
+```text
+[[VS_NEED_USER question="The genuinely blocking question"]]
+```
+
+means execution cannot safely continue without user input. Models are instructed to use this only for real blockers such as missing credentials, destructive-action permission, missing information, or an unavoidable user decision—not merely to ask whether they should proceed.
+
+VibeSolaris still has a finite autonomous-round safety limit so a badly behaved model cannot loop forever. Planning-only retries are separately bounded and are visible in the activity trace as `auto-continue` events.
+
 ## Files, commands, and AGENT.MD
 
 VibeSolaris is an agent, not only a chat client.
@@ -834,7 +855,7 @@ The installation tree uses `/usr/local/bin` for the binaries and `/usr/local/sha
 
 ## Stability on large operations
 
-VibeSolaris 0.10.1 hardens both front ends for long model/tool runs and large data.
+VibeSolaris 0.10.2 hardens both front ends for long model/tool runs and large data.
 
 The X11 GUI runs the agent on a background POSIX worker thread.  Xlib remains on the
 main thread, with live activity delivered over a pipe, so a slow API request, MCP

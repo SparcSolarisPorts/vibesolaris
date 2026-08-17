@@ -2,14 +2,15 @@
 #ifndef VIBESOLARIS_H
 #define VIBESOLARIS_H
 
-#define VS_VERSION "0.10.1"
+#define VS_VERSION "0.10.2"
 
 #include <stddef.h>
 
 #define VS_MAX_ATTACH 16
 #define VS_MAX_PATH 1024
 #define VS_MAX_TEXT (1024*1024)
-#define VS_MAX_TOOL_ROUNDS 8
+#define VS_MAX_TOOL_ROUNDS 16
+#define VS_MAX_PLAN_CONTINUES 4
 #define VS_MAX_HISTORY 48
 #define VS_HISTORY_BUDGET (192*1024)
 #define VS_HISTORY_MESSAGE_MAX (32*1024)
