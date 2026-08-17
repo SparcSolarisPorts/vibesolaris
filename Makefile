@@ -14,6 +14,7 @@ LDFLAGS =
 CURL_LIBS = -lcurl
 CRYPTO_LIBS = -lcrypto
 X11_LIBS = -lX11
+THREAD_LIBS = -lpthread
 
 CORE = src/util.o src/http.o src/config.o src/secure_config.o src/sha256.o src/oauth.o src/mcp.o src/provider.o src/agent.o
 
@@ -23,7 +24,7 @@ vibesolaris: $(CORE) src/tui.o
 	$(CC) $(LDFLAGS) -o vibesolaris $(CORE) src/tui.o $(CURL_LIBS) $(CRYPTO_LIBS)
 
 vibesolaris-gui: $(CORE) src/gui.o
-	$(CC) $(LDFLAGS) -o vibesolaris-gui $(CORE) src/gui.o $(CURL_LIBS) $(CRYPTO_LIBS) $(X11_LIBS)
+	$(CC) $(LDFLAGS) -o vibesolaris-gui $(CORE) src/gui.o $(CURL_LIBS) $(CRYPTO_LIBS) $(X11_LIBS) $(THREAD_LIBS)
 
 src/util.o: src/util.c include/vibesolaris.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c src/util.c -o src/util.o

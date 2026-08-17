@@ -2,7 +2,7 @@
 #ifndef VIBESOLARIS_H
 #define VIBESOLARIS_H
 
-#define VS_VERSION "0.9.5"
+#define VS_VERSION "0.10.1"
 
 #include <stddef.h>
 
@@ -21,6 +21,16 @@
 #define VS_MAX_MCP_TOOLS 64
 #define VS_MCP_SCHEMA_MAX 4096
 #define VS_MAX_TRACE 128
+
+/* Resource guards for long-running/large agent operations.  These are deliberately
+   generous, but finite: a provider, command, or MCP server must not be able to
+   grow the process until the desktop starts swapping or the GUI appears dead. */
+#define VS_MAX_HTTP_RESPONSE (64U*1024U*1024U)
+#define VS_MAX_REQUEST_BODY (96U*1024U*1024U)
+#define VS_MAX_COMMAND_CAPTURE (4U*1024U*1024U)
+#define VS_MAX_TOOL_RESULT (2U*1024U*1024U)
+#define VS_MAX_ATTACHMENT_TEXT (4U*1024U*1024U)
+#define VS_FILE_CACHE_BLOB_MAX (2U*1024U*1024U)
 
 #define VS_GLOBAL_CONFIG_DIR "/etc/vibesolaris"
 #define VS_GLOBAL_CONFIG_FILE "/etc/vibesolaris/config.enc"
@@ -158,6 +168,9 @@ typedef struct {
     int provider_protocols[VS_PROVIDER_SLOT_COUNT];
     VSOAuthConfig oauth;
 
+    int proxy_enabled;
+    char proxy[1024];
+
     VSMcpServer mcp_servers[VS_MAX_MCP_SERVERS];
     int mcp_server_count;
     VSMcpTool mcp_tools[VS_MAX_MCP_TOOLS];
@@ -214,6 +227,8 @@ void vs_set_api_key(VSContext *ctx, const char *key);
 void vs_set_model(VSContext *ctx, const char *model);
 int  vs_persist_settings(VSContext *ctx);
 void vs_set_base_url(VSContext *ctx, const char *url);
+int  vs_set_proxy(VSContext *ctx, const char *value);
+void vs_proxy_redacted(const VSContext *ctx, char *out, size_t cap);
 const char *vs_protocol_name(VSProtocolKind protocol);
 int  vs_provider_supports_protocol(VSProviderKind kind, VSProtocolKind protocol);
 int  vs_attach(VSContext *ctx, const char *path);
@@ -232,9 +247,12 @@ char *vs_agent_turn(VSContext *ctx, const char *user_text);
 char *vs_build_system_prompt(const VSContext *ctx);
 char *vs_http_post(const char *url, const char *headers[], int nheaders, const char *body, long *status);
 char *vs_http_post_capture(const char *url, const char *headers[], int nheaders, const char *body, long *status, char *session_id, size_t session_cap);
+char *vs_http_post_ctx(VSContext *ctx, const char *url, const char *headers[], int nheaders, const char *body, long *status);
+char *vs_http_post_capture_ctx(VSContext *ctx, const char *url, const char *headers[], int nheaders, const char *body, long *status, char *session_id, size_t session_cap);
 char *vs_json_escape(const char *s);
 char *vs_base64_file(const char *path, size_t *out_len);
 char *vs_shell_quote(const char *s);
+char *vs_compact_text_limit(const char *s, size_t limit, const char *reason);
 int  vs_is_image_path(const char *path);
 int  vs_open_url(const char *url);
 unsigned long vs_hash_string(const char *s);

@@ -14,10 +14,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <locale.h>
+#include <limits.h>
+#include <pthread.h>
+#include <fcntl.h>
 
 #define UI_MAX_MESSAGES 128
 #define UI_INPUT_MAX 8192
 #define UI_SIDEBAR_W 228
+#define UI_SIDEBAR_COMPACT_W 188
 #define UI_TOPBAR_H 58
 #define UI_COMPOSER_H 132
 #define UI_ROLE_USER 0
@@ -29,7 +34,19 @@ typedef struct {
     char *text;
     int collapsed;
     char summary[192];
+    unsigned long trace_steps;
+    int trace_models;
+    int trace_tools;
+    int trace_mcps;
+    int trace_errors;
 } UIMessage;
+
+typedef struct {
+    int type; /* 1 trace, 2 done */
+    int step;
+    char kind[24];
+    char detail[512];
+} UIWorkerEvent;
 
 typedef enum {
     MODAL_NONE,
@@ -39,6 +56,7 @@ typedef enum {
     MODAL_MODEL,
     MODAL_KEY,
     MODAL_BASE,
+    MODAL_PROXY,
     MODAL_ACCOUNT,
     MODAL_OAUTH_CONFIG,
     MODAL_OAUTH_EDIT,
@@ -102,6 +120,11 @@ typedef struct {
     XFontStruct *font;
     XFontStruct *bold;
     XFontStruct *small;
+    XFontSet font_set;
+    XFontSet bold_set;
+    XFontSet small_set;
+    XIM xim;
+    XIC xic;
     UIColor c;
     int width;
     int height;
@@ -144,7 +167,17 @@ typedef struct {
     int xdnd_accept;
     int xdnd_hover;
     int xdnd_pending;
+    int live_trace_message;
+    int worker_pipe[2];
+    pthread_t worker_thread;
+    pthread_mutex_t worker_lock;
+    int worker_busy;
+    int worker_started;
+    char *worker_reply;
+    char *worker_user;
 } App;
+
+static void redraw(App *a);
 
 static const char *provider_names[] = {
     "openai", "claude", "gemini", "glm", "glm-coding",
@@ -171,6 +204,7 @@ static char *ui_dup(const char *s)
 
 static int mini(int a, int b) { return a < b ? a : b; }
 static int maxi(int a, int b) { return a > b ? a : b; }
+static int ui_attachment_count(const App *a) { return (a && !a->worker_busy) ? a->ctx.attachment_count : 0; }
 
 static int shortcut_mod(unsigned int state)
 {
@@ -338,15 +372,108 @@ static XFontStruct *load_font(App *a, const char *pattern, const char *fallback)
     return f;
 }
 
+static XFontSet load_font_set(App *a, const char *pattern)
+{
+    char **missing = NULL;
+    int missing_count = 0;
+    char *def = NULL;
+    XFontSet fs;
+    fs = XCreateFontSet(a->dpy, pattern, &missing, &missing_count, &def);
+    if (missing) XFreeStringList(missing);
+    if (!fs && strcmp(pattern, "*")) {
+        missing = NULL; missing_count = 0; def = NULL;
+        fs = XCreateFontSet(a->dpy, "*", &missing, &missing_count, &def);
+        if (missing) XFreeStringList(missing);
+    }
+    return fs;
+}
+
+static int lookup_utf8(App *a, XKeyEvent *ke, char *buf, int cap, KeySym *ks)
+{
+    int n;
+    if (!buf || cap < 2) return 0;
+    buf[0] = 0;
+    if (a->xic) {
+        Status st;
+#ifdef X_HAVE_UTF8_STRING
+        n = Xutf8LookupString(a->xic, ke, buf, cap - 1, ks, &st);
+#else
+        n = XmbLookupString(a->xic, ke, buf, cap - 1, ks, &st);
+#endif
+        if (st == XBufferOverflow) return 0;
+        if (n < 0) n = 0;
+        if (n >= cap) n = cap - 1;
+        buf[n] = 0;
+        return n;
+    }
+    n = XLookupString(ke, buf, cap - 1, ks, 0);
+    if (n < 0) n = 0;
+    if (n >= cap) n = cap - 1;
+    buf[n] = 0;
+    return n;
+}
+
 static void set_font(App *a, XFontStruct *f)
 {
     if (f) XSetFont(a->dpy, a->gc, f->fid);
 }
 
-static int text_w(XFontStruct *f, const char *s)
+static XFontSet font_set_for(App *a, XFontStruct *f)
+{
+    if (!a) return (XFontSet)0;
+    if (f == a->bold) return a->bold_set;
+    if (f == a->small) return a->small_set;
+    return a->font_set;
+}
+
+static int utf8_cont(unsigned char c)
+{
+    return (c & 0xc0U) == 0x80U;
+}
+
+static size_t utf8_prev(const char *s, size_t pos)
+{
+    if (!s || pos == 0) return 0;
+    pos--;
+    while (pos > 0 && utf8_cont((unsigned char)s[pos])) pos--;
+    return pos;
+}
+
+static size_t utf8_next(const char *s, size_t len, size_t pos)
+{
+    if (!s || pos >= len) return len;
+    pos++;
+    while (pos < len && utf8_cont((unsigned char)s[pos])) pos++;
+    return pos;
+}
+
+static size_t utf8_floor(const char *s, size_t len, size_t pos)
+{
+    if (!s) return 0;
+    if (pos > len) pos = len;
+    while (pos > 0 && pos < len && utf8_cont((unsigned char)s[pos])) pos--;
+    return pos;
+}
+
+static int text_width_n(App *a, XFontStruct *f, const char *s, size_t n)
+{
+    XFontSet fs;
+    if (!s || n == 0) return 0;
+    fs = font_set_for(a, f);
+    if (fs) {
+#ifdef X_HAVE_UTF8_STRING
+        return Xutf8TextEscapement(fs, s, (int)n);
+#else
+        return XmbTextEscapement(fs, s, (int)n);
+#endif
+    }
+    return XTextWidth(f, s, (int)n);
+}
+
+static int text_w(App *a, XFontStruct *f, const char *s)
 {
     if (!s || !*s) return 0;
-    return XTextWidth(f, s, (int)strlen(s));
+    return text_width_n(a, f, s, strlen(s));
 }
 
 static void fill_round(App *a, int x, int y, int w, int h, int r, unsigned long color)
@@ -379,32 +506,41 @@ static void stroke_round(App *a, int x, int y, int w, int h, int r, unsigned lon
 
 static void draw_text(App *a, XFontStruct *f, unsigned long color, int x, int y, const char *s)
 {
+    XFontSet fs;
     if (!s) return;
-    set_font(a, f);
     XSetForeground(a->dpy, a->gc, color);
-    XDrawString(a->dpy, a->canvas, a->gc, x, y, s, (int)strlen(s));
+    fs = font_set_for(a, f);
+    if (fs) {
+#ifdef X_HAVE_UTF8_STRING
+        Xutf8DrawString(a->dpy, a->canvas, fs, a->gc, x, y, s, (int)strlen(s));
+#else
+        XmbDrawString(a->dpy, a->canvas, fs, a->gc, x, y, s, (int)strlen(s));
+#endif
+    } else {
+        set_font(a, f);
+        XDrawString(a->dpy, a->canvas, a->gc, x, y, s, (int)strlen(s));
+    }
 }
 
 static void draw_ellipsis(App *a, XFontStruct *f, unsigned long color, int x, int y, int maxw, const char *s)
 {
     char b[512];
-    int n;
+    size_t n;
     if (!s) s = "";
-    if (text_w(f, s) <= maxw) {
+    if (text_w(a, f, s) <= maxw) {
         draw_text(a, f, color, x, y, s);
         return;
     }
-    n = (int)strlen(s);
-    if (n > (int)sizeof(b) - 4) n = (int)sizeof(b) - 4;
-    memcpy(b, s, (size_t)n);
+    n = strlen(s);
+    if (n > sizeof(b) - 4) n = utf8_floor(s, strlen(s), sizeof(b) - 4);
+    memcpy(b, s, n);
     b[n] = 0;
-    while (n > 1) {
-        b[n - 1] = 0;
-        n--;
-        if (n + 3 < (int)sizeof(b)) {
-            b[n] = '.'; b[n + 1] = '.'; b[n + 2] = '.'; b[n + 3] = 0;
-        }
-        if (text_w(f, b) <= maxw) break;
+    while (n > 0) {
+        size_t p = utf8_prev(b, n);
+        n = p;
+        b[n] = '.'; b[n + 1] = '.'; b[n + 2] = '.'; b[n + 3] = 0;
+        if (text_w(a, f, b) <= maxw) break;
+        b[n] = 0;
     }
     draw_text(a, f, color, x, y, b);
 }
@@ -446,9 +582,10 @@ static void draw_caret(App *a, int x, int baseline)
     XDrawLine(a->dpy, a->canvas, a->gc, x, baseline - 14, x, baseline + 3);
 }
 
-static int wrap_line(XFontStruct *f, const char *p, int maxw, char *out, int cap, const char **next)
+static int wrap_line(App *a, XFontStruct *f, const char *p, int maxw, char *out, int cap, const char **next)
 {
-    int i, last_space, use, width;
+    size_t i, j, last_space, use, plen;
+    int width;
     if (!p || !*p) {
         out[0] = 0;
         *next = p;
@@ -459,39 +596,41 @@ static int wrap_line(XFontStruct *f, const char *p, int maxw, char *out, int cap
         *next = p + 1;
         return 1;
     }
+    plen = strlen(p);
     i = 0;
-    last_space = -1;
-    while (p[i] && p[i] != '\n' && i < cap - 1) {
-        out[i] = p[i];
-        out[i + 1] = 0;
-        if (p[i] == ' ' || p[i] == '\t') last_space = i;
-        width = XTextWidth(f, out, i + 1);
+    last_space = (size_t)-1;
+    while (i < plen && p[i] != '\n') {
+        j = utf8_next(p, plen, i);
+        if (j >= (size_t)cap) break;
+        if (p[i] == ' ' || p[i] == '	') last_space = i;
+        width = text_width_n(a, f, p, j);
         if (width > maxw) break;
-        i++;
+        i = j;
     }
-    if (p[i] == '\n') {
+    if (i < plen && p[i] == '\n') {
         use = i;
         *next = p + i + 1;
-    } else if (!p[i]) {
+    } else if (i >= plen) {
         use = i;
         *next = p + i;
-    } else if (i >= cap - 1) {
-        use = i;
-        *next = p + i;
-    } else {
-        if (last_space > 0) use = last_space;
-        else use = maxi(1, i);
+    } else if (i >= (size_t)cap - 1) {
+        use = utf8_floor(p, plen, (size_t)cap - 1);
+        if (!use) use = utf8_next(p, plen, 0);
         *next = p + use;
-        while (**next == ' ' || **next == '\t') (*next)++;
+    } else {
+        if (last_space != (size_t)-1 && last_space > 0) use = last_space;
+        else use = i > 0 ? i : utf8_next(p, plen, 0);
+        *next = p + use;
+        while (**next == ' ' || **next == '	') (*next)++;
     }
-    while (use > 0 && (p[use - 1] == ' ' || p[use - 1] == '\t')) use--;
-    if (use >= cap) use = cap - 1;
-    memcpy(out, p, (size_t)use);
+    while (use > 0 && (p[use - 1] == ' ' || p[use - 1] == '	')) use--;
+    if (use >= (size_t)cap) use = utf8_floor(p, plen, (size_t)cap - 1);
+    memcpy(out, p, use);
     out[use] = 0;
     return 1;
 }
 
-static int wrapped_height(XFontStruct *f, const char *s, int maxw, int lineh)
+static int wrapped_height(App *a, XFontStruct *f, const char *s, int maxw, int lineh)
 {
     const char *p, *n;
     char line[2048];
@@ -500,7 +639,7 @@ static int wrapped_height(XFontStruct *f, const char *s, int maxw, int lineh)
     p = s;
     lines = 0;
     while (*p) {
-        if (!wrap_line(f, p, maxw, line, sizeof(line), &n)) break;
+        if (!wrap_line(a, f, p, maxw, line, sizeof(line), &n)) break;
         lines++;
         if (n == p) break;
         p = n;
@@ -518,8 +657,11 @@ static void draw_selection_span(App *a, XFontStruct *f, int x, int baseline,
     a0 = lo > line_off ? lo : line_off;
     a1 = hi < line_off + llen ? hi : line_off + llen;
     if (a1 <= a0) return;
-    x0 = x + XTextWidth(f, line, (int)(a0 - line_off));
-    x1 = x + XTextWidth(f, line, (int)(a1 - line_off));
+    a0 = utf8_floor(line, llen, a0 - line_off) + line_off;
+    a1 = utf8_floor(line, llen, a1 - line_off) + line_off;
+    if (a1 <= a0) return;
+    x0 = x + text_width_n(a, f, line, a0 - line_off);
+    x1 = x + text_width_n(a, f, line, a1 - line_off);
     h = f->ascent + f->descent + 2;
     XSetForeground(a->dpy, a->gc, a->c.selection);
     XFillRectangle(a->dpy, a->canvas, a->gc, x0, baseline - f->ascent - 1,
@@ -538,16 +680,14 @@ static int draw_wrapped_message(App *a, int message_index, XFontStruct *f, unsig
                   selection_bounds(a,&lo,&hi);
     if (!s) s = "";
     p = s; yy = y; total = 0;
-    set_font(a, f);
     if (!*p) return lineh;
     while (*p) {
         size_t off;
-        if (!wrap_line(f, p, maxw, line, sizeof(line), &n)) break;
+        if (!wrap_line(a, f, p, maxw, line, sizeof(line), &n)) break;
         off = (size_t)(p - s);
         if (yy >= clip_top - lineh && yy <= clip_bottom + lineh) {
             if (has_sel) draw_selection_span(a,f,x,yy,line,off,lo,hi);
-            XSetForeground(a->dpy, a->gc, color);
-            XDrawString(a->dpy, a->canvas, a->gc, x, yy, line, (int)strlen(line));
+            draw_text(a, f, color, x, yy, line);
         }
         yy += lineh; total += lineh;
         if (n == p) break;
@@ -591,55 +731,110 @@ static void add_message(App *a, int role, const char *text)
 
 static void trace_summary(const VSContext *c, char *out, size_t cap)
 {
-    int i, models, tools, mcps, errors;
-    unsigned long steps;
-    models = tools = mcps = errors = 0;
-    if (!out || cap == 0) return;
-    if (!c) { snprintf(out, cap, "Activity"); return; }
-    for (i = 0; i < c->trace_count; i++) {
-        const char *k = c->trace[i].kind;
-        if (!strcmp(k, "model-request")) models++;
-        else if (!strcmp(k, "tool-read") || !strcmp(k, "tool-run") || !strcmp(k, "tool-write")) tools++;
-        else if (!strcmp(k, "mcp-call")) mcps++;
-        if (strstr(k, "error")) errors++;
-    }
-    steps = (unsigned long)c->trace_count + c->trace_dropped;
-    if (errors > 0)
-        snprintf(out, cap, "Activity  |  %lu steps  |  %d model  |  %d tool  |  %d MCP  |  %d error%s",
-                 steps, models, tools, mcps, errors, errors == 1 ? "" : "s");
-    else
-        snprintf(out, cap, "Activity  |  %lu steps  |  %d model  |  %d tool  |  %d MCP",
-                 steps, models, tools, mcps);
+    int i, models, tools, mcps, errors; unsigned long steps;
+    models=tools=mcps=errors=0;if(!out||cap==0)return;if(!c){snprintf(out,cap,"Activity");return;}
+    for(i=0;i<c->trace_count;i++){const char *k=c->trace[i].kind;if(!strcmp(k,"model-request"))models++;else if(!strcmp(k,"tool-read")||!strcmp(k,"tool-run")||!strcmp(k,"tool-write")||!strcmp(k,"tool-image"))tools++;else if(!strcmp(k,"mcp-call"))mcps++;if(strstr(k,"error"))errors++;}
+    steps=(unsigned long)c->trace_count+c->trace_dropped;
+    if(errors>0)snprintf(out,cap,"Activity  |  %lu steps  |  %d model  |  %d tool  |  %d MCP  |  %d error%s",steps,models,tools,mcps,errors,errors==1?"":"s");
+    else snprintf(out,cap,"Activity  |  %lu steps  |  %d model  |  %d tool  |  %d MCP",steps,models,tools,mcps);
 }
 
-static void add_trace_message(App *a, const char *text)
+static void trace_summary_message(UIMessage *m)
 {
-    UIMessage *m;
-    add_message(a, UI_ROLE_TRACE, text);
-    if (a->message_count <= 0) return;
-    m = &a->messages[a->message_count - 1];
-    m->collapsed = 1;
-    trace_summary(&a->ctx, m->summary, sizeof(m->summary));
+    if(!m)return;
+    if(m->trace_errors>0)snprintf(m->summary,sizeof(m->summary),"Activity  |  %lu steps  |  %d model  |  %d tool  |  %d MCP  |  %d error%s",m->trace_steps,m->trace_models,m->trace_tools,m->trace_mcps,m->trace_errors,m->trace_errors==1?"":"s");
+    else snprintf(m->summary,sizeof(m->summary),"Activity  |  %lu steps  |  %d model  |  %d tool  |  %d MCP",m->trace_steps,m->trace_models,m->trace_tools,m->trace_mcps);
+}
+
+static int begin_trace_message(App *a)
+{
+    UIMessage *m;add_message(a,UI_ROLE_TRACE,"");if(a->message_count<=0)return -1;m=&a->messages[a->message_count-1];m->collapsed=1;snprintf(m->summary,sizeof(m->summary),"Activity  |  starting...");return a->message_count-1;
+}
+
+static int append_trace_text(UIMessage *m,const char *text)
+{
+    size_t oldn,addn;char *n;if(!m||!text)return -1;oldn=m->text?strlen(m->text):0;addn=strlen(text);
+    /* Bound the GUI copy of a trace.  The core still keeps the most recent
+       VS_MAX_TRACE structured events; this prevents a pathological tool from
+       growing one X11 message forever. */
+    if(oldn>VS_MAX_TOOL_RESULT)return 0;
+    if(addn>VS_MAX_TOOL_RESULT-oldn)addn=VS_MAX_TOOL_RESULT-oldn;
+    n=(char*)realloc(m->text,oldn+addn+1);if(!n)return -1;memcpy(n+oldn,text,addn);n[oldn+addn]=0;m->text=n;return 0;
+}
+
+static int worker_write_event(App *a,const UIWorkerEvent *ev)
+{
+    const char *p=(const char*)ev;size_t left=sizeof(*ev);ssize_t n;
+    if(!a||a->worker_pipe[1]<0)return -1;
+    while(left){n=write(a->worker_pipe[1],p,left);if(n<0){if(errno==EINTR)continue;return -1;}if(n==0)return -1;p+=n;left-=(size_t)n;}return 0;
+}
+
+/* Called on the worker thread.  Never call Xlib or mutate GUI messages here. */
+static void gui_live_trace(void *userdata,int step,const char *kind,const char *detail)
+{
+    App *a=(App*)userdata;UIWorkerEvent ev;if(!a)return;memset(&ev,0,sizeof(ev));ev.type=1;ev.step=step;snprintf(ev.kind,sizeof(ev.kind),"%s",kind?kind:"activity");snprintf(ev.detail,sizeof(ev.detail),"%.510s",detail?detail:"");(void)worker_write_event(a,&ev);
+}
+
+static void *agent_worker_main(void *userdata)
+{
+    App *a=(App*)userdata;char *reply;UIWorkerEvent ev;
+    reply=vs_agent_turn(&a->ctx,a->worker_user?a->worker_user:"");
+    pthread_mutex_lock(&a->worker_lock);a->worker_reply=reply;pthread_mutex_unlock(&a->worker_lock);
+    memset(&ev,0,sizeof(ev));ev.type=2;(void)worker_write_event(a,&ev);return NULL;
+}
+
+static void apply_worker_trace(App *a,const UIWorkerEvent *ev)
+{
+    UIMessage *m;char line[768];const char *k;
+    if(!a||!ev||a->live_trace_message<0||a->live_trace_message>=a->message_count)return;
+    m=&a->messages[a->live_trace_message];k=ev->kind;
+    snprintf(line,sizeof(line),"%d. [%s] %s\n",ev->step,k[0]?k:"activity",ev->detail);(void)append_trace_text(m,line);
+    m->trace_steps=(unsigned long)ev->step;if(!strcmp(k,"model-request"))m->trace_models++;else if(!strcmp(k,"tool-read")||!strcmp(k,"tool-run")||!strcmp(k,"tool-write")||!strcmp(k,"tool-image"))m->trace_tools++;else if(!strcmp(k,"mcp-call"))m->trace_mcps++;if(strstr(k,"error"))m->trace_errors++;
+    trace_summary_message(m);snprintf(a->status,sizeof(a->status),"Activity %d: [%s] %.380s",ev->step,k[0]?k:"activity",ev->detail);a->auto_scroll=1;
+}
+
+static void finish_worker(App *a)
+{
+    char *reply=NULL;int ti=a->live_trace_message;
+    if(!a||!a->worker_started)return;
+    pthread_join(a->worker_thread,NULL);a->worker_started=0;
+    pthread_mutex_lock(&a->worker_lock);reply=a->worker_reply;a->worker_reply=NULL;pthread_mutex_unlock(&a->worker_lock);
+    if(ti>=0&&ti<a->message_count)trace_summary(&a->ctx,a->messages[ti].summary,sizeof(a->messages[ti].summary));
+    vs_set_trace_callback(&a->ctx,NULL,NULL);
+    a->live_trace_message=-1;add_message(a,UI_ROLE_ASSISTANT,reply?reply:"The provider did not return a response.");free(reply);free(a->worker_user);a->worker_user=NULL;
+    vs_clear_attachments(&a->ctx);a->worker_busy=0;a->status[0]=0;a->auto_scroll=1;
+}
+
+static void process_worker_pipe(App *a)
+{
+    UIWorkerEvent ev;ssize_t n;size_t got;
+    for(;;){got=0;while(got<sizeof(ev)){n=read(a->worker_pipe[0],((char*)&ev)+got,sizeof(ev)-got);if(n<0){if(errno==EINTR)continue;if(errno==EAGAIN||errno==EWOULDBLOCK)return;return;}if(n==0)return;got+=(size_t)n;}if(ev.type==1)apply_worker_trace(a,&ev);else if(ev.type==2){finish_worker(a);return;}if(a->worker_pipe[0]<0)return;}
 }
 
 static void remove_attachment(App *a, int idx)
 {
-    int i;
+    int i;if(a&&a->worker_busy)return;
     if (idx < 0 || idx >= a->ctx.attachment_count) return;
     for (i = idx + 1; i < a->ctx.attachment_count; i++)
         a->ctx.attachments[i - 1] = a->ctx.attachments[i];
     a->ctx.attachment_count--;
 }
 
+static int sidebar_compact(const App *a);
+static int sidebar_w(const App *a);
+static int sidebar_y(const App *a, int normal_y);
+static int sidebar_button_h(const App *a);
+
 static int content_x(App *a, int *cw)
 {
-    int mainw, w;
-    mainw = a->width - UI_SIDEBAR_W;
-    w = mainw - 64;
+    int mainw, w, sbw;
+    sbw = sidebar_w(a);
+    mainw = a->width - sbw;
+    w = mainw - (sidebar_compact(a) ? 36 : 64);
     if (w > 780) w = 780;
-    if (w < 420) w = maxi(300, mainw - 28);
+    if (w < 420) w = maxi(300, mainw - 20);
     if (cw) *cw = w;
-    return UI_SIDEBAR_W + (mainw - w) / 2;
+    return sbw + (mainw - w) / 2;
 }
 
 static int trace_body_height(App *a, const UIMessage *m, int cw)
@@ -648,7 +843,7 @@ static int trace_body_height(App *a, const UIMessage *m, int cw)
     if (!m || m->collapsed) return 0;
     w = cw - 70;
     if (w < 120) w = 120;
-    return wrapped_height(a->small, m->text ? m->text : "", w, 18);
+    return wrapped_height(a, a->small, m->text ? m->text : "", w, 18);
 }
 
 static int message_step_height(App *a, int index, int cw)
@@ -659,14 +854,14 @@ static int message_step_height(App *a, int index, int cw)
     m = &a->messages[index];
     maxbubble = (cw * 72) / 100;
     if (m->role == UI_ROLE_USER) {
-        th = wrapped_height(a->font, m->text, maxbubble - 28, 20);
+        th = wrapped_height(a, a->font, m->text, maxbubble - 28, 20);
         return th + 34;
     }
     if (m->role == UI_ROLE_TRACE) {
         th = trace_body_height(a, m, cw);
         return m->collapsed ? 48 : 62 + th;
     }
-    th = wrapped_height(a->font, m->text, cw - 50, 20);
+    th = wrapped_height(a, a->font, m->text, cw - 50, 20);
     return maxi(th + 20, 46) + 18;
 }
 
@@ -678,15 +873,39 @@ static int message_total_height(App *a, int cw)
     return h;
 }
 
+static int sidebar_compact(const App *a)
+{
+    return a && (a->width <= 1100 || a->height <= 800);
+}
+
+static int sidebar_w(const App *a)
+{
+    return sidebar_compact(a) ? UI_SIDEBAR_COMPACT_W : UI_SIDEBAR_W;
+}
+
+static int sidebar_y(const App *a, int normal_y)
+{
+    if (!sidebar_compact(a)) return normal_y;
+    if (normal_y <= 16) return 8;
+    return 8 + ((normal_y - 16) * 76) / 100;
+}
+
+static int sidebar_button_h(const App *a)
+{
+    return sidebar_compact(a) ? 30 : 36;
+}
+
 static void draw_sidebar_button(App *a, int y, const char *label, const char *value, int active)
 {
-    int x, w;
-    x = 14;
-    w = UI_SIDEBAR_W - 28;
-    fill_round(a, x, y, w, 36, 8, active ? a->c.soft : a->c.sidebar);
-    if (active) stroke_round(a, x, y, w, 36, 8, a->c.border);
-    draw_text(a, a->small, a->c.muted, x + 11, y + 14, label);
-    if (value && *value) draw_ellipsis(a, a->font, a->c.text, x + 11, y + 29, w - 22, value);
+    int x, w, h;
+    x = sidebar_compact(a) ? 10 : 14;
+    w = sidebar_w(a) - x * 2;
+    y = sidebar_y(a, y);
+    h = sidebar_button_h(a);
+    fill_round(a, x, y, w, h, 7, active ? a->c.soft : a->c.sidebar);
+    if (active) stroke_round(a, x, y, w, h, 7, a->c.border);
+    draw_text(a, a->small, a->c.muted, x + 9, y + (sidebar_compact(a) ? 11 : 14), label);
+    if (value && *value) draw_ellipsis(a, a->font, a->c.text, x + 9, y + (sidebar_compact(a) ? 25 : 29), w - 18, value);
 }
 
 static int protocol_switchable(const App *a)
@@ -697,93 +916,105 @@ static int protocol_switchable(const App *a)
 
 static void draw_sidebar(App *a)
 {
-    char b[256];
-    int y, cache_title_y, cache_btn_y, project_y, global_btn_y, mcp_btn_y, ti, ty;
+    char b[256], proxyb[512];
+    int y, cache_title_y, cache_btn_y, project_y, global_btn_y, mcp_btn_y, ti, ty, sbw, margin;
     int is_openai = a->ctx.provider.kind == VS_PROVIDER_OPENAI;
+    sbw = sidebar_w(a);
+    margin = sidebar_compact(a) ? 10 : 14;
     XSetForeground(a->dpy, a->gc, a->c.sidebar);
-    XFillRectangle(a->dpy, a->canvas, a->gc, 0, 0, UI_SIDEBAR_W, (unsigned int)a->height);
+    XFillRectangle(a->dpy, a->canvas, a->gc, 0, 0, (unsigned int)sbw, (unsigned int)a->height);
     XSetForeground(a->dpy, a->gc, a->c.border);
-    XDrawLine(a->dpy, a->canvas, a->gc, UI_SIDEBAR_W - 1, 0, UI_SIDEBAR_W - 1, a->height);
+    XDrawLine(a->dpy, a->canvas, a->gc, sbw - 1, 0, sbw - 1, a->height);
 
-    fill_round(a, 14, 16, UI_SIDEBAR_W - 28, 38, 9, a->c.panel);
-    stroke_round(a, 14, 16, UI_SIDEBAR_W - 28, 38, 9, a->c.border);
-    draw_text(a, a->bold, a->c.text, 28, 41, "+  New chat");
+    y = sidebar_y(a, 16);
+    fill_round(a, margin, y, sbw - margin * 2, sidebar_compact(a) ? 32 : 38, 8, a->c.panel);
+    stroke_round(a, margin, y, sbw - margin * 2, sidebar_compact(a) ? 32 : 38, 8, a->c.border);
+    draw_text(a, a->bold, a->c.text, margin + 14, y + (sidebar_compact(a) ? 22 : 25), "+  New chat");
 
-    draw_text(a, a->small, a->c.muted, 18, 82, "CONNECTION");
+    draw_text(a, a->small, a->c.muted, margin + 4, sidebar_y(a,82), "CONNECTION");
     draw_sidebar_button(a, 94, "Provider", a->ctx.provider.name, 1);
     draw_sidebar_button(a, 136, "Model", a->ctx.provider.model, 1);
     draw_sidebar_button(a, 178, "Protocol", vs_protocol_name(a->ctx.provider.protocol), protocol_switchable(a));
     draw_sidebar_button(a, 220, "API URL", a->ctx.provider.base_url, 1);
+    vs_proxy_redacted(&a->ctx,proxyb,sizeof(proxyb));
+    draw_sidebar_button(a, 262, "Proxy", proxyb, 1);
 
-    draw_text(a, a->small, a->c.muted, 18, 274, "AUTHENTICATION");
+    draw_text(a, a->small, a->c.muted, margin + 4, sidebar_y(a,316), "AUTHENTICATION");
     if (is_openai) {
-        draw_sidebar_button(a, 286, "ChatGPT OAuth", oauth_status_label(&a->ctx), 1);
-        draw_sidebar_button(a, 328, "OpenAI API key", a->ctx.provider.api_key[0] ? "Configured" : "Not set", 1);
-        cache_title_y = 382; cache_btn_y = 394; project_y = 530;
+        draw_sidebar_button(a, 328, "ChatGPT OAuth", a->worker_busy ? "In use" : oauth_status_label(&a->ctx), 1);
+        draw_sidebar_button(a, 370, "OpenAI API key", a->ctx.provider.api_key[0] ? "Configured" : "Not set", 1);
+        cache_title_y = 424; cache_btn_y = 436; project_y = 572;
     } else {
         snprintf(b,sizeof(b),"%s API key",a->ctx.provider.name);
-        draw_sidebar_button(a, 286, b, a->ctx.provider.api_key[0] ? "Configured" : "Not set", 1);
-        cache_title_y = 340; cache_btn_y = 352; project_y = 488;
+        draw_sidebar_button(a, 328, b, a->ctx.provider.api_key[0] ? "Configured" : "Not set", 1);
+        cache_title_y = 382; cache_btn_y = 394; project_y = 530;
     }
 
-    draw_text(a, a->small, a->c.muted, 18, cache_title_y, "CACHE");
+    draw_text(a, a->small, a->c.muted, margin + 4, sidebar_y(a,cache_title_y), "CACHE");
     draw_sidebar_button(a, cache_btn_y, "Prompt cache", a->ctx.cache_enabled ? "On" : "Off", 1);
     draw_sidebar_button(a, cache_btn_y + 42, "Cache data", "Clear local cache", 1);
     global_btn_y = cache_btn_y + 84;
     draw_sidebar_button(a, global_btn_y, vs_secure_config_is_per_user() ? "User config" : "System config", vs_global_config_exists() ? "Encrypted config present" : "Encrypted config", 1);
     mcp_btn_y = global_btn_y + 42;
-    snprintf(b,sizeof(b),"%d server(s), %d tool(s)",a->ctx.mcp_server_count,a->ctx.mcp_tool_count);
+    if(a->worker_busy)snprintf(b,sizeof(b),"Agent working...");else snprintf(b,sizeof(b),"%d server(s), %d tool(s)",a->ctx.mcp_server_count,a->ctx.mcp_tool_count);
     draw_sidebar_button(a,mcp_btn_y,"MCP",b,1);
 
-    y = project_y + 42;
-    draw_text(a, a->small, a->c.muted, 18, y, "PROJECT");
-    draw_text(a, a->small, a->c.muted, 18, y + 25, "Working directory");
-    draw_ellipsis(a, a->font, a->c.text, 18, y + 43, UI_SIDEBAR_W - 36, a->ctx.cwd);
-    draw_text(a, a->small, a->c.muted, 18, y + 69, "System");
+    y = sidebar_y(a, project_y + 42);
+    draw_text(a, a->small, a->c.muted, margin + 4, y, "PROJECT");
+    draw_text(a, a->small, a->c.muted, margin + 4, y + 20, "Working directory");
+    draw_ellipsis(a, a->font, a->c.text, margin + 4, y + 36, sbw - (margin + 4) * 2, a->ctx.cwd);
+    draw_text(a, a->small, a->c.muted, margin + 4, y + 56, "System");
     snprintf(b, sizeof(b), "%.90s %.90s / %.60s", a->ctx.os_name, a->ctx.os_release, a->ctx.arch);
-    draw_ellipsis(a, a->font, a->c.text, 18, y + 87, UI_SIDEBAR_W - 36, b);
-    draw_text(a, a->small, a->c.muted, 18, y + 113, "AGENT.MD");
+    draw_ellipsis(a, a->font, a->c.text, margin + 4, y + 72, sbw - (margin + 4) * 2, b);
+    draw_text(a, a->small, a->c.muted, margin + 4, y + 92, "AGENT.MD");
     draw_text(a, a->font, a->ctx.agent_md[0] ? a->c.accent_dark : a->c.muted,
-              18, y + 132, a->ctx.agent_md[0] ? "Loaded" : "Not found");
+              margin + 4, y + 108, a->ctx.agent_md[0] ? "Loaded" : "Not found");
 
-    if (a->height > y + 205) {
-        ty=y+164;draw_text(a,a->small,a->c.muted,18,ty,"ACTIVITY");
+    if (!a->worker_busy && !sidebar_compact(a) && a->height > y + 205) {
+        ty=y+140;draw_text(a,a->small,a->c.muted,margin+4,ty,"ACTIVITY");
         for(ti=maxi(0,a->ctx.trace_count-5);ti<a->ctx.trace_count;ti++){
             ty+=18;snprintf(b,sizeof(b),"%s: %.90s",a->ctx.trace[ti].kind,a->ctx.trace[ti].detail);
-            draw_ellipsis(a,a->small,a->c.text,18,ty,UI_SIDEBAR_W-36,b);
+            draw_ellipsis(a,a->small,a->c.text,margin+4,ty,sbw-(margin+4)*2,b);
         }
     }
-    if (a->height > y + 150) {
-        if(a->ctx.conversation_usage_responses>0)
-            snprintf(b,sizeof(b),"Tokens %lu total",a->ctx.conversation_total_tokens);
-        else
-            snprintf(b,sizeof(b),"Tokens not reported yet");
-        draw_ellipsis(a,a->small,a->c.text,18,a->height-57,UI_SIDEBAR_W-36,b);
-        snprintf(b,sizeof(b),"%lu input / %lu output",a->ctx.conversation_input_tokens,a->ctx.conversation_output_tokens);
-        draw_ellipsis(a,a->small,a->c.muted,18,a->height-39,UI_SIDEBAR_W-36,b);
-        snprintf(b, sizeof(b), "Cache %lu hit / %lu miss", a->ctx.file_cache_hits, a->ctx.file_cache_misses);
-        draw_text(a, a->small, a->c.muted, 18, a->height - 21, b);
+    if (a->height > y + 120) {
+        if(a->worker_busy){
+            snprintf(b,sizeof(b),"Tokens updating...");
+            draw_ellipsis(a,a->small,a->c.text,margin+4,a->height-49,sbw-(margin+4)*2,b);
+            snprintf(b,sizeof(b),"Agent operation in progress");
+            draw_ellipsis(a,a->small,a->c.muted,margin+4,a->height-32,sbw-(margin+4)*2,b);
+            snprintf(b,sizeof(b),"Cache active");
+        } else {
+            if(a->ctx.conversation_usage_responses>0)snprintf(b,sizeof(b),"Tokens %lu total",a->ctx.conversation_total_tokens);else snprintf(b,sizeof(b),"Tokens not reported yet");
+            draw_ellipsis(a,a->small,a->c.text,margin+4,a->height-49,sbw-(margin+4)*2,b);
+            snprintf(b,sizeof(b),"%lu input / %lu output",a->ctx.conversation_input_tokens,a->ctx.conversation_output_tokens);
+            draw_ellipsis(a,a->small,a->c.muted,margin+4,a->height-32,sbw-(margin+4)*2,b);
+            snprintf(b,sizeof(b),"Cache %lu hit / %lu miss",a->ctx.file_cache_hits,a->ctx.file_cache_misses);
+        }
+        draw_ellipsis(a, a->small, a->c.muted, margin+4, a->height - 15, sbw-(margin+4)*2, b);
     }
 }
 
 static void draw_topbar(App *a)
 {
     char b[256],tb[96];
-    int cw, cx, right, token_x, token_right;
+    int cw, cx, right, token_x, token_right, sbw;
+    sbw = sidebar_w(a);
     XSetForeground(a->dpy, a->gc, a->c.panel);
-    XFillRectangle(a->dpy, a->canvas, a->gc, UI_SIDEBAR_W, 0,
-                   (unsigned int)(a->width - UI_SIDEBAR_W), UI_TOPBAR_H);
+    XFillRectangle(a->dpy, a->canvas, a->gc, sbw, 0,
+                   (unsigned int)(a->width - sbw), UI_TOPBAR_H);
     XSetForeground(a->dpy, a->gc, a->c.border);
-    XDrawLine(a->dpy, a->canvas, a->gc, UI_SIDEBAR_W, UI_TOPBAR_H - 1, a->width, UI_TOPBAR_H - 1);
+    XDrawLine(a->dpy, a->canvas, a->gc, sbw, UI_TOPBAR_H - 1, a->width, UI_TOPBAR_H - 1);
     cx = content_x(a, &cw);
     draw_text(a, a->bold, a->c.text, cx, 35, "VibeSolaris");
-    token_x=cx+text_w(a->bold,"VibeSolaris")+14;
-    if(a->ctx.conversation_usage_responses>0)snprintf(tb,sizeof(tb),"%lu tokens",a->ctx.conversation_total_tokens);
+    token_x=cx+text_w(a, a->bold,"VibeSolaris")+14;
+    if(a->worker_busy)snprintf(tb,sizeof(tb),"working...");
+    else if(a->ctx.conversation_usage_responses>0)snprintf(tb,sizeof(tb),"%lu tokens",a->ctx.conversation_total_tokens);
     else snprintf(tb,sizeof(tb),"0 tokens");
     draw_text(a,a->small,a->c.muted,token_x,34,tb);
-    token_right=token_x+text_w(a->small,tb)+18;
+    token_right=token_x+text_w(a, a->small,tb)+18;
     snprintf(b, sizeof(b), "%s  /  %s  /  %s", a->ctx.provider.name, vs_protocol_name(a->ctx.provider.protocol), a->ctx.provider.model);
-    right = cx + cw - text_w(a->small, b);
+    right = cx + cw - text_w(a, a->small, b);
     if (right < token_right) right = token_right;
     draw_ellipsis(a, a->small, a->c.muted, right, 34, cx + cw - right, b);
 }
@@ -792,10 +1023,10 @@ static void draw_empty_state(App *a, int chat_top, int chat_bottom, int cx, int 
 {
     int y, cardw, gap;
     y = chat_top + (chat_bottom - chat_top) / 2 - 86;
-    draw_text(a, a->bold, a->c.text, cx + (cw - text_w(a->bold, "What are you working on?")) / 2,
+    draw_text(a, a->bold, a->c.text, cx + (cw - text_w(a, a->bold, "What are you working on?")) / 2,
               y, "What are you working on?");
     draw_text(a, a->font, a->c.muted,
-              cx + (cw - text_w(a->font, "Ask about code, attach a file, or let the agent work in this directory.")) / 2,
+              cx + (cw - text_w(a, a->font, "Ask about code, attach a file, or let the agent work in this directory.")) / 2,
               y + 28, "Ask about code, attach a file, or let the agent work in this directory.");
     cardw = (cw - 16) / 2;
     gap = 16;
@@ -827,9 +1058,9 @@ static void draw_messages(App *a, int chat_top, int chat_bottom, int cx, int cw)
     maxbubble = (cw * 72) / 100;
     for (i = 0; i < a->message_count; i++) {
         if (a->messages[i].role == UI_ROLE_USER) {
-            th = wrapped_height(a->font, a->messages[i].text, maxbubble - 28, 20);
+            th = wrapped_height(a, a->font, a->messages[i].text, maxbubble - 28, 20);
             if (!strchr(a->messages[i].text, '\n')) {
-                tw = text_w(a->font, a->messages[i].text) + 28;
+                tw = text_w(a, a->font, a->messages[i].text) + 28;
                 bw = mini(maxbubble, maxi(76, tw));
             } else bw = maxbubble;
             bx = cx + cw - bw;
@@ -860,7 +1091,7 @@ static void draw_messages(App *a, int chat_top, int chat_bottom, int cx, int cw)
                 }
             }
         } else {
-            th = wrapped_height(a->font, a->messages[i].text, cw - 50, 20);
+            th = wrapped_height(a, a->font, a->messages[i].text, cw - 50, 20);
             if (y + maxi(th, 26) + 28 >= chat_top && y <= chat_bottom) {
                 fill_round(a, cx, y + 4, 28, 28, 14, a->c.accent);
                 draw_text(a, a->bold, a->c.panel, cx + 9, y + 24, "V");
@@ -888,10 +1119,10 @@ static int draw_attachment_chips(App *a, int x, int y, int maxw)
     char b[128];
     xx = x;
     shown = 0;
-    for (i = 0; i < a->ctx.attachment_count; i++) {
+    for (i = 0; i < ui_attachment_count(a); i++) {
         name = base_name(a->ctx.attachments[i].path);
         snprintf(b, sizeof(b), "%s %s  x", a->ctx.attachments[i].is_image ? "IMG" : "FILE", name);
-        w = text_w(a->small, b) + 18;
+        w = text_w(a, a->small, b) + 18;
         if (w > 210) w = 210;
         if (xx + w > x + maxw) break;
         fill_round(a, xx, y, w, 24, 8, a->c.soft);
@@ -900,8 +1131,8 @@ static int draw_attachment_chips(App *a, int x, int y, int maxw)
         xx += w + 7;
         shown++;
     }
-    if (shown < a->ctx.attachment_count) {
-        snprintf(b, sizeof(b), "+%d", a->ctx.attachment_count - shown);
+    if (shown < ui_attachment_count(a)) {
+        snprintf(b, sizeof(b), "+%d", ui_attachment_count(a) - shown);
         draw_text(a, a->small, a->c.muted, xx, y + 16, b);
     }
     return shown;
@@ -936,7 +1167,7 @@ static void draw_input_text(App *a, int x, int y, int maxw, int max_lines)
     p = a->input; count = 0; stored = 0;
     while (*p && count < 64) {
         size_t off, noff;
-        if (!wrap_line(a->font, p, maxw, line, sizeof(line), &n)) break;
+        if (!wrap_line(a, a->font, p, maxw, line, sizeof(line), &n)) break;
         off = (size_t)(p - a->input); noff = (size_t)(n - a->input);
         if (stored < 8) {
             strcpy(lines[stored], line); offs[stored]=off; nextoffs[stored]=noff; stored++;
@@ -966,13 +1197,13 @@ static void draw_input_text(App *a, int x, int y, int maxw, int max_lines)
         if (!has_sel && !caret_drawn && a->input_cursor >= off && a->input_cursor <= noff) {
             rel = a->input_cursor > off ? a->input_cursor - off : 0;
             if (rel > llen) rel = llen;
-            draw_caret(a,x+XTextWidth(a->font,lines[idx],(int)rel)+1,baseline);
+            draw_caret(a,x+text_width_n(a,a->font,lines[idx],rel)+1,baseline);
             caret_drawn=1;
         }
     }
     if (!has_sel && !caret_drawn && stored>0) {
         idx=stored-1; baseline=y+(mini(count,max_lines)-1)*19;
-        draw_caret(a,x+text_w(a->font,lines[idx])+1,baseline);
+        draw_caret(a,x+text_w(a, a->font,lines[idx])+1,baseline);
     }
 }
 
@@ -986,11 +1217,11 @@ static void draw_composer(App *a, int cx, int cw)
     stroke_round(a, cx, py, cw, ph, 16, a->xdnd_hover ? a->c.accent : a->c.border);
 
     chips_y = py + 9;
-    if (a->ctx.attachment_count > 0) {
+    if (ui_attachment_count(a) > 0) {
         draw_attachment_chips(a, cx + 13, chips_y, cw - 26);
         text_y = py + 51;
     } else text_y = py + 30;
-    draw_input_text(a, cx + 48, text_y, cw - 104, a->ctx.attachment_count ? 1 : 2);
+    draw_input_text(a, cx + 48, text_y, cw - 104, ui_attachment_count(a) ? 1 : 2);
 
     plusx = cx + 25;
     fill_round(a, plusx - 14, py + ph - 34, 28, 28, 14, a->c.soft);
@@ -1005,7 +1236,7 @@ static void draw_composer(App *a, int cx, int cw)
         draw_ellipsis(a, a->small, a->c.muted, cx, a->height - 13, cw, a->status);
     } else {
         snprintf(b, sizeof(b), "Enter send  -  Ctrl/Meta+V paste  -  Ctrl+C copy  -  Ctrl+O attach  -  drag files to attach");
-        draw_text(a, a->small, a->c.muted, cx + (cw - text_w(a->small, b)) / 2,
+        draw_text(a, a->small, a->c.muted, cx + (cw - text_w(a, a->small, b)) / 2,
                   a->height - 13, b);
     }
 }
@@ -1075,8 +1306,8 @@ static void draw_modal(App *a)
     if (a->modal == MODAL_NONE) return;
 
     XSetForeground(a->dpy, a->gc, a->c.overlay);
-    XFillRectangle(a->dpy, a->canvas, a->gc, UI_SIDEBAR_W, UI_TOPBAR_H,
-                   (unsigned int)(a->width - UI_SIDEBAR_W),
+    XFillRectangle(a->dpy, a->canvas, a->gc, sidebar_w(a), UI_TOPBAR_H,
+                   (unsigned int)(a->width - sidebar_w(a)),
                    (unsigned int)(a->height - UI_TOPBAR_H));
     modal_geometry(a, &x, &y, &w, &h);
     fill_round(a, x, y, w, h, 14, a->c.panel);
@@ -1139,19 +1370,19 @@ static void draw_modal(App *a)
                    (!vs_oauth_is_configured(&a->ctx) || !vs_oauth_is_signed_in(&a->ctx)) ? a->c.accent : a->c.soft);
         if (a->oauth_flow.active) {
             draw_text(a, a->bold, a->c.panel,
-                      x + 24 + ((w - 48) - text_w(a->bold, "Waiting for browser callback...")) / 2,
+                      x + 24 + ((w - 48) - text_w(a, a->bold, "Waiting for browser callback...")) / 2,
                       y + 197, "Waiting for browser callback...");
         } else if (!vs_oauth_is_configured(&a->ctx)) {
             draw_text(a, a->bold, a->c.panel,
-                      x + 24 + ((w - 48) - text_w(a->bold, "Configure ChatGPT OAuth")) / 2,
+                      x + 24 + ((w - 48) - text_w(a, a->bold, "Configure ChatGPT OAuth")) / 2,
                       y + 197, "Configure ChatGPT OAuth");
         } else if (vs_oauth_is_signed_in(&a->ctx)) {
             draw_text(a, a->bold, a->c.text,
-                      x + 24 + ((w - 48) - text_w(a->bold, "OAuth session active")) / 2,
+                      x + 24 + ((w - 48) - text_w(a, a->bold, "OAuth session active")) / 2,
                       y + 197, "OAuth session active");
         } else {
             draw_text(a, a->bold, a->c.panel,
-                      x + 24 + ((w - 48) - text_w(a->bold, "Sign in with ChatGPT / OpenAI")) / 2,
+                      x + 24 + ((w - 48) - text_w(a, a->bold, "Sign in with ChatGPT / OpenAI")) / 2,
                       y + 197, "Sign in with ChatGPT / OpenAI");
         }
 
@@ -1235,6 +1466,7 @@ static void draw_modal(App *a)
     else if (a->modal == MODAL_MODEL) { title = "Model"; hint = a->ctx.provider.kind==VS_PROVIDER_DEEPSEEK ? "DeepSeek options: deepseek-v4-pro or deepseek-v4-flash." : "Enter the provider model ID."; }
     else if (a->modal == MODAL_KEY) { title = "API key"; hint = vs_secure_config_is_per_user() ? "Autosaved encrypted in ~/.vibesolaris/config.enc." : "Autosaved encrypted in /etc/vibesolaris/config.enc."; }
     else if (a->modal == MODAL_BASE) { title = "API URL / Base URL"; hint = "Enter a provider base URL or a full request URL; VibeSolaris adds the protocol path when needed."; }
+    else if (a->modal == MODAL_PROXY) { title = "HTTP proxy"; hint = "Enter ip:port or user:pass@ip:port. Enter off to disable the saved proxy."; }
     else if (a->modal == MODAL_OAUTH_EDIT) { title = oauth_field_label(a->oauth_field); hint = "Enter the exact OAuth application value issued for VibeSolaris."; }
     else if (a->modal == MODAL_MCP) { title = "Add MCP server"; hint = "local: NAME|stdio|COMMAND (stdin alias accepted)   remote: NAME|http|URL|TOKEN(optional)"; }
     draw_text(a, a->bold, a->c.text, x + 24, y + 35, title);
@@ -1254,7 +1486,7 @@ static void draw_modal(App *a)
         draw_ellipsis(a,a->font,a->c.text,x+35,y+101,w-70,shown);
         if(a->cursor_visible && !has_sel){
             int caret;cur=a->modal_cursor;if(cur>strlen(shown))cur=strlen(shown);
-            caret=x+35+XTextWidth(a->font,shown,(int)cur)+1;if(caret>x+w-38)caret=x+w-38;
+            caret=x+35+text_width_n(a,a->font,shown,cur)+1;if(caret>x+w-38)caret=x+w-38;
             draw_caret(a,caret,y+101);
         }
     }
@@ -1359,6 +1591,10 @@ static void apply_modal(App *a)
     } else if (a->modal == MODAL_BASE) {
         vs_set_base_url(&a->ctx, a->modal_text);
         strcpy(a->status, "API URL updated for this provider/protocol");
+    } else if (a->modal == MODAL_PROXY) {
+        char pb[512];
+        if(vs_set_proxy(&a->ctx,a->modal_text)==0){vs_proxy_redacted(&a->ctx,pb,sizeof(pb));snprintf(a->status,sizeof(a->status),"Proxy: %.480s",pb);}
+        else strcpy(a->status,"Proxy must be ip:port or user:pass@ip:port");
     } else if (a->modal == MODAL_PROTOCOL) {
         if (vs_set_protocol(&a->ctx, a->protocol_sel ? "anthropic" : "openai") == 0)
             snprintf(a->status, sizeof(a->status), "Protocol set to %s", vs_protocol_name(a->ctx.provider.protocol));
@@ -1410,7 +1646,7 @@ static int insert_edit_text(App *a, SelectionKind kind, const char *text, size_t
     else { buf=a->modal_text;lenp=&a->modal_len;curp=&a->modal_cursor;cap=sizeof(a->modal_text); }
     delete_edit_selection(a,kind);
     len=*lenp;cur=*curp;if(cur>len)cur=len;
-    if(len+n>=cap)n=cap-len-1;
+    if(len+n>=cap){size_t maxn=cap-len-1;n=utf8_floor(text,n,maxn);}
     if(!n)return 0;
     memmove(buf+cur+n,buf+cur,len-cur+1);memcpy(buf+cur,text,n);
     *lenp=len+n;*curp=cur+n;selection_clear(a);return 1;
@@ -1420,7 +1656,7 @@ static int insert_edit_text(App *a, SelectionKind kind, const char *text, size_t
 static int modal_accepts_text(const App *a)
 {
     return a->modal == MODAL_ATTACH || a->modal == MODAL_MODEL || a->modal == MODAL_KEY ||
-           a->modal == MODAL_BASE || a->modal == MODAL_OAUTH_EDIT;
+           a->modal == MODAL_BASE || a->modal == MODAL_PROXY || a->modal == MODAL_OAUTH_EDIT;
 }
 
 static SelectionKind active_edit_target(const App *a)
@@ -1571,6 +1807,7 @@ static int uri_to_path(const char *uri, char *out, size_t cap)
 
 static int attach_dropped_uri_list(App *a, const unsigned char *data, size_t len)
 {
+    if(a && a->worker_busy){snprintf(a->status,sizeof(a->status),"Attachments are locked while the agent is working");return 0;}
     char *copy, *line, *next, path[VS_MAX_PATH];
     int added = 0, skipped = 0;
     struct stat st;
@@ -1702,6 +1939,7 @@ static void handle_xdnd_selection(App *a, XSelectionEvent *se)
 
 static void new_chat(App *a)
 {
+    if(a->worker_busy){snprintf(a->status,sizeof(a->status),"Wait for the current agent operation to finish before starting a new chat");return;}
     free_messages(a);
     vs_history_clear(&a->ctx);
     vs_clear_attachments(&a->ctx);
@@ -1715,71 +1953,25 @@ static void new_chat(App *a)
 
 static void send_message(App *a)
 {
-    char *reply;
-    char *usercopy;
-    if (!a->input_len) return;
-    usercopy = ui_dup(a->input);
-    if (!usercopy) return;
-    add_message(a, UI_ROLE_USER, usercopy);
-    strcpy(a->status, "Working...");
-    redraw(a);
-    XSync(a->dpy, False);
-    reply = vs_agent_turn(&a->ctx, usercopy);
-    {
-        size_t cap, len;
-        char *tr;
-        int i;
-        cap = 1024; len = 0; tr = (char *)malloc(cap);
-        if (tr) {
-            tr[0] = 0;
-            for (i = 0; i < a->ctx.trace_count; i++) {
-                char line[600];
-                size_t n;
-                snprintf(line, sizeof(line), "%d. [%s] %s\n", i + 1,
-                         a->ctx.trace[i].kind, a->ctx.trace[i].detail);
-                n = strlen(line);
-                if (len + n + 1 > cap) {
-                    char *nt;
-                    while (len + n + 1 > cap) cap *= 2;
-                    nt = (char *)realloc(tr, cap);
-                    if (!nt) { free(tr); tr = NULL; break; }
-                    tr = nt;
-                }
-                if (tr) { memcpy(tr + len, line, n); len += n; tr[len] = 0; }
-            }
-            if (tr && a->ctx.trace_dropped) {
-                char line[160];
-                size_t n;
-                snprintf(line, sizeof(line), "... %lu older trace events dropped\n", a->ctx.trace_dropped);
-                n = strlen(line);
-                if (len + n + 1 > cap) {
-                    char *nt;
-                    while (len + n + 1 > cap) cap *= 2;
-                    nt = (char *)realloc(tr, cap);
-                    if (!nt) { free(tr); tr = NULL; }
-                    else tr = nt;
-                }
-                if (tr) { memcpy(tr + len, line, n); len += n; tr[len] = 0; }
-            }
-            if (tr && len) add_trace_message(a, tr);
-            if (tr) free(tr);
-        }
-    }
-    add_message(a, UI_ROLE_ASSISTANT, reply ? reply : "The provider did not return a response.");
-    if (reply) free(reply);
-    free(usercopy);
-    a->input[0] = 0;
-    a->input_len = 0;
-    a->input_cursor = 0;
-    selection_clear(a);
-    vs_clear_attachments(&a->ctx);
-    a->status[0] = 0;
+    char *usercopy;int trace_index,flags;
+    if(a->worker_busy){snprintf(a->status,sizeof(a->status),"Agent is already working; the window remains responsive while it finishes");return;}
+    if(a->worker_pipe[0]<0||a->worker_pipe[1]<0){snprintf(a->status,sizeof(a->status),"Background worker pipe is unavailable");return;}
+    if(!a->input_len)return;
+    usercopy=ui_dup(a->input);if(!usercopy)return;
+    add_message(a,UI_ROLE_USER,usercopy);trace_index=begin_trace_message(a);a->live_trace_message=trace_index;
+    a->worker_user=usercopy;a->worker_reply=NULL;a->worker_busy=1;vs_set_trace_callback(&a->ctx,gui_live_trace,a);strcpy(a->status,"Working...");
+    a->input[0]=0;a->input_len=0;a->input_cursor=0;selection_clear(a);a->auto_scroll=1;redraw(a);XFlush(a->dpy);
+    if(pthread_create(&a->worker_thread,NULL,agent_worker_main,a)!=0){a->worker_busy=0;a->worker_user=NULL;free(usercopy);vs_set_trace_callback(&a->ctx,NULL,NULL);strcpy(a->status,"Could not start background agent worker");return;}
+    a->worker_started=1;
+    /* Non-blocking read side lets the event loop drain all available activity
+       packets without ever stalling X11. */
+    flags=fcntl(a->worker_pipe[0],F_GETFL,0);if(flags>=0)(void)fcntl(a->worker_pipe[0],F_SETFL,flags|O_NONBLOCK);
 }
 
 static void handle_modal_key(App *a, XKeyEvent *ke)
 {
     KeySym k; char b[64]; int n; unsigned int st; int extend;
-    n = XLookupString(ke, b, sizeof(b), &k, 0); st=ke->state; extend=(st&ShiftMask)!=0;
+    n = lookup_utf8(a, ke, b, sizeof(b), &k); st=ke->state; extend=(st&ShiftMask)!=0;
     if (k == XK_Escape) {
         selection_clear(a);
         if (a->modal == MODAL_OAUTH_EDIT) a->modal = MODAL_OAUTH_CONFIG;
@@ -1822,24 +2014,24 @@ static void handle_modal_key(App *a, XKeyEvent *ke)
     if (shortcut_mod(st) && (k==XK_x||k==XK_X)) { own_selection(a,1); delete_edit_selection(a,SEL_MODAL); return; }
     if (k == XK_Return || k == XK_KP_Enter) { apply_modal(a); return; }
     if (k == XK_Left) {
-        size_t old=a->modal_cursor,newp=old?old-1:0; set_edit_cursor(a,SEL_MODAL,old,newp,extend); return;
+        size_t old=a->modal_cursor,newp=utf8_prev(a->modal_text,old); set_edit_cursor(a,SEL_MODAL,old,newp,extend); return;
     }
     if (k == XK_Right) {
-        size_t old=a->modal_cursor,newp=old<a->modal_len?old+1:a->modal_len; set_edit_cursor(a,SEL_MODAL,old,newp,extend); return;
+        size_t old=a->modal_cursor,newp=utf8_next(a->modal_text,a->modal_len,old); set_edit_cursor(a,SEL_MODAL,old,newp,extend); return;
     }
     if (k == XK_Home) { size_t old=a->modal_cursor;set_edit_cursor(a,SEL_MODAL,old,0,extend);return; }
     if (k == XK_End) { size_t old=a->modal_cursor;set_edit_cursor(a,SEL_MODAL,old,a->modal_len,extend);return; }
     if (k == XK_BackSpace) {
         if (!delete_edit_selection(a,SEL_MODAL) && a->modal_cursor>0) {
-            size_t p=a->modal_cursor-1;memmove(a->modal_text+p,a->modal_text+a->modal_cursor,a->modal_len-a->modal_cursor+1);
-            a->modal_len--;a->modal_cursor=p;
+            size_t p=utf8_prev(a->modal_text,a->modal_cursor);size_t cut=a->modal_cursor-p;memmove(a->modal_text+p,a->modal_text+a->modal_cursor,a->modal_len-a->modal_cursor+1);
+            a->modal_len-=cut;a->modal_cursor=p;
         }
         return;
     }
     if (k == XK_Delete) {
         if (!delete_edit_selection(a,SEL_MODAL) && a->modal_cursor<a->modal_len) {
-            memmove(a->modal_text+a->modal_cursor,a->modal_text+a->modal_cursor+1,a->modal_len-a->modal_cursor);
-            a->modal_len--;
+            size_t np=utf8_next(a->modal_text,a->modal_len,a->modal_cursor);size_t cut=np-a->modal_cursor;memmove(a->modal_text+a->modal_cursor,a->modal_text+np,a->modal_len-np+1);
+            a->modal_len-=cut;
         }
         return;
     }
@@ -1849,8 +2041,9 @@ static void handle_modal_key(App *a, XKeyEvent *ke)
 static void handle_key(App *a, XKeyEvent *ke)
 {
     KeySym k; char b[64]; int n; unsigned int st; int extend;
-    a->cursor_visible=1;n=XLookupString(ke,b,sizeof(b),&k,0);st=ke->state;extend=(st&ShiftMask)!=0;
+    a->cursor_visible=1;n=lookup_utf8(a,ke,b,sizeof(b),&k);st=ke->state;extend=(st&ShiftMask)!=0;
     if (a->modal != MODAL_NONE) { handle_modal_key(a, ke); return; }
+    if(a->worker_busy && shortcut_mod(st) && (k==XK_o||k==XK_O||k==XK_p||k==XK_P||k==XK_m||k==XK_M||k==XK_k||k==XK_K||k==XK_u||k==XK_U||k==XK_r||k==XK_R||k==XK_t||k==XK_T||k==XK_n||k==XK_N||k==XK_y||k==XK_Y)){snprintf(a->status,sizeof(a->status),"Connection/configuration changes are locked while the agent is working");return;}
     if (shortcut_mod(st) && (k==XK_a||k==XK_A)) { select_all_edit(a); return; }
     if (shortcut_mod(st) && (k==XK_c||k==XK_C)) { own_selection(a,1); if(a->clipboard_text)strcpy(a->status,"Copied selection"); return; }
     if (shortcut_mod(st) && (k==XK_v||k==XK_V)) { request_paste(a,a->clipboard_atom); return; }
@@ -1865,21 +2058,21 @@ static void handle_key(App *a, XKeyEvent *ke)
     if (shortcut_mod(st) && (k==XK_n||k==XK_N)) { new_chat(a);return; }
     if (shortcut_mod(st) && (k==XK_y||k==XK_Y)) { new_chat(a);return; }
     if (shortcut_mod(st) && (k==XK_l||k==XK_L)) { a->input[0]=0;a->input_len=0;a->input_cursor=0;selection_clear(a);return; }
-    if (k == XK_Left) { size_t old=a->input_cursor,newp=old?old-1:0;set_edit_cursor(a,SEL_INPUT,old,newp,extend);return; }
-    if (k == XK_Right) { size_t old=a->input_cursor,newp=old<a->input_len?old+1:a->input_len;set_edit_cursor(a,SEL_INPUT,old,newp,extend);return; }
+    if (k == XK_Left) { size_t old=a->input_cursor,newp=utf8_prev(a->input,old);set_edit_cursor(a,SEL_INPUT,old,newp,extend);return; }
+    if (k == XK_Right) { size_t old=a->input_cursor,newp=utf8_next(a->input,a->input_len,old);set_edit_cursor(a,SEL_INPUT,old,newp,extend);return; }
     if (k == XK_Home) { size_t old=a->input_cursor;set_edit_cursor(a,SEL_INPUT,old,0,extend);return; }
     if (k == XK_End) { size_t old=a->input_cursor;set_edit_cursor(a,SEL_INPUT,old,a->input_len,extend);return; }
     if (k == XK_BackSpace) {
         if (!delete_edit_selection(a,SEL_INPUT) && a->input_cursor>0) {
-            size_t p=a->input_cursor-1;memmove(a->input+p,a->input+a->input_cursor,a->input_len-a->input_cursor+1);
-            a->input_len--;a->input_cursor=p;
+            size_t p=utf8_prev(a->input,a->input_cursor);size_t cut=a->input_cursor-p;memmove(a->input+p,a->input+a->input_cursor,a->input_len-a->input_cursor+1);
+            a->input_len-=cut;a->input_cursor=p;
         }
         return;
     }
     if (k == XK_Delete) {
         if (!delete_edit_selection(a,SEL_INPUT) && a->input_cursor<a->input_len) {
-            memmove(a->input+a->input_cursor,a->input+a->input_cursor+1,a->input_len-a->input_cursor);
-            a->input_len--;
+            size_t np=utf8_next(a->input,a->input_len,a->input_cursor);size_t cut=np-a->input_cursor;memmove(a->input+a->input_cursor,a->input+np,a->input_len-np+1);
+            a->input_len-=cut;
         }
         return;
     }
@@ -1890,19 +2083,22 @@ static void handle_key(App *a, XKeyEvent *ke)
     if (n > 0) { if(a->selection.kind==SEL_MESSAGE)selection_clear(a);insert_edit_text(a,SEL_INPUT,b,(size_t)n); }
 }
 
-static size_t line_offset_for_x(XFontStruct *f,const char *line,int relx)
+static size_t line_offset_for_x(App *a, XFontStruct *f,const char *line,int relx)
 {
-    size_t i,n=strlen(line);int prev=0,w;
+    size_t i,n=strlen(line),next;int prev=0,w;
     if(relx<=0)return 0;
-    for(i=1;i<=n;i++){
-        w=XTextWidth(f,line,(int)i);
-        if(relx < prev + (w-prev)/2) return i-1;
+    i=0;
+    while(i<n){
+        next=utf8_next(line,n,i);
+        w=text_width_n(a,f,line,next);
+        if(relx < prev + (w-prev)/2) return i;
         prev=w;
+        i=next;
     }
     return n;
 }
 
-static size_t wrapped_offset_at(XFontStruct *f,const char *text,int maxw,int x,int first_baseline,
+static size_t wrapped_offset_at(App *a, XFontStruct *f,const char *text,int maxw,int x,int first_baseline,
                                 int px,int py,int lineh)
 {
     const char *p,*n;char line[2048];int line_no=0,target;
@@ -1912,9 +2108,9 @@ static size_t wrapped_offset_at(XFontStruct *f,const char *text,int maxw,int x,i
     p=text;
     while(*p){
         size_t off;
-        if(!wrap_line(f,p,maxw,line,sizeof(line),&n))break;
+        if(!wrap_line(a,f,p,maxw,line,sizeof(line),&n))break;
         off=(size_t)(p-text);
-        if(line_no==target || !*n) return off+line_offset_for_x(f,line,px-x);
+        if(line_no==target || !*n) return off+line_offset_for_x(a,f,line,px-x);
         line_no++;if(n==p)break;p=n;
     }
     return strlen(text);
@@ -1956,23 +2152,23 @@ static int message_offset_at(App *a,int px,int py,int *message_index,size_t *off
     y=chat_top+8-a->scroll_y;maxbubble=(cw*72)/100;
     for(i=0;i<a->message_count;i++){
         if(a->messages[i].role==UI_ROLE_USER){
-            th=wrapped_height(a->font,a->messages[i].text,maxbubble-28,20);
-            if(!strchr(a->messages[i].text,'\n')){tw=text_w(a->font,a->messages[i].text)+28;bw=mini(maxbubble,maxi(76,tw));}else bw=maxbubble;
+            th=wrapped_height(a, a->font,a->messages[i].text,maxbubble-28,20);
+            if(!strchr(a->messages[i].text,'\n')){tw=text_w(a, a->font,a->messages[i].text)+28;bw=mini(maxbubble,maxi(76,tw));}else bw=maxbubble;
             bx=cx+cw-bw;by=y+5;tx=bx+14;baseline=by+18;maxw=bw-28;bottom=baseline+th+a->font->descent;
             if(py>=baseline-a->font->ascent-3&&py<=bottom&&px>=tx-4&&px<=tx+maxw+4){
-                *message_index=i;*offset=wrapped_offset_at(a->font,a->messages[i].text,maxw,tx,baseline,px,py,20);return 1;
+                *message_index=i;*offset=wrapped_offset_at(a,a->font,a->messages[i].text,maxw,tx,baseline,px,py,20);return 1;
             }
         }else if(a->messages[i].role==UI_ROLE_TRACE){
             if(!a->messages[i].collapsed){
                 th=trace_body_height(a,&a->messages[i],cw);tx=cx+56;baseline=y+54;maxw=cw-70;bottom=baseline+th+a->small->descent;
                 if(py>=baseline-a->small->ascent-3&&py<=bottom&&px>=tx-4&&px<=tx+maxw+4){
-                    *message_index=i;*offset=wrapped_offset_at(a->small,a->messages[i].text,maxw,tx,baseline,px,py,18);return 1;
+                    *message_index=i;*offset=wrapped_offset_at(a,a->small,a->messages[i].text,maxw,tx,baseline,px,py,18);return 1;
                 }
             }
         }else{
-            th=wrapped_height(a->font,a->messages[i].text,cw-50,20);tx=cx+42;baseline=y+40;maxw=cw-50;bottom=baseline+th+a->font->descent;
+            th=wrapped_height(a, a->font,a->messages[i].text,cw-50,20);tx=cx+42;baseline=y+40;maxw=cw-50;bottom=baseline+th+a->font->descent;
             if(py>=baseline-a->font->ascent-3&&py<=bottom&&px>=tx-4&&px<=tx+maxw+4){
-                *message_index=i;*offset=wrapped_offset_at(a->font,a->messages[i].text,maxw,tx,baseline,px,py,20);return 1;
+                *message_index=i;*offset=wrapped_offset_at(a,a->font,a->messages[i].text,maxw,tx,baseline,px,py,20);return 1;
             }
         }
         y+=message_step_height(a,i,cw);
@@ -1984,12 +2180,12 @@ static size_t input_offset_at(App *a,int px,int py,int cx,int cw)
 {
     const char *p,*n;char line[1024];int count=0,target,visible_start,max_lines;
     int panel_y=a->height-114,text_y,maxw=cw-104,x=cx+48;size_t result=a->input_len;
-    max_lines=a->ctx.attachment_count?1:2;text_y=a->ctx.attachment_count?panel_y+51:panel_y+30;
-    p=a->input;while(*p){if(!wrap_line(a->font,p,maxw,line,sizeof(line),&n))break;count++;if(n==p)break;p=n;}
+    max_lines=ui_attachment_count(a)?1:2;text_y=ui_attachment_count(a)?panel_y+51:panel_y+30;
+    p=a->input;while(*p){if(!wrap_line(a, a->font,p,maxw,line,sizeof(line),&n))break;count++;if(n==p)break;p=n;}
     if(count==0)return 0;
     visible_start=count>max_lines?count-max_lines:0;
     target=(py-(text_y-a->font->ascent))/19;if(target<0)target=0;if(target>=max_lines)target=max_lines-1;target+=visible_start;
-    p=a->input;count=0;while(*p){size_t off;if(!wrap_line(a->font,p,maxw,line,sizeof(line),&n))break;off=(size_t)(p-a->input);if(count==target||!*n){result=off+line_offset_for_x(a->font,line,px-x);break;}count++;if(n==p)break;p=n;}
+    p=a->input;count=0;while(*p){size_t off;if(!wrap_line(a, a->font,p,maxw,line,sizeof(line),&n))break;off=(size_t)(p-a->input);if(count==target||!*n){result=off+line_offset_for_x(a,a->font,line,px-x);break;}count++;if(n==p)break;p=n;}
     if(result>a->input_len)result=a->input_len;
     return result;
 }
@@ -1999,14 +2195,14 @@ static int chip_at(App *a, int px, int py, int cx, int cw)
     int py0, xx, i, w;
     const char *name;
     char b[128];
-    if (!a->ctx.attachment_count) return -1;
+    if (!ui_attachment_count(a)) return -1;
     py0 = a->height - 114 + 9;
     if (py < py0 || py >= py0 + 24) return -1;
     xx = cx + 13;
-    for (i = 0; i < a->ctx.attachment_count; i++) {
+    for (i = 0; i < ui_attachment_count(a); i++) {
         name = base_name(a->ctx.attachments[i].path);
         snprintf(b, sizeof(b), "%s %s  x", a->ctx.attachments[i].is_image ? "IMG" : "FILE", name);
-        w = text_w(a->small, b) + 18;
+        w = text_w(a, a->small, b) + 18;
         if (w > 210) w = 210;
         if (xx + w > cx + 13 + cw - 26) break;
         if (hit(px, py, xx, py0, w, 24)) return i;
@@ -2103,7 +2299,7 @@ static void handle_modal_click(App *a, int px, int py)
         const char *shown=a->modal_text;
         char masked_local[sizeof(a->modal_text)];size_t j;
         if(a->modal==MODAL_KEY){for(j=0;j<a->modal_len&&j<sizeof(masked_local)-1;j++)masked_local[j]='*';masked_local[j]=0;shown=masked_local;}
-        a->modal_cursor=line_offset_for_x(a->font,shown,px-(x+35));
+        a->modal_cursor=line_offset_for_x(a,a->font,shown,px-(x+35));
         if(a->modal_cursor>a->modal_len)a->modal_cursor=a->modal_len;
         selection_clear(a);a->selection.kind=SEL_MODAL;a->selection.anchor=a->selection.cursor=a->modal_cursor;
         return;
@@ -2124,30 +2320,37 @@ static void handle_click(App *a, XButtonEvent *be)
     if(be->button==Button2){request_paste(a,XA_PRIMARY);return;}
     if(be->button!=Button1)return;
     if(a->modal!=MODAL_NONE){handle_modal_click(a,x,y);return;}
+    if(a->worker_busy && x<sidebar_w(a)){snprintf(a->status,sizeof(a->status),"Connection/configuration controls are locked while the agent is working");return;}
 
     is_openai=a->ctx.provider.kind==VS_PROVIDER_OPENAI;
-    if(x<UI_SIDEBAR_W){
-        if(hit(x,y,14,16,UI_SIDEBAR_W-28,38))new_chat(a);
-        else if(hit(x,y,14,94,UI_SIDEBAR_W-28,36))open_modal(a,MODAL_PROVIDER,"");
-        else if(hit(x,y,14,136,UI_SIDEBAR_W-28,36))open_modal(a,MODAL_MODEL,a->ctx.provider.model);
-        else if(hit(x,y,14,178,UI_SIDEBAR_W-28,36)){
+    if(x<sidebar_w(a)){
+        int sbx = sidebar_compact(a) ? 10 : 14;
+        int sbw = sidebar_w(a) - sbx * 2;
+        int sbh = sidebar_button_h(a);
+        int newy = sidebar_y(a,16);
+        int newh = sidebar_compact(a) ? 32 : 38;
+        if(hit(x,y,sbx,newy,sbw,newh))new_chat(a);
+        else if(hit(x,y,sbx,sidebar_y(a,94),sbw,sbh))open_modal(a,MODAL_PROVIDER,"");
+        else if(hit(x,y,sbx,sidebar_y(a,136),sbw,sbh))open_modal(a,MODAL_MODEL,a->ctx.provider.model);
+        else if(hit(x,y,sbx,sidebar_y(a,178),sbw,sbh)){
             if(protocol_switchable(a))open_modal(a,MODAL_PROTOCOL,"");
             else snprintf(a->status,sizeof(a->status),"%s uses the %s protocol",a->ctx.provider.name,vs_protocol_name(a->ctx.provider.protocol));
         }
-        else if(hit(x,y,14,220,UI_SIDEBAR_W-28,36))open_modal(a,MODAL_BASE,a->ctx.provider.base_url);
-        else if(is_openai&&hit(x,y,14,286,UI_SIDEBAR_W-28,36))open_modal(a,MODAL_ACCOUNT,"");
-        else if(is_openai&&hit(x,y,14,328,UI_SIDEBAR_W-28,36))open_modal(a,MODAL_KEY,"");
-        else if(!is_openai&&hit(x,y,14,286,UI_SIDEBAR_W-28,36))open_modal(a,MODAL_KEY,"");
+        else if(hit(x,y,sbx,sidebar_y(a,220),sbw,sbh))open_modal(a,MODAL_BASE,a->ctx.provider.base_url);
+        else if(hit(x,y,sbx,sidebar_y(a,262),sbw,sbh))open_modal(a,MODAL_PROXY,"");
+        else if(is_openai&&hit(x,y,sbx,sidebar_y(a,328),sbw,sbh))open_modal(a,MODAL_ACCOUNT,"");
+        else if(is_openai&&hit(x,y,sbx,sidebar_y(a,370),sbw,sbh))open_modal(a,MODAL_KEY,"");
+        else if(!is_openai&&hit(x,y,sbx,sidebar_y(a,328),sbw,sbh))open_modal(a,MODAL_KEY,"");
         else{
-            cache_y=is_openai?394:352;
-            if(hit(x,y,14,cache_y,UI_SIDEBAR_W-28,36)){
+            cache_y=is_openai?436:394;
+            if(hit(x,y,sbx,sidebar_y(a,cache_y),sbw,sbh)){
                 a->ctx.cache_enabled=!a->ctx.cache_enabled;(void)vs_persist_settings(&a->ctx);
                 strcpy(a->status,a->ctx.cache_enabled?"Prompt cache enabled":"Prompt cache disabled");
-            }else if(hit(x,y,14,cache_y+42,UI_SIDEBAR_W-28,36)){
+            }else if(hit(x,y,sbx,sidebar_y(a,cache_y+42),sbw,sbh)){
                 vs_cache_clear(&a->ctx);strcpy(a->status,"Local cache and cache statistics cleared");
-            }else if(hit(x,y,14,cache_y+84,UI_SIDEBAR_W-28,36)){
+            }else if(hit(x,y,sbx,sidebar_y(a,cache_y+84),sbw,sbh)){
                 open_modal(a,MODAL_GLOBAL_CONFIG,"");
-            }else if(hit(x,y,14,cache_y+126,UI_SIDEBAR_W-28,36)){
+            }else if(hit(x,y,sbx,sidebar_y(a,cache_y+126),sbw,sbh)){
                 open_modal(a,MODAL_MCP,"");
             }
         }
@@ -2161,8 +2364,8 @@ static void handle_click(App *a, XButtonEvent *be)
         a->auto_scroll = 0;
         return;
     }
-    idx=chip_at(a,x,y,cx,cw);if(idx>=0){remove_attachment(a,idx);return;}
-    if(hit(x,y,cx+11,panel_y+panel_h-34,28,28)){open_modal(a,MODAL_ATTACH,"");return;}
+    idx=chip_at(a,x,y,cx,cw);if(idx>=0){if(a->worker_busy)strcpy(a->status,"Attachments are locked while the agent is working");else remove_attachment(a,idx);return;}
+    if(hit(x,y,cx+11,panel_y+panel_h-34,28,28)){if(a->worker_busy)strcpy(a->status,"Attachments are locked while the agent is working");else open_modal(a,MODAL_ATTACH,"");return;}
     if(hit(x,y,cx+cw-39,panel_y+panel_h-34,28,28)){send_message(a);return;}
 
     if(y>=panel_y&&y<=panel_y+panel_h){
@@ -2201,6 +2404,12 @@ static void init_app(App *a, int argc, char **argv)
     XSetWindowAttributes attrs;
     XSizeHints hints;
     memset(a, 0, sizeof(*a));
+    a->worker_pipe[0]=a->worker_pipe[1]=-1;
+    pthread_mutex_init(&a->worker_lock,NULL);
+    if(pipe(a->worker_pipe)!=0){a->worker_pipe[0]=a->worker_pipe[1]=-1;}
+    if (!setlocale(LC_CTYPE, "") || MB_CUR_MAX <= 1) {
+        if (!setlocale(LC_CTYPE, "C.UTF-8")) (void)setlocale(LC_CTYPE, "en_US.UTF-8");
+    }
     vs_init(&a->ctx);
     if (argc > 1) vs_load_config(&a->ctx, argv[1]);
     a->width = 1080;
@@ -2208,13 +2417,20 @@ static void init_app(App *a, int argc, char **argv)
     a->auto_scroll = 1;
     a->cursor_visible = 1;
     a->oauth_flow.listener_fd = -1;
+    a->live_trace_message = -1;
     selection_clear(a);
     a->dpy = XOpenDisplay(NULL);
     if (!a->dpy) return;
     a->screen = DefaultScreen(a->dpy);
+    {
+        int sw = DisplayWidth(a->dpy, a->screen);
+        int sh = DisplayHeight(a->dpy, a->screen);
+        if (sw > 0 && a->width > sw - 24) a->width = maxi(760, sw - 24);
+        if (sh > 0 && a->height > sh - 40) a->height = maxi(560, sh - 40);
+    }
     init_colors(a);
     attrs.background_pixel = a->c.bg;
-    a->win = XCreateWindow(a->dpy, RootWindow(a->dpy, a->screen), 70, 50,
+    a->win = XCreateWindow(a->dpy, RootWindow(a->dpy, a->screen), 12, 20,
                            (unsigned int)a->width, (unsigned int)a->height, 0,
                            CopyFromParent, InputOutput, CopyFromParent,
                            CWBackPixel, &attrs);
@@ -2227,6 +2443,36 @@ static void init_app(App *a, int argc, char **argv)
     a->font = load_font(a, "-*-helvetica-medium-r-normal--14-*-*-*-*-*-*-*", "fixed");
     a->bold = load_font(a, "-*-helvetica-bold-r-normal--14-*-*-*-*-*-*-*", "fixed");
     a->small = load_font(a, "-*-helvetica-medium-r-normal--12-*-*-*-*-*-*-*", "fixed");
+    if (XSupportsLocale()) {
+        const char *fs_regular;
+        const char *fs_bold;
+        const char *fs_small;
+        XSetLocaleModifiers("");
+        fs_regular = getenv("VIBESOLARIS_FONTSET");
+        fs_bold = getenv("VIBESOLARIS_FONTSET_BOLD");
+        fs_small = getenv("VIBESOLARIS_FONTSET_SMALL");
+        if (!fs_regular || !*fs_regular) fs_regular = "-misc-fixed-medium-r-normal--14-*-*-*-*-*-iso10646-1,-*-helvetica-medium-r-normal--14-*-*-*-*-*-*-*";
+        if (!fs_bold || !*fs_bold) fs_bold = "-misc-fixed-bold-r-normal--14-*-*-*-*-*-iso10646-1,-*-helvetica-bold-r-normal--14-*-*-*-*-*-*-*";
+        if (!fs_small || !*fs_small) fs_small = "-misc-fixed-medium-r-normal--12-*-*-*-*-*-iso10646-1,-*-helvetica-medium-r-normal--12-*-*-*-*-*-*-*";
+        a->font_set = load_font_set(a, fs_regular);
+        a->bold_set = load_font_set(a, fs_bold);
+        a->small_set = load_font_set(a, fs_small);
+    }
+    a->xim = XOpenIM(a->dpy, NULL, NULL, NULL);
+    if (a->xim) {
+        a->xic = XCreateIC(a->xim,
+                           XNInputStyle, XIMPreeditNothing | XIMStatusNothing,
+                           XNClientWindow, a->win,
+                           XNFocusWindow, a->win,
+                           NULL);
+        if (a->xic) {
+            long im_events = 0;
+            XSetICFocus(a->xic);
+            (void)XGetICValues(a->xic, XNFilterEvents, &im_events, NULL);
+            if (im_events) XSelectInput(a->dpy, a->win, ExposureMask | KeyPressMask | ButtonPressMask | ButtonReleaseMask |
+                                        PointerMotionMask | StructureNotifyMask | PropertyChangeMask | FocusChangeMask | im_events);
+        }
+    }
     a->wm_delete = XInternAtom(a->dpy, "WM_DELETE_WINDOW", False);
     a->clipboard_atom = XInternAtom(a->dpy, "CLIPBOARD", False);
     a->utf8_atom = XInternAtom(a->dpy, "UTF8_STRING", False);
@@ -2262,10 +2508,23 @@ static void init_app(App *a, int argc, char **argv)
 static void destroy_app(App *a)
 {
     if (a->oauth_flow.active) vs_oauth_cancel(&a->oauth_flow);
+    if(a->worker_started){
+        while(a->worker_started){fd_set rf;struct timeval tv;int rc;FD_ZERO(&rf);FD_SET(a->worker_pipe[0],&rf);tv.tv_sec=0;tv.tv_usec=200000;rc=select(a->worker_pipe[0]+1,&rf,NULL,NULL,&tv);if(rc>0&&FD_ISSET(a->worker_pipe[0],&rf))process_worker_pipe(a);}
+    }
+    vs_set_trace_callback(&a->ctx,NULL,NULL);
+    free(a->worker_reply);free(a->worker_user);
+    if(a->worker_pipe[0]>=0)close(a->worker_pipe[0]);
+    if(a->worker_pipe[1]>=0)close(a->worker_pipe[1]);
+    pthread_mutex_destroy(&a->worker_lock);
     free_messages(a);
     free(a->clipboard_text);
     free(a->paste_data);
     if (a->back_buffer) XFreePixmap(a->dpy, a->back_buffer);
+    if (a->xic) XDestroyIC(a->xic);
+    if (a->xim) XCloseIM(a->xim);
+    if (a->font_set) XFreeFontSet(a->dpy, a->font_set);
+    if (a->bold_set) XFreeFontSet(a->dpy, a->bold_set);
+    if (a->small_set) XFreeFontSet(a->dpy, a->small_set);
     if (a->font) XFreeFont(a->dpy, a->font);
     if (a->bold) XFreeFont(a->dpy, a->bold);
     if (a->small) XFreeFont(a->dpy, a->small);
@@ -2294,6 +2553,7 @@ int main(int argc, char **argv)
     while (running) {
         while (XPending(a.dpy)) {
             XNextEvent(a.dpy, &ev);
+            if (XFilterEvent(&ev, None)) continue;
             if (ev.type == ClientMessage && ev.xclient.message_type == XInternAtom(a.dpy, "WM_PROTOCOLS", False) &&
                 (Atom)ev.xclient.data.l[0] == a.wm_delete) {
                 running = 0;
@@ -2334,9 +2594,9 @@ int main(int argc, char **argv)
                 handle_paste_property(&a, &ev.xproperty);
                 if (a.paste_incr || ev.xproperty.atom == a.paste_atom) redraw(&a);
             } else if (ev.type == FocusIn) {
-                a.has_focus = 1; a.cursor_visible = 1; redraw(&a);
+                a.has_focus = 1; a.cursor_visible = 1; if (a.xic) XSetICFocus(a.xic); redraw(&a);
             } else if (ev.type == FocusOut) {
-                a.has_focus = 0; a.cursor_visible = 0; redraw(&a);
+                a.has_focus = 0; a.cursor_visible = 0; if (a.xic) XUnsetICFocus(a.xic); redraw(&a);
             }
         }
         if (!running) break;
@@ -2348,9 +2608,11 @@ int main(int argc, char **argv)
             FD_SET(a.oauth_flow.listener_fd, &rfds);
             if (a.oauth_flow.listener_fd > maxfd) maxfd = a.oauth_flow.listener_fd;
         }
+        if(a.worker_pipe[0]>=0){FD_SET(a.worker_pipe[0],&rfds);if(a.worker_pipe[0]>maxfd)maxfd=a.worker_pipe[0];}
         tv.tv_sec = 0;
         tv.tv_usec = 500000;
         rc = select(maxfd + 1, &rfds, (fd_set *)0, (fd_set *)0, &tv);
+        if(rc>0&&a.worker_pipe[0]>=0&&FD_ISSET(a.worker_pipe[0],&rfds)){process_worker_pipe(&a);redraw(&a);}
         if (a.oauth_flow.active) {
             oauth_msg[0] = 0;
             orc = vs_oauth_poll(&a.ctx, &a.oauth_flow, oauth_msg, sizeof(oauth_msg));

@@ -134,6 +134,11 @@ char *vs_cached_read_file(VSContext *ctx,const char *path) {
     struct stat st; VSFileCacheEntry *e; char *s;
     if(!ctx || !ctx->cache_enabled) return vs_read_file(path);
     if(stat(path,&st)!=0) return NULL;
+    /* Do not keep another full copy of a multi-megabyte source file in RAM. */
+    if((unsigned long)st.st_size > (unsigned long)VS_FILE_CACHE_BLOB_MAX) {
+        ctx->file_cache_misses++;
+        return vs_read_file(path);
+    }
     e=cache_slot(ctx,path,(long)st.st_mtime,(long)st.st_size,0);
     if(e->text) { ctx->file_cache_hits++; e->hits++; return dupstr(e->text); }
     s=vs_read_file(path); if(!s) return NULL;
@@ -145,6 +150,12 @@ char *vs_cached_base64_file(VSContext *ctx,const char *path,size_t *out_len) {
     struct stat st; VSFileCacheEntry *e; char *s; size_t n=0;
     if(!ctx || !ctx->cache_enabled) return vs_base64_file(path,out_len);
     if(stat(path,&st)!=0) return NULL;
+    /* Large images are already expanded ~4/3 by base64.  Caching another copy
+       can double peak memory while the request body is being built. */
+    if((unsigned long)st.st_size > (unsigned long)VS_FILE_CACHE_BLOB_MAX) {
+        ctx->file_cache_misses++;
+        return vs_base64_file(path,out_len);
+    }
     e=cache_slot(ctx,path,(long)st.st_mtime,(long)st.st_size,1);
     if(e->base64) { ctx->file_cache_hits++; e->hits++; if(out_len)*out_len=e->base64_len; return dupstr(e->base64); }
     s=vs_base64_file(path,&n); if(!s) return NULL;
@@ -223,20 +234,53 @@ int vs_write_file(const char *path, const char *text) {
 }
 
 char *vs_run_command(const char *cmd, int *exit_code) {
-    FILE *p; char buf[4096]; size_t cap=8192,len=0; char *out=(char*)malloc(cap);
-    if(!out) return NULL;
-    out[0]=0;
-    p=popen(cmd,"r"); if(!p){free(out); return NULL;}
-    while(fgets(buf,sizeof(buf),p)){
-        size_t n=strlen(buf);
-        if(len+n+1>cap){char *tmp;cap=(len+n+1)*2;tmp=(char*)realloc(out,cap);if(!tmp){free(out);pclose(p);return NULL;}out=tmp;}
-        memcpy(out+len,buf,n);len+=n;out[len]=0;
+    FILE *p; char buf[8192];
+    size_t head_cap=VS_MAX_COMMAND_CAPTURE/2, tail_cap=VS_MAX_COMMAND_CAPTURE/2;
+    size_t head_n=0, tail_n=0, tail_pos=0, total=0, n, i, out_n, marker_n;
+    char *head, *tail, *out; int truncated=0;
+    const char *marker="\n...[command output truncated by VibeSolaris]...\n";
+    head=(char*)malloc(head_cap?head_cap:1);tail=(char*)malloc(tail_cap?tail_cap:1);
+    if(!head||!tail){free(head);free(tail);return NULL;}
+    p=popen(cmd,"r"); if(!p){free(head);free(tail);return NULL;}
+    while((n=fread(buf,1,sizeof(buf),p))>0){
+        total+=n;
+        if(total>(size_t)VS_MAX_COMMAND_CAPTURE)truncated=1;
+        for(i=0;i<n;i++){
+            unsigned char ch=(unsigned char)buf[i];
+            if(head_n<head_cap) head[head_n++]=(char)ch;
+            else if(tail_cap){tail[tail_pos]=(char)ch;tail_pos=(tail_pos+1)%tail_cap;if(tail_n<tail_cap)tail_n++;}
+            else if(total>(size_t)VS_MAX_COMMAND_CAPTURE)truncated=1;
+        }
     }
     {
         int st=pclose(p);
         if(exit_code){ if(WIFEXITED(st))*exit_code=WEXITSTATUS(st); else *exit_code=-1; }
     }
+    marker_n=truncated?strlen(marker):0;
+    out_n=head_n+tail_n+(truncated?marker_n:0);
+    out=(char*)malloc(out_n+1);if(!out){free(head);free(tail);return NULL;}
+    memcpy(out,head,head_n);i=head_n;
+    {
+        size_t first, j;
+        if(truncated){memcpy(out+i,marker,marker_n);i+=marker_n;first=(tail_n==tail_cap)?tail_pos:0;}
+        else first=0;
+        for(j=0;j<tail_n;j++)out[i++]=tail[(first+j)%tail_cap];
+    }
+    out[i]=0;
+    free(head);free(tail);
     return out;
+}
+
+char *vs_compact_text_limit(const char *s,size_t limit,const char *reason){
+    size_t n,markn,head,tail,cap;char *o,*mark;
+    char mbuf[256];
+    if(!s)return dupstr("");
+    n=strlen(s);if(limit<256)limit=256;if(n<=limit)return dupstr(s);
+    snprintf(mbuf,sizeof(mbuf),"\n...[%.120s: %lu bytes omitted]...\n",reason?reason:"content truncated",(unsigned long)(n-limit));
+    mark=mbuf;markn=strlen(mark);if(markn>=limit)markn=limit/4;
+    head=(limit-markn)*2/3;tail=limit-markn-head;cap=head+markn+tail+1;
+    o=(char*)malloc(cap);if(!o)return NULL;
+    memcpy(o,s,head);memcpy(o+head,mark,markn);memcpy(o+head+markn,s+n-tail,tail);o[cap-1]=0;return o;
 }
 
 char *vs_json_escape(const char *s){
@@ -275,9 +319,13 @@ int vs_is_image_path(const char *path){
 }
 
 int vs_attach(VSContext *ctx,const char *path){
-    if(ctx->attachment_count>=VS_MAX_ATTACH)return -1;
+    int i;
+    if(!ctx||!path||!*path)return -1;
     if(access(path,R_OK)!=0)return -1;
+    for(i=0;i<ctx->attachment_count;i++)if(!strcmp(ctx->attachments[i].path,path))return 0;
+    if(ctx->attachment_count>=VS_MAX_ATTACH)return -1;
     strncpy(ctx->attachments[ctx->attachment_count].path,path,VS_MAX_PATH-1);
+    ctx->attachments[ctx->attachment_count].path[VS_MAX_PATH-1]=0;
     ctx->attachments[ctx->attachment_count].is_image=vs_is_image_path(path);
     ctx->attachment_count++;return 0;
 }
@@ -285,16 +333,21 @@ void vs_clear_attachments(VSContext *ctx){ctx->attachment_count=0;}
 
 char *vs_base64_file(const char *path,size_t *out_len){
     static const char T[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    FILE *f=fopen(path,"rb"); unsigned char *in; long n; size_t olen,i,j; char *out;
+    FILE *f=fopen(path,"rb"); long n; size_t olen,j=0,r,i; char *out;
+    unsigned char in[49152]; unsigned char carry[3]; size_t carry_n=0;
     if(!f)return NULL;
-    fseek(f,0,SEEK_END);n=ftell(f);rewind(f);
+    if(fseek(f,0,SEEK_END)!=0){fclose(f);return NULL;}n=ftell(f);rewind(f);
     if(n<0||n>20*1024*1024){fclose(f);return NULL;}
-    in=(unsigned char*)malloc((size_t)n); if(!in && n){fclose(f);return NULL;} if(n && fread(in,1,(size_t)n,f)!=(size_t)n){free(in);fclose(f);return NULL;} fclose(f);
-    olen=4*((n+2)/3);out=(char*)malloc(olen+1);if(!out){free(in);return NULL;}
-    for(i=0,j=0;i<(size_t)n;){unsigned a=i<(size_t)n?in[i++]:0,b=i<(size_t)n?in[i++]:0,c=i<(size_t)n?in[i++]:0;unsigned t=(a<<16)|(b<<8)|c;out[j++]=T[(t>>18)&63];out[j++]=T[(t>>12)&63];out[j++]=T[(t>>6)&63];out[j++]=T[t&63];}
-    if(n%3)out[olen-1]='=';
-    if(n%3==1)out[olen-2]='=';
-    out[olen]=0;free(in);if(out_len)*out_len=olen;return out;
+    olen=4*(((size_t)n+2)/3);out=(char*)malloc(olen+1);if(!out){fclose(f);return NULL;}
+    while((r=fread(in,1,sizeof(in),f))>0){
+        i=0;
+        if(carry_n){while(carry_n<3&&i<r)carry[carry_n++]=in[i++];if(carry_n==3){unsigned t=((unsigned)carry[0]<<16)|((unsigned)carry[1]<<8)|carry[2];out[j++]=T[(t>>18)&63];out[j++]=T[(t>>12)&63];out[j++]=T[(t>>6)&63];out[j++]=T[t&63];carry_n=0;}}
+        while(i+3<=r){unsigned t=((unsigned)in[i]<<16)|((unsigned)in[i+1]<<8)|in[i+2];i+=3;out[j++]=T[(t>>18)&63];out[j++]=T[(t>>12)&63];out[j++]=T[(t>>6)&63];out[j++]=T[t&63];}
+        while(i<r)carry[carry_n++]=in[i++];
+    }
+    if(ferror(f)){free(out);fclose(f);return NULL;}fclose(f);
+    if(carry_n){unsigned t=(unsigned)carry[0]<<16;if(carry_n>1)t|=(unsigned)carry[1]<<8;out[j++]=T[(t>>18)&63];out[j++]=T[(t>>12)&63];out[j++]=carry_n>1?T[(t>>6)&63]:'=';out[j++]='=';}
+    out[j]=0;if(out_len)*out_len=j;return out;
 }
 
 static int vs_exec_in_path(const char *name)

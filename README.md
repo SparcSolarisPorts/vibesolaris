@@ -1,4 +1,4 @@
-# VibeSolaris 0.9.5
+# VibeSolaris 0.10.1
 
 VibeSolaris is a lightweight local AI coding client intended to run on old and new Unix systems without requiring Electron, Qt, GTK, Java, Node.js, or a browser engine.
 
@@ -431,6 +431,24 @@ Attachment chips appear in the composer area. Click a chip to remove it before s
 
 The current build supports up to 16 attachments per request.
 
+### Vision, screenshots, GUI debugging and CAD renders
+
+Image attachments are sent as **native visual input**, not converted into a textual dump of pixels. With a vision-capable model, VibeSolaris can therefore reason about a screenshot, photograph, diagram, plot or CAD render together with your prompt. The OpenAI-compatible path uses image content/data URLs, the Anthropic-compatible path uses image content blocks, and Gemini uses inline image data. Whether a particular model accepts image input is still determined by that model/provider.
+
+Typical GUI workflow:
+
+1. Attach or drag in a screenshot.
+2. Ask the agent to identify visual defects and inspect the relevant source.
+3. The agent can edit source and run/build the application with its normal tools.
+4. If it creates a new screenshot or render, it can issue `[[VS_TOOL image path="FILE.png"]]` to load that local image into its **next model round**.
+5. It can compare the new visual result with the original and continue iterating.
+
+The same mechanism is useful for CAD and engineering work. A model can inspect a viewport/render, drawing or marked-up screenshot and then operate whatever CAD scripting/command tools are available on the host. For example, it can generate/edit OpenSCAD, use FreeCAD's Python interface, invoke a CAD journal/script, or inspect exported geometry through an MCP tool. A screenshot alone is **not exact CAD geometry**: perspective hides dimensions and depth, so precise work should also provide dimensions, orthographic views, drawings or STEP/STL/native CAD data whenever possible.
+
+VibeSolaris deliberately distinguishes image **understanding** from image **generation/editing**. A vision-capable coding/language model is normally the better choice for reading a GUI screenshot and changing source code. Specialised models such as GPT Image are intended primarily to generate or edit image pixels. If a provider exposes an image-generation model through a different endpoint than its chat/vision model, that requires the matching provider endpoint rather than pretending it is an ordinary text-chat model.
+
+For automated visual iteration, the agent can use the ordinary `run` tool to call whatever screenshot utility exists on that host and then use the `image` tool to inspect the resulting PNG/JPEG/WebP/GIF. Examples of possible host utilities include `gnome-screenshot`, ImageMagick `import`, macOS `screencapture`, or a CAD application's own render/export command. VibeSolaris does not hard-code one screenshot program because the target range includes Solaris, illumos, Linux, BSD and Darwin.
+
 ### GUI connection controls
 
 The sidebar lets you change:
@@ -797,21 +815,55 @@ See `OAUTH.md`.
 Linux examples:
 
 ```text
-dist/vibesolaris-0.9.5-linux-x86_64.tar.gz
-dist/vibesolaris-0.9.5-linux-sparc64.tar.gz
+dist/vibesolaris-0.9.7-linux-x86_64.tar.gz
+dist/vibesolaris-0.9.7-linux-sparc64.tar.gz
 ```
 
 BSD and Darwin builds produce OS-labelled tar bundles, for example:
 
 ```text
-dist/vibesolaris-0.9.5-freebsd-x86_64.tar.gz
-dist/vibesolaris-0.9.5-darwin-arm64.tar.gz
-dist/vibesolaris-0.9.5-darwin-ppc.tar.gz
+dist/vibesolaris-0.9.7-freebsd-x86_64.tar.gz
+dist/vibesolaris-0.9.7-darwin-arm64.tar.gz
+dist/vibesolaris-0.9.7-darwin-ppc.tar.gz
 ```
 
 On Solaris, `build.sh` uses SVR4 `pkgmk`/`pkgtrans` when available and otherwise creates a tar archive.
 
 The installation tree uses `/usr/local/bin` for the binaries and `/usr/local/share/vibesolaris` for documentation/examples.
+
+
+## Stability on large operations
+
+VibeSolaris 0.10.1 hardens both front ends for long model/tool runs and large data.
+
+The X11 GUI runs the agent on a background POSIX worker thread.  Xlib remains on the
+main thread, with live activity delivered over a pipe, so a slow API request, MCP
+call, build, or other command does not freeze ordinary window events.  While a turn
+is running you can continue to scroll, select/copy text, resize the window, and type
+the next message into the composer.  Provider/configuration and attachment changes
+are temporarily locked until that turn finishes so that the worker sees a stable
+configuration.
+
+Large data is bounded deliberately instead of allowing accidental unlimited RAM
+growth:
+
+- HTTP responses are capped at 64 MiB.
+- Constructed provider request bodies are capped at 96 MiB.
+- Command output is captured in a bounded 4 MiB head/tail buffer; excess output is
+  drained so the child process cannot block merely because VibeSolaris stopped
+  reading it.
+- A tool or MCP result is compacted to at most 2 MiB before it is fed back to the
+  next model round.
+- Large text attachments are compacted to 4 MiB for model context while preserving
+  both their beginning and end.
+- Multi-megabyte files/images are not duplicated in the in-memory file cache.
+- Image base64 encoding is streamed from a fixed-size input buffer rather than
+  loading both the complete binary image and its expanded base64 form at once.
+
+These limits are safety rails for an interactive coding agent.  They do not limit
+files that a command edits on disk; they limit how much command/API/attachment data
+VibeSolaris keeps or sends in one in-memory operation.  When a limit is reached the
+Activity trace records a `limit` event instead of silently exhausting memory.
 
 ## Troubleshooting
 
@@ -911,3 +963,52 @@ See the full text in [`LICENSE`](LICENSE).
 The GUI and TUI use the **same encrypted configuration**. The active provider and the last model used for every provider are saved automatically. If you select `qwen` and `qwen3.8-max` in the GUI, close it, and then start the TUI, the TUI starts on that same provider/model. Changing it in the TUI works the same way in reverse.
 
 The normal per-user location is `~/.vibesolaris/config.enc` when `/etc/vibesolaris` is not writable. Use `/globalconfig status` in the TUI to see the exact file in use. The active provider/model are restored **after** all per-provider settings are loaded, so older configuration-file ordering cannot reset the model to a built-in default.
+
+## Live GUI activity
+
+The GUI shows an **Activity** disclosure row for every prompt. The row is collapsed by default, but its summary is updated **while the turn is still running**. Model requests, local tools, commands, file operations and MCP calls are appended to that prompt's trace as they happen; you do not need to wait for the final assistant response before seeing progress.
+
+Click the disclosure row to expand or collapse the full numbered trace. The trace is an execution log of observable operations, not hidden model reasoning.
+
+## UTF-8, Spanish, Chinese and other languages
+
+VibeSolaris keeps conversation text as UTF-8. The GUI now uses the X11 international input method/font-set APIs (`XIM`, `XIC`, `Xutf8LookupString`/`XmbLookupString`, and `Xutf8DrawString`/`XmbDrawString`) rather than treating keyboard input and display text as single-byte characters. Cursor movement, deletion, wrapping, selection and truncation also stay on UTF-8 code-point boundaries. JSON `\\uXXXX` escapes, including UTF-16 surrogate pairs, are decoded into UTF-8 before display.
+
+This permits text such as `¡Hola! ¿Cómo estás?`, `中文`, `日本語`, and other Unicode text to pass through the editor and provider layer correctly. Because the GUI deliberately remains **pure Xlib** for old Solaris portability, the X server must still have fonts containing the glyphs you want to display. A minimal X server with only Latin core fonts cannot draw Chinese glyphs even though VibeSolaris has the correct UTF-8 bytes.
+
+The GUI honours these optional font-set environment variables when a legacy X11 installation needs an explicit multilingual font set:
+
+```sh
+VIBESOLARIS_FONTSET='-*-fixed-medium-r-normal--*-*-*-*-*-*-iso10646-1,*' \
+VIBESOLARIS_FONTSET_BOLD='-*-fixed-bold-r-normal--*-*-*-*-*-*-iso10646-1,*' \
+./vibesolaris-gui
+```
+
+The exact XLFD/font-set pattern depends on the fonts installed on that X server. Modern Linux/XQuartz/Solaris desktops with a suitable Unicode/CJK X11 font normally need no override. Input methods configured through the user's locale/XIM environment are used when available.
+
+### Chinese/CJK fonts for the pure-Xlib GUI
+
+For VibeSolaris's current `XFontSet` renderer, an actual X11 bitmap/core font is the most predictable option on older servers. Modern Noto CJK outline fonts are also excellent, but a legacy X server may need the font directory added to its X font path before `XCreateFontSet` can use them. After installing fonts, restarting X is the simplest option; alternatively inspect available X fonts with `xlsfonts` and the current font path with `xset q`.
+
+Recommended starting points:
+
+- **Debian / Ubuntu:** `sudo apt install xfonts-wqy xfonts-unifont`. `xfonts-wqy` is WenQuanYi Bitmap Song specifically packaged as a Chinese X font; `xfonts-unifont` is a broad Unicode bitmap fallback. Modern desktops may additionally use `fonts-noto-cjk`.
+- **Fedora:** `sudo dnf install wqy-bitmap-fonts wqy-unibit-fonts`. WenQuanYi Bitmap has extensive Simplified/Traditional Chinese coverage and Unibit is a broad Unicode bitmap fallback. `google-noto-sans-cjk-fonts` is a good modern outline-font addition. On RHEL-family systems, exact availability can depend on the enabled repositories/EPEL.
+- **Arch Linux:** `sudo pacman -S noto-fonts-cjk` provides the maintained Noto CJK family. Because this is an outline-font package rather than a classic PCF/BDF X font, verify that XQuartz/Xorg exposes it to the Xlib font set; if not, use an X11 bitmap CJK package from the repository/AUR or add a generated X font directory to the server font path.
+- **FreeBSD:** `pkg install wqy` is a useful X11-oriented WenQuanYi choice; current ports also provide Noto CJK families such as `noto-sans-sc`/`noto-sans-tc`.
+- **OpenBSD:** `pkg_add noto-cjk`. Current OpenBSD package sets provide `noto-cjk` on architectures including SPARC64 and PowerPC64.
+- **NetBSD/pkgsrc:** `pkgin install noto-cjk-fonts`.
+- **Oracle Solaris 11:** `pkg install system/font/truetype/wqy-zenhei system/font/truetype/arphic-ukai system/font/truetype/arphic-uming`. Solaris 11 ships these Chinese font families; older Solaris releases may instead rely on locale-specific bitmap fonts under `/usr/openwin/lib/locale/.../X11/fonts`.
+- **macOS/XQuartz:** `brew install --cask font-noto-sans-cjk` (or the SC/TC-specific Noto cask). Restart XQuartz after installing. If the font is visible to macOS but not to Xlib, add an X11-visible font directory or use an explicit `VIBESOLARIS_FONTSET` pattern.
+
+For Simplified Chinese specifically, a good test string is:
+
+```text
+VibeSolaris 中文测试：你好，世界。
+```
+
+If the bytes copy/paste correctly but boxes appear on screen, the UTF-8 path is working and the problem is **glyph/font availability**, not model output corruption.
+
+## Compact GUI for lower-resolution displays
+
+The GUI automatically switches to a compact sidebar when the window is approximately 1100 pixels wide or less, or 800 pixels tall or less. At 1024×768 this reduces the sidebar width, button heights, vertical spacing and secondary sidebar information while retaining provider/model/authentication controls and token usage. The initial window size is also clamped to the current X11 display so it does not start larger than the screen.

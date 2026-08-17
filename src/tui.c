@@ -129,6 +129,8 @@ static void help(void)
     cprintf(T_CYAN,"  /model MODEL                  ");printf("set model for the active provider\n");
     cprintf(T_CYAN,"  /base URL                     ");printf("set API endpoint for active provider/protocol\n");
     cprintf(T_CYAN,"  /key KEY                      ");printf("set the active provider API key (not echoed)\n");
+    cprintf(T_CYAN,"  /proxy VALUE                  ");printf("route HTTP API/MCP/OAuth calls via ip:port or user:pass@ip:port\n");
+    cprintf(T_CYAN,"  /proxy on|off|status          ");printf("enable, disable, or inspect the saved proxy\n");
     cprintf(T_BOLD T_BLUE,"\nOAuth / OpenAI application login\n");
     cprintf(T_CYAN,"  /oauth status                 ");printf("show OAuth configuration/session status\n");
     cprintf(T_CYAN,"  /oauth client CLIENT_ID\n");
@@ -246,6 +248,10 @@ int main(int argc, char **argv)
             else errorf("protocol not supported by provider %s\n",c.provider.name);
         } else if (!strncmp(line, "/key ", 5)) {
             vs_set_api_key(&c, line + 5);successf("API key saved for %s\n", c.provider.name);
+        } else if (!strcmp(line, "/proxy") || !strcmp(line, "/proxy status")) {
+            char pb[1024];vs_proxy_redacted(&c,pb,sizeof(pb));printf("proxy=%s  enabled=%s\n",pb,c.proxy_enabled?"yes":"no");
+        } else if (!strncmp(line, "/proxy ", 7)) {
+            char pb[1024];if(vs_set_proxy(&c,line+7)==0){vs_proxy_redacted(&c,pb,sizeof(pb));successf("proxy=%s\n",pb);}else errorf("proxy must be ip:port or user:pass@ip:port; use /proxy off to disable\n");
         } else if (!strncmp(line, "/model ", 7)) {
             vs_set_model(&c,line+7);if(vs_persist_settings(&c)==0)successf("model=%s (saved for %s)\n", c.provider.model,c.provider.name);else errorf("model=%s, but encrypted config could not be saved\n",c.provider.model);
         } else if (!strncmp(line, "/base ", 6)) {

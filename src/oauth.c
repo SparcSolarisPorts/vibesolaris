@@ -226,7 +226,7 @@ static int exchange_code(VSContext *ctx,const char *code,const char *verifier,ch
     form=form4("grant_type","authorization_code","client_id",ctx->oauth.client_id,"code",code,"redirect_uri",ctx->oauth.redirect_uri,"code_verifier",verifier);
     if(!form){setmsg(err,errcap,"Out of memory creating token request");return -1;}
     h[0]="Content-Type: application/x-www-form-urlencoded";h[1]="Accept: application/json";status=0;
-    resp=vs_http_post(ctx->oauth.token_url,h,2,form,&status);free(form);
+    resp=vs_http_post_ctx(ctx,ctx->oauth.token_url,h,2,form,&status);free(form);
     if(!resp){setmsg(err,errcap,"Token endpoint request failed");return -1;}
     if(status<200||status>=300){char b[512];snprintf(b,sizeof(b),"Token endpoint returned HTTP %ld: %.360s",status,resp);setmsg(err,errcap,b);free(resp);return -1;}
     if(apply_token_response(ctx,resp,0,err,errcap)!=0){free(resp);return -1;}free(resp);return 0;
@@ -370,7 +370,7 @@ int vs_oauth_refresh(VSContext *ctx,char *err,size_t errcap)
     char *form,*resp;const char *h[2];long status;
     if(!ctx||!ctx->oauth.refresh_token[0]){setmsg(err,errcap,"No OAuth refresh token is available");return -1;}if(!ctx->oauth.token_url[0]||!ctx->oauth.client_id[0]){setmsg(err,errcap,"OAuth token endpoint or client ID is missing");return -1;}
     form=form4("grant_type","refresh_token","client_id",ctx->oauth.client_id,"refresh_token",ctx->oauth.refresh_token,"scope",ctx->oauth.scopes,NULL,NULL);if(!form){setmsg(err,errcap,"Out of memory creating refresh request");return -1;}
-    h[0]="Content-Type: application/x-www-form-urlencoded";h[1]="Accept: application/json";status=0;resp=vs_http_post(ctx->oauth.token_url,h,2,form,&status);free(form);
+    h[0]="Content-Type: application/x-www-form-urlencoded";h[1]="Accept: application/json";status=0;resp=vs_http_post_ctx(ctx,ctx->oauth.token_url,h,2,form,&status);free(form);
     if(!resp){setmsg(err,errcap,"OAuth refresh request failed");return -1;}if(status<200||status>=300){char b[512];snprintf(b,sizeof(b),"OAuth refresh returned HTTP %ld: %.360s",status,resp);setmsg(err,errcap,b);free(resp);return -1;}
     if(apply_token_response(ctx,resp,1,err,errcap)!=0){free(resp);return -1;}free(resp);setmsg(err,errcap,"");return 0;
 }

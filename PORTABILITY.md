@@ -79,3 +79,11 @@ Provider-reported input/output/total token fields are normalised in the shared c
 The GUI requests pasted text through the X11 selection protocol (`CLIPBOARD` with `UTF8_STRING`, falling back to `STRING`) rather than interpreting Ctrl/Meta+V as typed text. It handles normal and incremental (`INCR`) transfers and supports middle-click PRIMARY paste.
 
 File drag-and-drop uses XDND version 5 and requests `text/uri-list`. Only local readable regular files are attached; remote-host URIs and directories are rejected. No GTK/Qt drag-and-drop dependency is introduced. Rendering uses an X11 pixmap back buffer so cursor blinking and selection motion are copied to the visible window as completed frames instead of being painted in stages.
+
+## X11 UTF-8 and compact display behaviour (0.9.7)
+
+The GUI uses X11 internationalisation facilities (`XFontSet`, XIM/XIC and the UTF-8/multibyte drawing and lookup functions where available) while retaining a pure-Xlib dependency footprint. Internally, provider responses and editor text remain UTF-8 and JSON Unicode escapes are converted to UTF-8. Glyph availability is still controlled by the fonts installed in the X server; very small/old X11 installations may need a CJK/Unicode core font or an explicit `VIBESOLARIS_FONTSET` override.
+
+For low-resolution X11 sessions, including 1024x768, the GUI automatically uses a narrower and vertically tighter sidebar. The requested initial geometry is clamped to the actual display dimensions.
+
+GUI activity trace callbacks are painted and synchronised as trace events arrive, so the per-prompt Activity disclosure summary changes during a long-running model/tool/MCP turn rather than only after the turn returns.

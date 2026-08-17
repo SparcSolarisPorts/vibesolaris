@@ -4,17 +4,42 @@
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct { char *p; size_t len; size_t cap; } VSBuf;
+typedef struct { char *p; size_t len; size_t cap; int failed; } VSBuf;
 
 static char *dupstr(const char *s){size_t n=s?strlen(s):0;char *p=(char*)malloc(n+1);if(!p)return 0;if(s)memcpy(p,s,n);p[n]=0;return p;}
-static int binit(VSBuf *b,size_t cap){b->p=(char*)malloc(cap);if(!b->p)return -1;b->p[0]=0;b->len=0;b->cap=cap;return 0;}
-static int bgrow(VSBuf *b,size_t add){char *n;size_t c;if(b->len+add+1<=b->cap)return 0;c=(b->len+add+1)*2;n=(char*)realloc(b->p,c);if(!n)return -1;b->p=n;b->cap=c;return 0;}
+static int binit(VSBuf *b,size_t cap){if(cap<256)cap=256;if(cap>VS_MAX_REQUEST_BODY)cap=VS_MAX_REQUEST_BODY;b->p=(char*)malloc(cap);if(!b->p)return -1;b->p[0]=0;b->len=0;b->cap=cap;b->failed=0;return 0;}
+static int bgrow(VSBuf *b,size_t add){char *n;size_t need,c,max=(size_t)VS_MAX_REQUEST_BODY;if(b->failed)return -1;if(add>max||b->len>max-add-1){b->failed=1;return -1;}need=b->len+add+1;if(need<=b->cap)return 0;c=b->cap?b->cap:256;while(c<need){if(c>max/2){c=max;break;}c*=2;}if(c<need||c>max){b->failed=1;return -1;}n=(char*)realloc(b->p,c);if(!n){b->failed=1;return -1;}b->p=n;b->cap=c;return 0;}
 static int badd(VSBuf *b,const char *s){size_t n=s?strlen(s):0;if(bgrow(b,n)!=0)return -1;if(n)memcpy(b->p+b->len,s,n);b->len+=n;b->p[b->len]=0;return 0;}
-static int bquoted(VSBuf *b,const char *s){char *e=vs_json_escape(s);int rc;if(!e)return -1;rc=badd(b,"\"");if(!rc)rc=badd(b,e);if(!rc)rc=badd(b,"\"");free(e);return rc;}
+static int bquoted(VSBuf *b,const char *s){char *e=vs_json_escape(s);int rc;if(!e){b->failed=1;return -1;}rc=badd(b,"\"");if(!rc)rc=badd(b,e);if(!rc)rc=badd(b,"\"");free(e);return rc;}
+static char *bfinish(VSContext *c,VSBuf *b){if(!b||!b->p)return NULL;if(b->failed){if(c)vs_trace(c,"limit","request body exceeded the safe in-memory limit or allocation failed");free(b->p);b->p=NULL;return NULL;}return b->p;}
+static char *bounded_attachment(VSContext *c,char *t,const char *path){char *q;if(!t)return NULL;q=vs_compact_text_limit(t,VS_MAX_ATTACHMENT_TEXT,"large attachment compacted");if(q&&strlen(q)<strlen(t)){char b[512];snprintf(b,sizeof(b),"attachment %.360s compacted before sending",path?path:"file");vs_trace(c,"limit",b);}free(t);return q;}
 
+static int hex4(const char *p,unsigned long *v){int i;unsigned long n=0;for(i=0;i<4;i++){unsigned char c=(unsigned char)p[i];n<<=4;if(c>='0'&&c<='9')n+=(unsigned long)(c-'0');else if(c>='a'&&c<='f')n+=(unsigned long)(c-'a'+10);else if(c>='A'&&c<='F')n+=(unsigned long)(c-'A'+10);else return -1;}*v=n;return 0;}
+static size_t put_utf8(char *o,size_t n,unsigned long cp){if(cp<=0x7fUL)o[n++]=(char)cp;else if(cp<=0x7ffUL){o[n++]=(char)(0xc0U|(cp>>6));o[n++]=(char)(0x80U|(cp&0x3fU));}else if(cp<=0xffffUL){o[n++]=(char)(0xe0U|(cp>>12));o[n++]=(char)(0x80U|((cp>>6)&0x3fU));o[n++]=(char)(0x80U|(cp&0x3fU));}else if(cp<=0x10ffffUL){o[n++]=(char)(0xf0U|(cp>>18));o[n++]=(char)(0x80U|((cp>>12)&0x3fU));o[n++]=(char)(0x80U|((cp>>6)&0x3fU));o[n++]=(char)(0x80U|(cp&0x3fU));}return n;}
 static char *json_unescape_string(const char *p){
     size_t cap=strlen(p)+1,n=0;char *o=(char*)malloc(cap);if(!o)return 0;
-    while(*p && *p!='"'){if(*p=='\\'){p++;if(!*p)break;switch(*p){case 'n':o[n++]='\n';break;case 'r':o[n++]='\r';break;case 't':o[n++]='\t';break;default:o[n++]=*p;}}else o[n++]=*p;p++;}o[n]=0;return o;
+    while(*p && *p!='"'){
+        if(*p=='\\'){
+            unsigned long cp=0,lo=0;
+            p++;if(!*p)break;
+            switch(*p){
+                case 'n':o[n++]='\n';break;case 'r':o[n++]='\r';break;case 't':o[n++]='\t';break;
+                case 'b':o[n++]='\b';break;case 'f':o[n++]='\f';break;case '"':o[n++]='"';break;
+                case '\\':o[n++]='\\';break;case '/':o[n++]='/';break;
+                case 'u':
+                    if(hex4(p+1,&cp)==0){
+                        p+=4;
+                        if(cp>=0xd800UL&&cp<=0xdbffUL&&p[1]=='\\'&&p[2]=='u'&&hex4(p+3,&lo)==0&&lo>=0xdc00UL&&lo<=0xdfffUL){cp=0x10000UL+((cp-0xd800UL)<<10)+(lo-0xdc00UL);p+=6;}
+                        if(cp>=0xd800UL&&cp<=0xdfffUL)cp=0xfffdUL;
+                        n=put_utf8(o,n,cp);
+                    } else o[n++]='u';
+                    break;
+                default:o[n++]=*p;break;
+            }
+        }else o[n++]=*p;
+        p++;
+    }
+    o[n]=0;return o;
 }
 static char *extract_after(const char *json,const char *needle){const char *p=strstr(json,needle);if(!p)return 0;p+=strlen(needle);while(*p&&*p!='"')p++;if(*p=='"')p++;return json_unescape_string(p);}
 static char *extract_text(const char *json){char *r;
@@ -77,7 +102,7 @@ static char *request_url(const char *base,VSProtocolKind protocol){
 }
 
 char *vs_build_system_prompt(const VSContext *c){
-    const char *base="You are VibeSolaris, a local coding agent. You may ask the host to use local tools by emitting exactly one directive on a line: [[VS_TOOL read path=\"FILE\"]], [[VS_TOOL run cmd=\"COMMAND\"]], or [[VS_TOOL write path=\"FILE\" content=\"TEXT_WITH_\\n_ESCAPES\"]]. The host will execute it and return TOOL_RESULT. MCP tools, when available, are listed below and may be called only with the documented VS_MCP directive. Prefer inspecting files before editing. Never assume Linux; honor the detected OS and CPU architecture.\n";
+    const char *base="You are VibeSolaris, a local coding agent. You may ask the host to use local tools by emitting exactly one directive on a line: [[VS_TOOL read path=\"FILE\"]], [[VS_TOOL run cmd=\"COMMAND\"]], [[VS_TOOL write path=\"FILE\" content=\"TEXT_WITH_\\n_ESCAPES\"]], or [[VS_TOOL image path=\"IMAGE_FILE\"]]. The host will execute it and return TOOL_RESULT. The image tool loads a local PNG/JPEG/GIF/WebP into the next model round as real visual input; use it after creating a screenshot, render, plot, CAD viewport capture, or other image that you need to inspect. When the user attaches an image, inspect the visual content directly rather than pretending it is only text. For GUI screenshots, distinguish visible pixel/layout observations from inferred causes; for CAD images, do not invent hidden dimensions or geometry that are not visible. A useful visual-debug loop is: inspect image -> inspect/edit source -> run/build -> capture a new screenshot/render with the run tool -> load it with the image tool -> compare and continue. MCP tools, when available, are listed below and may be called only with the documented VS_MCP directive. Prefer inspecting files before editing. Never assume Linux; honour the detected OS and CPU architecture.\n";
     char *mcp=vs_mcp_prompt_fragment(c);size_t n=strlen(base)+strlen(c->agent_md)+strlen(c->os_name)+strlen(c->os_release)+strlen(c->arch)+strlen(c->cwd)+(mcp?strlen(mcp):0)+768;char *o=(char*)malloc(n);
     if(!o){if(mcp)free(mcp);return NULL;}
     snprintf(o,n,"%sHost OS: %s %s\nCPU architecture: %s\nWorking directory: %s\n\nAGENT.MD:\n%s\n\nMCP TOOLS:\n%s\n",base,c->os_name,c->os_release,c->arch,c->cwd,c->agent_md[0]?c->agent_md:"(none)",mcp?mcp:"(none)");if(mcp)free(mcp);return o;
@@ -99,12 +124,12 @@ static char *build_openai_body(VSContext *c,const char *sys,const char *user){
     if(!first)badd(&b,",");
     badd(&b,"{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");bquoted(&b,user);badd(&b,"}");
     for(i=0;i<c->attachment_count;i++){
-        if(c->attachments[i].is_image){x=vs_cached_base64_file(c,c->attachments[i].path,0);if(x){mime=mime_for(c->attachments[i].path);badd(&b,",{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:");badd(&b,mime);badd(&b,";base64,");badd(&b,x);badd(&b,"\"}}");free(x);}}
-        else {t=vs_cached_read_file(c,c->attachments[i].path);if(t){e=vs_json_escape(t);badd(&b,",{\"type\":\"text\",\"text\":\"Attached file: ");x=vs_json_escape(c->attachments[i].path);badd(&b,x);free(x);badd(&b,"\\n");badd(&b,e);badd(&b,"\"}");free(e);free(t);}}
+        if(c->attachments[i].is_image){x=vs_cached_base64_file(c,c->attachments[i].path,0);if(x){char *label=(char*)malloc(strlen(c->attachments[i].path)+32);mime=mime_for(c->attachments[i].path);if(label){sprintf(label,"Attached image: %s",c->attachments[i].path);badd(&b,",{\"type\":\"text\",\"text\":");bquoted(&b,label);badd(&b,"}");free(label);}badd(&b,",{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:");badd(&b,mime);badd(&b,";base64,");badd(&b,x);badd(&b,"\"}}");free(x);}}
+        else {t=vs_cached_read_file(c,c->attachments[i].path);if(t){t=bounded_attachment(c,t,c->attachments[i].path);if(!t)continue;e=vs_json_escape(t);badd(&b,",{\"type\":\"text\",\"text\":\"Attached file: ");x=vs_json_escape(c->attachments[i].path);badd(&b,x);free(x);badd(&b,"\\n");badd(&b,e);badd(&b,"\"}");free(e);free(t);}}
     }
     badd(&b,"]}]");
     if(c->provider.kind==VS_PROVIDER_OPENAI && c->cache_enabled){badd(&b,",\"prompt_cache_key\":");bquoted(&b,c->cache_key);if(gpt56plus(c->provider.model))badd(&b,",\"prompt_cache_options\":{\"mode\":\"implicit\",\"ttl\":\"30m\"}");}
-    badd(&b,",\"temperature\":0.2}");return b.p;
+    badd(&b,",\"temperature\":0.2}");return bfinish(c,&b);
 }
 
 static char *build_claude_body(VSContext *c,const char *sys,const char *user){
@@ -117,10 +142,10 @@ static char *build_claude_body(VSContext *c,const char *sys,const char *user){
     if(!first)badd(&b,",");
     badd(&b,"{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");bquoted(&b,user);badd(&b,"}");
     for(i=0;i<c->attachment_count;i++){
-        if(c->attachments[i].is_image){x=vs_cached_base64_file(c,c->attachments[i].path,0);if(x){mime=mime_for(c->attachments[i].path);badd(&b,",{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":");bquoted(&b,mime);badd(&b,",\"data\":");bquoted(&b,x);badd(&b,"}}");free(x);}}
-        else {t=vs_cached_read_file(c,c->attachments[i].path);if(t){badd(&b,",{\"type\":\"text\",\"text\":");x=(char*)malloc(strlen(c->attachments[i].path)+strlen(t)+32);if(x){sprintf(x,"Attached file: %s\n%s",c->attachments[i].path,t);bquoted(&b,x);free(x);}else bquoted(&b,t);badd(&b,"}");free(t);}}
+        if(c->attachments[i].is_image){x=vs_cached_base64_file(c,c->attachments[i].path,0);if(x){char *label=(char*)malloc(strlen(c->attachments[i].path)+32);mime=mime_for(c->attachments[i].path);if(label){sprintf(label,"Attached image: %s",c->attachments[i].path);badd(&b,",{\"type\":\"text\",\"text\":");bquoted(&b,label);badd(&b,"}");free(label);}badd(&b,",{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":");bquoted(&b,mime);badd(&b,",\"data\":");bquoted(&b,x);badd(&b,"}}");free(x);}}
+        else {t=vs_cached_read_file(c,c->attachments[i].path);if(t){t=bounded_attachment(c,t,c->attachments[i].path);if(!t)continue;badd(&b,",{\"type\":\"text\",\"text\":");x=(char*)malloc(strlen(c->attachments[i].path)+strlen(t)+32);if(x){sprintf(x,"Attached file: %s\n%s",c->attachments[i].path,t);bquoted(&b,x);free(x);}else bquoted(&b,t);badd(&b,"}");free(t);}}
     }
-    badd(&b,"]}]}");return b.p;
+    badd(&b,"]}]}");return bfinish(c,&b);
 }
 
 static char *build_gemini_body(VSContext *c,const char *sys,const char *user){
@@ -131,10 +156,10 @@ static char *build_gemini_body(VSContext *c,const char *sys,const char *user){
     if(!first)badd(&b,",");
     badd(&b,"{\"role\":\"user\",\"parts\":[{\"text\":");bquoted(&b,user);badd(&b,"}");
     for(i=0;i<c->attachment_count;i++){
-        if(c->attachments[i].is_image){x=vs_cached_base64_file(c,c->attachments[i].path,0);if(x){mime=mime_for(c->attachments[i].path);badd(&b,",{\"inlineData\":{\"mimeType\":");bquoted(&b,mime);badd(&b,",\"data\":");bquoted(&b,x);badd(&b,"}}");free(x);}}
-        else {t=vs_cached_read_file(c,c->attachments[i].path);if(t){badd(&b,",{\"text\":");x=(char*)malloc(strlen(c->attachments[i].path)+strlen(t)+32);if(x){sprintf(x,"Attached file: %s\n%s",c->attachments[i].path,t);bquoted(&b,x);free(x);}else bquoted(&b,t);badd(&b,"}");free(t);}}
+        if(c->attachments[i].is_image){x=vs_cached_base64_file(c,c->attachments[i].path,0);if(x){char *label=(char*)malloc(strlen(c->attachments[i].path)+32);mime=mime_for(c->attachments[i].path);if(label){sprintf(label,"Attached image: %s",c->attachments[i].path);badd(&b,",{\"text\":");bquoted(&b,label);badd(&b,"}");free(label);}badd(&b,",{\"inlineData\":{\"mimeType\":");bquoted(&b,mime);badd(&b,",\"data\":");bquoted(&b,x);badd(&b,"}}");free(x);}}
+        else {t=vs_cached_read_file(c,c->attachments[i].path);if(t){t=bounded_attachment(c,t,c->attachments[i].path);if(!t)continue;badd(&b,",{\"text\":");x=(char*)malloc(strlen(c->attachments[i].path)+strlen(t)+32);if(x){sprintf(x,"Attached file: %s\n%s",c->attachments[i].path,t);bquoted(&b,x);free(x);}else bquoted(&b,t);badd(&b,"}");free(t);}}
     }
-    badd(&b,"]}]}");return b.p;
+    badd(&b,"]}]}");return bfinish(c,&b);
 }
 
 char *vs_chat(VSContext *c,const char *user){
@@ -148,11 +173,12 @@ char *vs_chat(VSContext *c,const char *user){
     if(c->provider.protocol==VS_PROTOCOL_GEMINI){
         if(!c->provider.api_key[0]){free(sys);return dupstr("No API key configured for Gemini.");}
         body=build_gemini_body(c,sys,user);
+        if(!body){free(sys);return dupstr("Request is too large or memory is exhausted; reduce attachments/context and retry.");}
         u=(char*)malloc(strlen(c->provider.base_url)+strlen(c->provider.model)+strlen(c->provider.api_key)+64);
         if(!u){free(body);free(sys);return dupstr("Out of memory");}
         sprintf(u,"%s/%s:generateContent?key=%s",c->provider.base_url,c->provider.model,c->provider.api_key);
         h[0]="Content-Type: application/json";
-        resp=vs_http_post(u,h,1,body,&status);free(u);free(body);free(sys);
+        resp=vs_http_post_ctx(c,u,h,1,body,&status);free(u);free(body);free(sys);
         if(!resp)return dupstr("HTTP request failed");
         capture_usage(c,resp);out=extract_text(resp);free(resp);return out;
     }
@@ -173,6 +199,7 @@ char *vs_chat(VSContext *c,const char *user){
 
     if(c->provider.protocol==VS_PROTOCOL_ANTHROPIC){
         body=build_claude_body(c,sys,user);
+        if(!body){free(endpoint);free(sys);return dupstr("Request is too large or memory is exhausted; reduce attachments/context and retry.");}
         h[nh++]="Content-Type: application/json";
         if(c->provider.kind==VS_PROVIDER_CLAUDE || c->provider.kind==VS_PROVIDER_DEEPSEEK){
             snprintf(apiheader,sizeof(apiheader),"x-api-key: %s",credential);h[nh++]=apiheader;
@@ -180,12 +207,13 @@ char *vs_chat(VSContext *c,const char *user){
             snprintf(auth,sizeof(auth),"Authorization: Bearer %s",credential);h[nh++]=auth;
         }
         h[nh++]="anthropic-version: 2023-06-01";
-        resp=vs_http_post(endpoint,h,nh,body,&status);
+        resp=vs_http_post_ctx(c,endpoint,h,nh,body,&status);
     }else{
         body=build_openai_body(c,sys,user);
+        if(!body){free(endpoint);free(sys);return dupstr("Request is too large or memory is exhausted; reduce attachments/context and retry.");}
         snprintf(auth,sizeof(auth),"Authorization: Bearer %s",credential);
         h[0]="Content-Type: application/json";h[1]=auth;
-        resp=vs_http_post(endpoint,h,2,body,&status);
+        resp=vs_http_post_ctx(c,endpoint,h,2,body,&status);
     }
     free(endpoint);free(body);free(sys);
     if(!resp)return dupstr("HTTP request failed");
