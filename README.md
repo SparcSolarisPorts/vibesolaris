@@ -1,4 +1,4 @@
-# VibeSolaris 0.10.3
+# VibeSolaris 0.10.5
 
 VibeSolaris is a lightweight local AI coding client intended to run on old and new Unix systems without requiring Electron, Qt, GTK, Java, Node.js, or a browser engine.
 
@@ -855,7 +855,7 @@ The installation tree uses `/usr/local/bin` for the binaries and `/usr/local/sha
 
 ## Stability on large operations
 
-VibeSolaris 0.10.3 hardens both front ends for long model/tool runs and large data.
+VibeSolaris 0.10.5 hardens both front ends for long model/tool runs and large data.
 
 The X11 GUI runs the agent on a background POSIX worker thread.  Xlib remains on the
 main thread, with live activity delivered over a pipe, so a slow API request, MCP
@@ -887,7 +887,7 @@ VibeSolaris keeps or sends in one in-memory operation.  When a limit is reached 
 Activity trace records a `limit` event instead of silently exhausting memory.
 
 Long autonomous turns are also protected against a different failure mode: losing
-the task or command capability after many model/tool cycles. VibeSolaris 0.10.3
+the task or command capability after many model/tool cycles. VibeSolaris 0.10.5
 raises the per-turn autonomous ceiling from 16 to 64 model rounds, keeps a compact
 copy of the original user task anchored in every continuation prompt, and emits a
 visible long-task checkpoint every 16 rounds. History compaction can therefore drop
@@ -1068,3 +1068,22 @@ If the bytes copy/paste correctly but boxes appear on screen, the UTF-8 path is 
 ## Compact GUI for lower-resolution displays
 
 The GUI automatically switches to a compact sidebar when the window is approximately 1100 pixels wide or less, or 800 pixels tall or less. At 1024×768 this reduces the sidebar width, button heights, vertical spacing and secondary sidebar information while retaining provider/model/authentication controls and token usage. The initial window size is also clamped to the current X11 display so it does not start larger than the screen.
+
+## Recovering from failed commands without asking the user
+
+VibeSolaris 0.10.5 distinguishes a **command failure** from a **command-runner failure**. A shell syntax error, compiler diagnostic, non-zero exit status, or timeout is returned to the model as a normal tool result with `COMMAND_RUNNER_STATUS: operational`. The model is expected to inspect the error, correct the command, and continue the active task automatically.
+
+Some models occasionally hallucinate that `VS_TOOL` or `TOOL_RESULT` has disappeared after seeing a failed shell command. There is no separate hidden result channel: VibeSolaris places the tool result directly into the next continuation message. If a model nevertheless asks the user to “restore VS_TOOL”, says that no `TOOL_RESULT` arrived, or claims that commands are unavailable immediately after an operational result, the host now runs a tiny local health probe. When that probe succeeds, the false blocker is ignored, a `tool-health` event appears in Activity, the previous tool result is re-anchored, and the model is told to correct the command and continue.
+
+A genuine host-level failure to `fork`, create the command pipe, or communicate with the child is still reported as `COMMAND_RUNNER_STATUS: host_error`; VibeSolaris does not conceal a real local execution failure.
+
+
+### False tool-bridge claims before any tool call
+
+VibeSolaris 0.10.5 also handles a model that claims the tool bridge is broken **without actually issuing a `VS_TOOL` directive**. For an execution task, statements such as “VS_TOOL is not returning `TOOL_RESULT`”, “re-enable the workspace tool bridge”, or “I cannot run commands” cause the host to run an independent command-runner health probe before any `VS_NEED_USER` request is honoured. If the probe succeeds, the blocker is suppressed, Activity records the recovery, and the model is reminded of the exact directive syntax, for example:
+
+```text
+[[VS_TOOL run cmd="pwd && uname -a"]]
+```
+
+This prevents a model from confusing *describing a command* with *actually asking VibeSolaris to execute it*. A user prompt is required only when the host probe itself fails or the task truly needs missing information, credentials, destructive-action permission, or an unsafe-to-infer decision.

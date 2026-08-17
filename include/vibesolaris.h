@@ -2,7 +2,7 @@
 #ifndef VIBESOLARIS_H
 #define VIBESOLARIS_H
 
-#define VS_VERSION "0.10.3"
+#define VS_VERSION "0.10.5"
 
 #include <stddef.h>
 
@@ -11,6 +11,8 @@
 #define VS_MAX_TEXT (1024*1024)
 #define VS_MAX_TOOL_ROUNDS 64
 #define VS_MAX_PLAN_CONTINUES 8
+#define VS_MAX_TOOL_RECOVERIES 8
+#define VS_MAX_TOOL_RECOVERIES 8
 #define VS_ACTIVE_TASK_MAX (16U*1024U)
 #define VS_LONG_TASK_CHECKPOINT 16
 #define VS_MAX_HISTORY 48
