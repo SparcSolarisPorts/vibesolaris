@@ -1,0 +1,31 @@
+VibeSolaris optional system configuration directory
+
+This directory is used only when it is writable by the current account. If it is not writable, VibeSolaris automatically stores that account's encrypted configuration under ~/.vibesolaris instead.
+
+===========================================
+
+At runtime VibeSolaris can create these files here:
+
+  config.enc   Encrypted system-wide provider/configuration data.
+  master.key   256-bit machine key encoded as hex.
+
+Both files are created with mode 0600 and the directory with mode 0700 by
+default.  Creating them under /etc normally requires root privileges.
+
+The encrypted file uses AES-256-CBC with encrypt-then-MAC HMAC-SHA256.
+Separate encryption and authentication keys are derived from the 256-bit
+machine key.  The key is never written into config.enc.
+
+For managed installations the master key can instead be supplied through the
+VIBESOLARIS_MASTER_KEY environment variable as exactly 64 hexadecimal
+characters.  In that mode master.key does not need to exist.
+
+Administrators who deliberately want several users to share the same global
+credentials should grant access through a dedicated OS group/ACL rather than
+making master.key world-readable.
+
+VibeSolaris 0.9.5 autosaves provider selection, per-provider models and API
+credentials, protocol URLs, cache setting, and MCP server definitions to
+config.enc whenever those settings change and this directory is writable.
+MCP remote bearer tokens are therefore encrypted at rest with the same system
+configuration mechanism.
