@@ -46,17 +46,33 @@ static char *strip_marker(const char *s,const char *marker){
     const char *p;char *o;size_t a,b;if(!s)return dupstr("");p=strstr(s,marker);if(!p)return dupstr(s);a=(size_t)(p-s);b=strlen(p+strlen(marker));o=(char*)malloc(a+b+1);if(!o)return 0;memcpy(o,s,a);memcpy(o+a,p+strlen(marker),b+1);return o;
 }
 
+static char *continuation_prompt(const char *task,const char *result,int planning_only){
+    const char *tail="Continue executing the ACTIVE_TASK autonomously. The local command runner remains available even after a command returns a non-zero status, times out, or prints an error; inspect the result, correct the problem, and run another command when useful. Do not stop merely to describe what you will do next and do not ask the user to send another prompt just to continue. Use VS_TOOL or VS_MCP directives as needed. Ask the user only if genuinely blocked, using [[VS_NEED_USER question=\"YOUR QUESTION\"]]. When the requested task is actually complete, emit [[VS_FINAL]] followed by the concise result.";
+    const char *lead=planning_only?"AUTONOMY_CONTINUE: the previous response described future work without executing it. Execute the next concrete step now.":"TOOL_RESULT:";
+    size_t n=strlen(task?task:"")+strlen(result?result:"")+strlen(lead)+strlen(tail)+160;
+    char *o=(char*)malloc(n);
+    if(!o)return NULL;
+    if(planning_only)snprintf(o,n,"ACTIVE_TASK (persistent anchor; do not ask the user to restate it):\n%s\n\n%s\n\n%s",task?task:"",lead,tail);
+    else snprintf(o,n,"ACTIVE_TASK (persistent anchor; do not ask the user to restate it):\n%s\n\n%s\n%s\n\n%s",task?task:"",lead,result?result:"",tail);
+    return o;
+}
+
 char *vs_agent_turn(VSContext *c,const char *user){
-    char *prompt=dupstr(user),*ans=0,*original=dupstr(user);int round,plan_continues=0;
+    char *prompt=dupstr(user),*ans=0,*original=dupstr(user),*task_anchor=0;int round,plan_continues=0,max_rounds=VS_MAX_TOOL_ROUNDS;
     char step[512];
+    {const char *mr=getenv("VIBESOLARIS_MAX_AGENT_ROUNDS");if(mr&&*mr){char *ep=0;long v=strtol(mr,&ep,10);if(ep&&*ep==0&&v>=8&&v<=256)max_rounds=(int)v;}}
     if(!prompt||!original){free(prompt);free(original);return dupstr("out of memory");}
+    task_anchor=vs_compact_text_limit(original,VS_ACTIVE_TASK_MAX,"active task anchor compacted");
+    if(!task_anchor)task_anchor=dupstr(original);
+    if(!task_anchor){free(prompt);free(original);return dupstr("out of memory");}
     vs_trace_clear(c);
     vs_trace(c,"agent","starting agent turn");
     if(c->mcp_server_count>0){int n=vs_mcp_refresh_all(c,0);snprintf(step,sizeof(step),"MCP catalogue ready: %d tool(s)",n<0?0:n);vs_trace(c,"mcp",step);}
-    for(round=0;round<VS_MAX_TOOL_ROUNDS;round++){
-        char *tool,*mcp,*result=0,*next;size_t n;
+    for(round=0;round<max_rounds;round++){
+        char *tool,*mcp,*result=0,*next;
+        if(round>0 && (round%VS_LONG_TASK_CHECKPOINT)==0){snprintf(step,sizeof(step),"long-task checkpoint: %d rounds completed; local command and MCP tools remain available",round);vs_trace(c,"checkpoint",step);}
         snprintf(step,sizeof(step),"model round %d",round+1);vs_trace(c,"model",step);
-        free(ans);ans=vs_chat(c,prompt);if(!ans){free(prompt);free(original);return dupstr("provider error");}
+        free(ans);ans=vs_chat(c,prompt);if(!ans){free(prompt);free(original);free(task_anchor);return dupstr("provider error");}
         vs_trace(c,"model-result","model response received");
 
         /* Explicit lifecycle markers are optional but make the cross-provider
@@ -80,11 +96,11 @@ char *vs_agent_turn(VSContext *c,const char *user){
         mcp=strstr(ans,"[[VS_MCP ");
         if(!tool && !mcp){
             if(plan_continues<VS_MAX_PLAN_CONTINUES && should_auto_continue(original,ans)){
-                const char *nudge="AUTONOMY_CONTINUE:\nYou have described work you intend to do but have not executed it. Do not stop at a plan or ask the user to prompt you again. Execute the next concrete step now using VS_TOOL or VS_MCP directives as needed. Continue autonomously until the requested work is actually complete. Ask the user only if you are genuinely blocked by missing information, credentials, destructive-action permission, or a decision that cannot safely be inferred; in that case emit [[VS_NEED_USER question=\"YOUR QUESTION\"]]. When the task is actually complete, answer with [[VS_FINAL]] followed by the concise result.";
                 plan_continues++;
                 snprintf(step,sizeof(step),"planning-only response detected; automatically continuing (%d/%d)",plan_continues,VS_MAX_PLAN_CONTINUES);vs_trace(c,"auto-continue",step);
                 vs_history_add(c,"user",prompt);vs_history_add(c,"assistant",ans);
-                free(prompt);prompt=dupstr(nudge);if(!prompt){vs_trace(c,"memory-error","could not allocate autonomy continuation prompt");break;}
+                next=continuation_prompt(task_anchor,NULL,1);
+                free(prompt);prompt=next;if(!prompt){vs_trace(c,"memory-error","could not allocate autonomy continuation prompt");break;}
                 continue;
             }
             vs_history_add(c,"user",prompt);vs_history_add(c,"assistant",ans);vs_trace(c,"agent","completed without further tool calls");break;
@@ -107,7 +123,15 @@ char *vs_agent_turn(VSContext *c,const char *user){
         } else if(!strncmp(tool+10,"read ",5)){
             char *p=attr(tool,"path");snprintf(step,sizeof(step),"read file %s",p?p:"?");vs_trace(c,"tool-read",step);result=p?vs_cached_read_file(c,p):0;if(!result)result=dupstr("ERROR: unable to read file");free(p);
         } else if(!strncmp(tool+10,"run ",4)){
-            char *cmd=attr(tool,"cmd");int st=0;snprintf(step,sizeof(step),"run command %.430s",cmd?cmd:"?");vs_trace(c,"tool-run",step);result=cmd?vs_run_command(cmd,&st):0;if(!result)result=dupstr("ERROR: command failed");snprintf(step,sizeof(step),"command exit %d",st);vs_trace(c,"tool-result",step);free(cmd);
+            char *cmd=attr(tool,"cmd"),*raw=0;int st=0;
+            snprintf(step,sizeof(step),"run command %.430s",cmd?cmd:"?");vs_trace(c,"tool-run",step);
+            raw=cmd?vs_run_command(cmd,&st):0;
+            if(!raw)raw=dupstr("ERROR: the host could not start the command process. This is a per-command failure; the command tool itself remains available for another attempt.");
+            if(raw){size_t z=strlen(raw)+160;result=(char*)malloc(z);if(result)snprintf(result,z,"COMMAND_EXIT_STATUS: %d\nCOMMAND_TOOL_AVAILABLE: yes\nOUTPUT:\n%s",st,raw);free(raw);}
+            if(!result)result=dupstr("ERROR: command result allocation failed; command tool remains available");
+            if(st==124)snprintf(step,sizeof(step),"command timed out (exit 124); command runner remains available");
+            else snprintf(step,sizeof(step),"command exit %d; command runner remains available",st);
+            vs_trace(c,"tool-result",step);free(cmd);
         } else if(!strncmp(tool+10,"write ",6)){
             char *p=attr(tool,"path"),*ct=attr(tool,"content");int rc=-1;if(ct)unesc(ct);snprintf(step,sizeof(step),"write file %s",p?p:"?");vs_trace(c,"tool-write",step);if(p&&ct)rc=vs_write_file(p,ct);if(rc==0&&p)vs_cache_invalidate(c,p);result=dupstr(rc==0?"OK: file written":"ERROR: write failed");free(p);free(ct);
         } else result=dupstr("ERROR: unknown tool");
@@ -118,11 +142,14 @@ char *vs_agent_turn(VSContext *c,const char *user){
             snprintf(step,sizeof(step),"%.470s",result);vs_trace(c,"tool-output",step);
         }
         vs_history_add(c,"user",prompt);vs_history_add(c,"assistant",ans);
-        n=strlen(result?result:"")+512;next=(char*)malloc(n);if(!next){free(result);vs_trace(c,"memory-error","could not allocate next tool round prompt");break;}
-        snprintf(next,n,"TOOL_RESULT:\n%s\n\nContinue executing the original user request autonomously. Do not stop merely to describe what you will do next. Use another VS_TOOL or VS_MCP directive if more work remains. Ask the user only if genuinely blocked, using [[VS_NEED_USER question=\"YOUR QUESTION\"]]. When the requested task is actually complete, emit [[VS_FINAL]] followed by the concise result.",result?result:"");
+        next=continuation_prompt(task_anchor,result,0);
+        if(!next){free(result);vs_trace(c,"memory-error","could not allocate next tool round prompt");break;}
         free(result);free(prompt);prompt=next;
     }
-    if(round>=VS_MAX_TOOL_ROUNDS)vs_trace(c,"limit","maximum autonomous agent rounds reached");
-    free(prompt);free(original);return ans;
+    if(round>=max_rounds){
+        snprintf(step,sizeof(step),"maximum autonomous agent rounds reached (%d); local command execution is not disabled and remains available on the next turn",max_rounds);vs_trace(c,"limit",step);
+        if(ans && (strstr(ans,"[[VS_TOOL ")||strstr(ans,"[[VS_MCP "))){free(ans);ans=dupstr("The single-turn autonomous safety ceiling was reached while work was still in progress. Local command execution is still available. For unusually large jobs, raise VIBESOLARIS_MAX_AGENT_ROUNDS (up to 256) and continue from the existing files and conversation state.");}
+    }
+    free(prompt);free(original);free(task_anchor);return ans;
 }
 

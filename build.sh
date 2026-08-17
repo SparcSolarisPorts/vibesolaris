@@ -7,7 +7,7 @@ set -eu
 SCRIPT_DIR=`dirname "$0"`
 ROOT=`cd "$SCRIPT_DIR" && pwd`
 OUT="$ROOT/dist"
-VERSION=0.10.2
+VERSION=0.10.3
 HOST_OS=`uname -s 2>/dev/null || echo unknown`
 
 mkdir -p "$OUT"

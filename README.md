@@ -1,4 +1,4 @@
-# VibeSolaris 0.10.2
+# VibeSolaris 0.10.3
 
 VibeSolaris is a lightweight local AI coding client intended to run on old and new Unix systems without requiring Electron, Qt, GTK, Java, Node.js, or a browser engine.
 
@@ -855,7 +855,7 @@ The installation tree uses `/usr/local/bin` for the binaries and `/usr/local/sha
 
 ## Stability on large operations
 
-VibeSolaris 0.10.2 hardens both front ends for long model/tool runs and large data.
+VibeSolaris 0.10.3 hardens both front ends for long model/tool runs and large data.
 
 The X11 GUI runs the agent on a background POSIX worker thread.  Xlib remains on the
 main thread, with live activity delivered over a pipe, so a slow API request, MCP
@@ -885,6 +885,41 @@ These limits are safety rails for an interactive coding agent.  They do not limi
 files that a command edits on disk; they limit how much command/API/attachment data
 VibeSolaris keeps or sends in one in-memory operation.  When a limit is reached the
 Activity trace records a `limit` event instead of silently exhausting memory.
+
+Long autonomous turns are also protected against a different failure mode: losing
+the task or command capability after many model/tool cycles. VibeSolaris 0.10.3
+raises the per-turn autonomous ceiling from 16 to 64 model rounds, keeps a compact
+copy of the original user task anchored in every continuation prompt, and emits a
+visible long-task checkpoint every 16 rounds. History compaction can therefore drop
+older intermediate chatter without dropping the instruction the agent is currently
+executing.
+
+The command runner now captures **both stdout and stderr**, always returns the
+command exit status to the model, and explicitly tells the model that the command
+tool remains available after a failed command. Commands run with stdin connected to
+`/dev/null` so an unexpected interactive prompt cannot silently consume GUI/TUI
+input. A portable watchdog terminates a stuck command (including a child that leaves
+the output pipe open) after 30 minutes by default.
+Override that timeout (10 to 86400 seconds) with, for example:
+
+```sh
+VIBESOLARIS_COMMAND_TIMEOUT=7200 ./vibesolaris-gui
+```
+
+
+The default autonomous ceiling is 64 model rounds. Extremely large jobs can raise
+it without recompiling, up to 256 rounds:
+
+```sh
+VIBESOLARIS_MAX_AGENT_ROUNDS=128 ./vibesolaris-gui
+```
+
+The ceiling remains finite to prevent a broken model/tool loop from spending tokens
+or running commands indefinitely.
+
+A timeout uses exit status `124`; it does **not** disable future command execution.
+The completed trace buffer is large enough to retain up to 512 recent activity
+entries, while the TUI still streams activity live as it occurs.
 
 ## Troubleshooting
 

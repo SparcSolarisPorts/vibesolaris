@@ -8,6 +8,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/select.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <errno.h>
+#include <time.h>
 #ifdef __sun
 #include <sys/systeminfo.h>
 #endif
@@ -234,36 +239,109 @@ int vs_write_file(const char *path, const char *text) {
 }
 
 char *vs_run_command(const char *cmd, int *exit_code) {
-    FILE *p; char buf[8192];
+    int fds[2], flags, status=0, child_done=0, eof_seen=0, timed_out=0, detached_output=0;
+    pid_t pid;
+    char buf[8192];
     size_t head_cap=VS_MAX_COMMAND_CAPTURE/2, tail_cap=VS_MAX_COMMAND_CAPTURE/2;
     size_t head_n=0, tail_n=0, tail_pos=0, total=0, n, i, out_n, marker_n;
     char *head, *tail, *out; int truncated=0;
     const char *marker="\n...[command output truncated by VibeSolaris]...\n";
+    char timeout_marker[160],detached_marker[192];
+    long timeout_sec=1800;
+    time_t started,child_done_at=0;
+    const char *te;
+
+    if(exit_code)*exit_code=-1;
+    if(!cmd||!*cmd)return dupstr("ERROR: empty command");
+    te=getenv("VIBESOLARIS_COMMAND_TIMEOUT");
+    if(te&&*te){char *ep=0;long v=strtol(te,&ep,10);if(ep&&*ep==0&&v>=10&&v<=86400)timeout_sec=v;}
+
     head=(char*)malloc(head_cap?head_cap:1);tail=(char*)malloc(tail_cap?tail_cap:1);
     if(!head||!tail){free(head);free(tail);return NULL;}
-    p=popen(cmd,"r"); if(!p){free(head);free(tail);return NULL;}
-    while((n=fread(buf,1,sizeof(buf),p))>0){
-        total+=n;
-        if(total>(size_t)VS_MAX_COMMAND_CAPTURE)truncated=1;
-        for(i=0;i<n;i++){
-            unsigned char ch=(unsigned char)buf[i];
-            if(head_n<head_cap) head[head_n++]=(char)ch;
-            else if(tail_cap){tail[tail_pos]=(char)ch;tail_pos=(tail_pos+1)%tail_cap;if(tail_n<tail_cap)tail_n++;}
-            else if(total>(size_t)VS_MAX_COMMAND_CAPTURE)truncated=1;
+    if(pipe(fds)!=0){free(head);free(tail);return NULL;}
+
+    pid=fork();
+    if(pid<0){close(fds[0]);close(fds[1]);free(head);free(tail);return NULL;}
+    if(pid==0){
+        int devnull;
+        (void)setpgid(0,0);
+        close(fds[0]);
+        if(dup2(fds[1],STDOUT_FILENO)<0)_exit(126);
+        if(dup2(fds[1],STDERR_FILENO)<0)_exit(126);
+        if(fds[1]>STDERR_FILENO)close(fds[1]);
+        devnull=open("/dev/null",O_RDONLY);
+        if(devnull>=0){(void)dup2(devnull,STDIN_FILENO);if(devnull>STDERR_FILENO)close(devnull);}
+        execl("/bin/sh","sh","-c",cmd,(char*)0);
+        _exit(127);
+    }
+
+    close(fds[1]);
+    (void)setpgid(pid,pid);
+    flags=fcntl(fds[0],F_GETFL,0);if(flags>=0)(void)fcntl(fds[0],F_SETFL,flags|O_NONBLOCK);
+    started=time(NULL);
+    while(!eof_seen || !child_done){
+        fd_set rfds;struct timeval tv;int sr;
+        FD_ZERO(&rfds);FD_SET(fds[0],&rfds);tv.tv_sec=1;tv.tv_usec=0;
+        sr=select(fds[0]+1,&rfds,NULL,NULL,&tv);
+        if(sr>0&&FD_ISSET(fds[0],&rfds)){
+            for(;;){
+                ssize_t rr=read(fds[0],buf,sizeof(buf));
+                if(rr>0){
+                    n=(size_t)rr;total+=n;if(total>(size_t)VS_MAX_COMMAND_CAPTURE)truncated=1;
+                    for(i=0;i<n;i++){
+                        unsigned char ch=(unsigned char)buf[i];
+                        if(head_n<head_cap)head[head_n++]=(char)ch;
+                        else if(tail_cap){tail[tail_pos]=(char)ch;tail_pos=(tail_pos+1)%tail_cap;if(tail_n<tail_cap)tail_n++;}
+                    }
+                }else if(rr==0){eof_seen=1;break;}
+                else if(errno==EINTR)continue;
+                else if(errno==EAGAIN||errno==EWOULDBLOCK)break;
+                else {eof_seen=1;break;}
+            }
+        }else if(sr<0&&errno!=EINTR){eof_seen=1;}
+
+        if(!child_done){
+            pid_t wr=waitpid(pid,&status,WNOHANG);
+            if(wr==pid){child_done=1;child_done_at=time(NULL);}
+            else if(wr<0&&errno!=EINTR){child_done=1;status=0;}
+        }
+        if(child_done && !eof_seen && child_done_at && time(NULL)-child_done_at>=2){
+            /* A daemon/background grandchild inherited stdout/stderr after the
+               requested shell command itself exited. Do not make the coding
+               agent wait forever for that inherited descriptor. */
+            detached_output=1;eof_seen=1;break;
+        }
+        if(time(NULL)-started>=timeout_sec && (!child_done || !eof_seen)){
+            timed_out=1;
+            if(kill(-pid,SIGTERM)!=0 && !child_done)(void)kill(pid,SIGTERM);
+            {struct timeval grace;grace.tv_sec=1;grace.tv_usec=0;(void)select(0,NULL,NULL,NULL,&grace);}
+            (void)kill(-pid,SIGKILL);
+            if(!child_done){while(waitpid(pid,&status,0)<0&&errno==EINTR){}child_done=1;}
+            eof_seen=1;
+            break;
         }
     }
-    {
-        int st=pclose(p);
-        if(exit_code){ if(WIFEXITED(st))*exit_code=WEXITSTATUS(st); else *exit_code=-1; }
+    close(fds[0]);
+
+    if(exit_code){
+        if(timed_out)*exit_code=124;
+        else if(WIFEXITED(status))*exit_code=WEXITSTATUS(status);
+        else if(WIFSIGNALED(status))*exit_code=128+WTERMSIG(status);
+        else *exit_code=-1;
     }
-    marker_n=truncated?strlen(marker):0;
-    out_n=head_n+tail_n+(truncated?marker_n:0);
+
+    timeout_marker[0]=0;detached_marker[0]=0;
+    if(timed_out)snprintf(timeout_marker,sizeof(timeout_marker),"\n...[command timed out after %ld seconds; process group terminated]...\n",timeout_sec);
+    if(detached_output)snprintf(detached_marker,sizeof(detached_marker),"\n...[command exited; a detached/background child kept the output pipe open, so capture was closed]...\n");
+    marker_n=(truncated?strlen(marker):0)+strlen(timeout_marker)+strlen(detached_marker);
+    out_n=head_n+tail_n+marker_n;
     out=(char*)malloc(out_n+1);if(!out){free(head);free(tail);return NULL;}
     memcpy(out,head,head_n);i=head_n;
+    if(truncated){memcpy(out+i,marker,strlen(marker));i+=strlen(marker);}
+    if(timeout_marker[0]){memcpy(out+i,timeout_marker,strlen(timeout_marker));i+=strlen(timeout_marker);}
+    if(detached_marker[0]){memcpy(out+i,detached_marker,strlen(detached_marker));i+=strlen(detached_marker);}
     {
-        size_t first, j;
-        if(truncated){memcpy(out+i,marker,marker_n);i+=marker_n;first=(tail_n==tail_cap)?tail_pos:0;}
-        else first=0;
+        size_t first=(tail_n==tail_cap)?tail_pos:0,j;
         for(j=0;j<tail_n;j++)out[i++]=tail[(first+j)%tail_cap];
     }
     out[i]=0;
