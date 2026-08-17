@@ -65,7 +65,7 @@ static char *strip_marker(const char *s,const char *marker){
 }
 
 static char *continuation_prompt(const char *task,const char *result,int planning_only){
-    const char *tail="Continue executing the ACTIVE_TASK autonomously. TOOL_RESULT is ordinary text delivered in this continuation message; there is no separate hidden tool-result transport/channel that the user must restore. If COMMAND_RUNNER_STATUS is operational, the local command runner is confirmed working even when COMMAND_EXIT_STATUS is non-zero, the shell reports a syntax error, a compiler fails, or a command times out. Inspect the result, correct the command/problem, and run another command when useful. Do not stop merely to describe what you will do next and do not ask the user to send another prompt just to continue. Use VS_TOOL or VS_MCP directives as needed. Ask the user only if genuinely blocked by task information, credentials, or permission, using [[VS_NEED_USER question=\"YOUR QUESTION\"]]. When the requested task is actually complete, emit [[VS_FINAL]] followed by the concise result.";
+    const char *tail="Continue executing the ACTIVE_TASK autonomously. TOOL_RESULT is ordinary text delivered in this continuation message; there is no separate hidden tool-result transport/channel that the user must restore. If COMMAND_RUNNER_STATUS is operational, the local command runner is confirmed working even when COMMAND_EXIT_STATUS is non-zero, the shell reports a syntax error, a compiler fails, or a command times out. Inspect the result, correct the command/problem, and run another command when useful. Do not stop merely to describe what you will do next and do not ask the user to send another prompt just to continue. Use VS_TOOL or VS_MCP directives as needed. Ask the user only if genuinely blocked by task information, credentials, or permission, using [[VS_NEED_USER question=\"YOUR QUESTION\"]]. When the requested task is actually complete, emit [[VS_FINAL]] followed by the concise result. Never combine VS_FINAL with VS_TOOL or VS_MCP in one response; pending executable directives always run first.";
     const char *lead=planning_only?"AUTONOMY_CONTINUE: the previous response described future work without executing it. Execute the next concrete step now.":"TOOL_RESULT (delivered successfully by the host):";
     size_t n=strlen(task?task:"")+strlen(result?result:"")+strlen(lead)+strlen(tail)+192;
     char *o=(char*)malloc(n);
@@ -76,7 +76,7 @@ static char *continuation_prompt(const char *task,const char *result,int plannin
 }
 
 static char *tool_channel_recovery_prompt(const char *task,const char *last_result,const char *claim,int actual_tool_seen){
-    const char *tail="The host independently verified that the local command runner is operational. Do not ask the user to restore VS_TOOL, TOOL_RESULT, or a workspace/tool bridge. If you want to run a command, you MUST actually emit a directive such as [[VS_TOOL run cmd=\"pwd && uname -a\"]] on its own line and wait for the host result. Never claim that a command produced no result when you did not emit a VS_TOOL directive. A shell/compiler failure is a normal result to inspect and correct. Continue the ACTIVE_TASK now using VS_TOOL or VS_MCP as needed. Ask the user only for genuinely missing task information, credentials, destructive-action permission, or a decision that cannot safely be inferred. Emit [[VS_FINAL]] only after the requested work is actually complete.";
+    const char *tail="The host independently verified that the local command runner is operational. Do not ask the user to restore VS_TOOL, TOOL_RESULT, or a workspace/tool bridge. If you want to run a command, you MUST actually emit a directive such as [[VS_TOOL run cmd=\"pwd && uname -a\"]] on its own line and wait for the host result. Never claim that a command produced no result when you did not emit a VS_TOOL directive. A shell/compiler failure is a normal result to inspect and correct. Continue the ACTIVE_TASK now using VS_TOOL or VS_MCP as needed. Ask the user only for genuinely missing task information, credentials, destructive-action permission, or a decision that cannot safely be inferred. Emit [[VS_FINAL]] only after the requested work is actually complete, and never in the same response as VS_TOOL or VS_MCP.";
     const char *seen=actual_tool_seen?"A real VS_TOOL/VS_MCP request had previously been executed in this turn.":"IMPORTANT: no VS_TOOL or VS_MCP directive was present in the model response that made this claim. The model therefore did not actually attempt the command it says failed.";
     size_t n=strlen(task?task:"")+strlen(last_result?last_result:"")+strlen(claim?claim:"")+strlen(tail)+strlen(seen)+512;
     char *o=(char*)malloc(n);
@@ -104,10 +104,23 @@ char *vs_agent_turn(VSContext *c,const char *user){
         free(ans);ans=vs_chat(c,prompt);if(!ans){free(prompt);free(original);free(task_anchor);free(last_tool_result);return dupstr("provider error");}
         vs_trace(c,"model-result","model response received");
 
+        /* Parse executable directives BEFORE lifecycle markers.  Some models
+           embed a VS_TOOL/VS_MCP directive in prose and also append VS_FINAL.
+           A pending tool action always takes precedence: VS_FINAL is only valid
+           after a response contains no executable directive. */
+        tool=strstr(ans,"[[VS_TOOL ");
+        mcp=strstr(ans,"[[VS_MCP ");
+        if((tool||mcp) && strstr(ans,"[[VS_FINAL]]")){
+            char *clean=strip_marker(ans,"[[VS_FINAL]]");
+            vs_trace(c,"protocol","deferred premature VS_FINAL because an executable directive is pending");
+            if(clean){free(ans);ans=clean;tool=strstr(ans,"[[VS_TOOL ");mcp=strstr(ans,"[[VS_MCP ");}
+        }
+
         /* A model may hallucinate a broken tool bridge without ever emitting a
-           VS_TOOL directive.  Verify any such claim independently on execution
-           tasks, before honouring a false VS_NEED_USER blocker. */
-        if(execution_intent(original) && false_tool_unavailable_claim(ans) && tool_recoveries<VS_MAX_TOOL_RECOVERIES){
+           VS_TOOL directive.  Only run the independent health-probe path when
+           there is NO executable directive waiting in this same response.  If
+           there is a directive, execute it and let its real result speak. */
+        if(!tool && !mcp && execution_intent(original) && false_tool_unavailable_claim(ans) && tool_recoveries<VS_MAX_TOOL_RECOVERIES){
             char *probe=0,*recover=0;int pst=-1;
             tool_recoveries++;
             snprintf(step,sizeof(step),"model claimed tool channel unavailable%s; probing command runner (%d/%d)",actual_tool_seen?" after tool use":" without issuing a tool directive",tool_recoveries,VS_MAX_TOOL_RECOVERIES);vs_trace(c,"tool-health",step);
@@ -127,24 +140,22 @@ char *vs_agent_turn(VSContext *c,const char *user){
         }
 
         /* Explicit lifecycle markers are optional but make the cross-provider
-           text protocol deterministic when a model supports the instruction. */
-        if(strstr(ans,"[[VS_NEED_USER")){
+           text protocol deterministic when a model supports the instruction.
+           They are honoured only when there is no pending executable directive. */
+        if(!tool && !mcp && strstr(ans,"[[VS_NEED_USER")){
             char *q=attr(strstr(ans,"[[VS_NEED_USER"),"question");
             vs_trace(c,"agent","paused because the model genuinely needs user input");
             if(q&&*q){free(ans);ans=q;}else free(q);
             vs_history_add(c,"user",prompt);vs_history_add(c,"assistant",ans);
             break;
         }
-        if(strstr(ans,"[[VS_FINAL]]")){
+        if(!tool && !mcp && strstr(ans,"[[VS_FINAL]]")){
             char *clean=strip_marker(ans,"[[VS_FINAL]]");
             if(clean){free(ans);ans=clean;}
             vs_history_add(c,"user",prompt);vs_history_add(c,"assistant",ans);
             vs_trace(c,"agent","completed with explicit final marker");
             break;
         }
-
-        tool=strstr(ans,"[[VS_TOOL ");
-        mcp=strstr(ans,"[[VS_MCP ");
         if(!tool && !mcp){
             if(plan_continues<VS_MAX_PLAN_CONTINUES && should_auto_continue(original,ans)){
                 plan_continues++;

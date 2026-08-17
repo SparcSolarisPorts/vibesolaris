@@ -2,7 +2,7 @@
 #ifndef VIBESOLARIS_H
 #define VIBESOLARIS_H
 
-#define VS_VERSION "0.10.5"
+#define VS_VERSION "0.10.6"
 
 #include <stddef.h>
 

@@ -1,4 +1,4 @@
-# VibeSolaris 0.10.5
+# VibeSolaris 0.10.6
 
 VibeSolaris is a lightweight local AI coding client intended to run on old and new Unix systems without requiring Electron, Qt, GTK, Java, Node.js, or a browser engine.
 
@@ -1087,3 +1087,10 @@ VibeSolaris 0.10.5 also handles a model that claims the tool bridge is broken **
 ```
 
 This prevents a model from confusing *describing a command* with *actually asking VibeSolaris to execute it*. A user prompt is required only when the host probe itself fails or the task truly needs missing information, credentials, destructive-action permission, or an unsafe-to-infer decision.
+
+
+## 0.10.6 — executable directives take precedence over final markers
+
+Some models occasionally emit a real `[[VS_TOOL ...]]` or `[[VS_MCP ...]]` directive inside explanatory prose and then append `[[VS_FINAL]]` in the same response. Earlier releases could honour the final marker first, leaving the literal tool directive visible in the answer without executing it.
+
+VibeSolaris 0.10.6 parses executable directives before lifecycle markers. If a response contains a tool/MCP directive, that directive is executed even when `VS_FINAL` or `VS_NEED_USER` also appears in the response. A premature `VS_FINAL` is removed and Activity records `deferred premature VS_FINAL because an executable directive is pending`. Final completion is accepted only on a subsequent response containing no pending executable directive. This applies equally to directives on their own line, embedded in prose, or surrounded by Markdown text.
