@@ -93,7 +93,7 @@ static char *tool_channel_recovery_prompt(const char *task,const char *last_resu
 
 
 char *vs_agent_turn(VSContext *c,const char *user){
-    char *prompt=dupstr(user),*ans=0,*original=dupstr(user),*task_anchor=0,*last_tool_result=0;int round,plan_continues=0,tool_recoveries=0,command_runner_confirmed=0,actual_tool_seen=0,execution_mode=0,max_rounds=VS_MAX_TOOL_ROUNDS;
+    char *prompt=dupstr(user),*ans=0,*original=dupstr(user),*task_anchor=0,*last_tool_result=0;int round,plan_continues=0,tool_recoveries=0,command_runner_confirmed=0,actual_tool_seen=0,execution_mode=0,cancelled=0,max_rounds=VS_MAX_TOOL_ROUNDS;
     char step[512];
     {const char *mr=getenv("VIBESOLARIS_MAX_AGENT_ROUNDS");if(mr&&*mr){char *ep=0;long v=strtol(mr,&ep,10);if(ep&&*ep==0&&v>=8&&v<=256)max_rounds=(int)v;}}
     if(!prompt||!original){free(prompt);free(original);return dupstr("out of memory");}
@@ -103,12 +103,18 @@ char *vs_agent_turn(VSContext *c,const char *user){
     execution_mode=execution_intent(original);
     vs_trace_clear(c);
     vs_trace(c,"agent","starting agent turn");
-    if(c->mcp_server_count>0){int n=vs_mcp_refresh_all(c,0);snprintf(step,sizeof(step),"MCP catalogue ready: %d tool(s)",n<0?0:n);vs_trace(c,"mcp",step);}
-    for(round=0;round<max_rounds;round++){
+    if(vs_cancel_requested(c)){cancelled=1;vs_trace(c,"cancel","agent turn stopped by user before work began");}
+    if(!cancelled&&c->mcp_server_count>0){int n=vs_mcp_refresh_all(c,0);if(vs_cancel_requested(c)){cancelled=1;vs_trace(c,"cancel","agent turn stopped while preparing MCP tools");}else{snprintf(step,sizeof(step),"MCP catalogue ready: %d tool(s)",n<0?0:n);vs_trace(c,"mcp",step);}}
+    for(round=0;!cancelled&&round<max_rounds;round++){
         char *tool,*mcp,*result=0,*next;
+        if(vs_cancel_requested(c)){cancelled=1;vs_trace(c,"cancel","agent turn stopped by user");break;}
         if(round>0 && (round%VS_LONG_TASK_CHECKPOINT)==0){snprintf(step,sizeof(step),"long-task checkpoint: %d rounds completed; local command and MCP tools remain available",round);vs_trace(c,"checkpoint",step);}
         snprintf(step,sizeof(step),"model round %d",round+1);vs_trace(c,"model",step);
+        vs_trace(c,"model-input",prompt);
+        vs_trace(c,"model-wait","requesting provider response");
         free(ans);ans=vs_chat(c,prompt);if(!ans){free(prompt);free(original);free(task_anchor);free(last_tool_result);return dupstr("provider error");}
+        if(vs_cancel_requested(c)){cancelled=1;free(ans);ans=dupstr("Stopped by user.");vs_trace(c,"cancel","agent turn stopped while waiting for the provider");break;}
+        vs_trace(c,"model-output",ans);
         vs_trace(c,"model-result","model response received");
 
         /* Parse executable directives BEFORE lifecycle markers.  Some models
@@ -131,7 +137,7 @@ char *vs_agent_turn(VSContext *c,const char *user){
             char *probe=0,*recover=0;int pst=-1;
             tool_recoveries++;
             snprintf(step,sizeof(step),"model claimed tool channel unavailable%s; probing command runner (%d/%d)",actual_tool_seen?" after tool use":" without issuing a tool directive",tool_recoveries,VS_MAX_TOOL_RECOVERIES);vs_trace(c,"tool-health",step);
-            probe=vs_run_command("printf 'VIBESOLARIS_COMMAND_RUNNER_OK\\n'",&pst);
+            probe=vs_run_command_ctx(c,"printf 'VIBESOLARIS_COMMAND_RUNNER_OK\\n'",&pst);
             if(probe && pst==0 && strstr(probe,"VIBESOLARIS_COMMAND_RUNNER_OK")){
                 command_runner_confirmed=1;
                 vs_trace(c,"tool-health","command runner health probe passed; false blocker suppressed and task will continue");
@@ -190,6 +196,7 @@ char *vs_agent_turn(VSContext *c,const char *user){
         plan_continues=0;
         actual_tool_seen=1;
         execution_mode=1;
+        if(vs_cancel_requested(c)){cancelled=1;vs_trace(c,"cancel","agent turn stopped before the next tool action");break;}
         if(mcp && (!tool || mcp<tool)){
             char *server=attr(mcp,"server"),*name=attr(mcp,"tool"),*args=attr(mcp,"args");
             if(args)unesc(args);
@@ -208,7 +215,7 @@ char *vs_agent_turn(VSContext *c,const char *user){
         } else if(!strncmp(tool+10,"run ",4)){
             char *cmd=attr(tool,"cmd"),*raw=0;int st=0;
             snprintf(step,sizeof(step),"run command %.430s",cmd?cmd:"?");vs_trace(c,"tool-run",step);
-            raw=cmd?vs_run_command(cmd,&st):0;
+            raw=cmd?vs_run_command_ctx(c,cmd,&st):0;
             if(raw){
                 size_t z=strlen(raw)+640;
                 command_runner_confirmed=1;
@@ -220,7 +227,8 @@ char *vs_agent_turn(VSContext *c,const char *user){
                 result=dupstr("TOOL_RESULT_DELIVERED: yes\nCOMMAND_RUNNER_STATUS: host_error\nCOMMAND_EXIT_STATUS: -1\nCOMMAND_TOOL_AVAILABLE: uncertain\nERROR: the host could not start or communicate with the command process.");
             }
             if(!result)result=dupstr("ERROR: command result allocation failed");
-            if(st==124)snprintf(step,sizeof(step),"command timed out (exit 124); command runner remains operational");
+            if(st==130&&vs_cancel_requested(c))snprintf(step,sizeof(step),"command cancelled by user (exit 130)");
+            else if(st==124)snprintf(step,sizeof(step),"command timed out (exit 124); command runner remains operational");
             else if(command_runner_confirmed)snprintf(step,sizeof(step),"command exit %d; command runner confirmed operational",st);
             else snprintf(step,sizeof(step),"command runner host error");
             vs_trace(c,"tool-result",step);free(cmd);
@@ -231,18 +239,19 @@ char *vs_agent_turn(VSContext *c,const char *user){
         if(result){
             char *bounded=vs_compact_text_limit(result,VS_MAX_TOOL_RESULT,"tool result truncated for model context");
             if(bounded){if(strlen(bounded)<strlen(result))vs_trace(c,"limit","tool/MCP result was compacted to keep the agent stable");free(result);result=bounded;}
-            snprintf(step,sizeof(step),"%.470s",result);vs_trace(c,"tool-output",step);
+            vs_trace(c,"tool-output",result);
         }
+        if(vs_cancel_requested(c)){cancelled=1;free(result);result=0;vs_trace(c,"cancel","agent turn stopped by user after the current tool returned");break;}
         free(last_tool_result);last_tool_result=result?dupstr(result):0;
         vs_history_add(c,"user",prompt);vs_history_add(c,"assistant",ans);
         next=continuation_prompt(task_anchor,result,0);
         if(!next){free(result);vs_trace(c,"memory-error","could not allocate next tool round prompt");break;}
         free(result);free(prompt);prompt=next;
     }
-    if(round>=max_rounds){
+    if(!cancelled&&round>=max_rounds){
         snprintf(step,sizeof(step),"maximum autonomous agent rounds reached (%d); local command execution is not disabled and remains available on the next turn",max_rounds);vs_trace(c,"limit",step);
         if(execution_mode || (ans && (strstr(ans,"[[VS_TOOL ")||strstr(ans,"[[VS_MCP ")))){free(ans);ans=dupstr("The single-turn autonomous safety ceiling was reached while work was still in progress. Local command execution is still available; the task was not marked complete. For unusually large jobs, raise VIBESOLARIS_MAX_AGENT_ROUNDS (up to 256) and continue from the existing files and conversation state.");}
     }
+    if(cancelled){free(ans);ans=dupstr("Stopped by user.");}
     free(prompt);free(original);free(task_anchor);free(last_tool_result);return ans;
 }
-

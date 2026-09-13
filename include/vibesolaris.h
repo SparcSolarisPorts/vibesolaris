@@ -5,6 +5,7 @@
 #define VS_VERSION "0.10.7"
 
 #include <stddef.h>
+#include <signal.h>
 
 #define VS_MAX_ATTACH 16
 #define VS_MAX_PATH 1024
@@ -25,6 +26,7 @@
 #define VS_MAX_MCP_TOOLS 64
 #define VS_MCP_SCHEMA_MAX 4096
 #define VS_MAX_TRACE 512
+#define VS_MAX_TRACE_BYTES (64U*1024U*1024U)
 
 /* Resource guards for long-running/large agent operations.  These are deliberately
    generous, but finite: a provider, command, or MCP server must not be able to
@@ -133,7 +135,8 @@ typedef struct {
 
 typedef struct {
     char kind[24];
-    char detail[512];
+    char *detail;
+    size_t bytes;
 } VSTraceEvent;
 
 typedef void (*VSTraceCallback)(void *userdata, int step, const char *kind, const char *detail);
@@ -183,8 +186,10 @@ typedef struct {
     VSTraceEvent trace[VS_MAX_TRACE];
     int trace_count;
     unsigned long trace_dropped;
+    size_t trace_bytes;
     VSTraceCallback trace_callback;
     void *trace_callback_data;
+    volatile sig_atomic_t cancel_requested;
     int config_autosave;
     int config_loading;
 
@@ -246,6 +251,7 @@ void vs_history_add(VSContext *ctx, const char *role, const char *content);
 void vs_history_clear(VSContext *ctx);
 int  vs_write_file(const char *path, const char *text);
 char *vs_run_command(const char *cmd, int *exit_code);
+char *vs_run_command_ctx(VSContext *ctx, const char *cmd, int *exit_code);
 const char *vs_command_shell_name(void);
 char *vs_chat(VSContext *ctx, const char *user_text);
 char *vs_agent_turn(VSContext *ctx, const char *user_text);
@@ -266,6 +272,9 @@ void vs_refresh_cache_key(VSContext *ctx);
 void vs_trace(VSContext *ctx, const char *kind, const char *detail);
 void vs_trace_clear(VSContext *ctx);
 void vs_set_trace_callback(VSContext *ctx, VSTraceCallback callback, void *userdata);
+void vs_cancel_request(VSContext *ctx);
+void vs_cancel_clear(VSContext *ctx);
+int  vs_cancel_requested(const VSContext *ctx);
 void vs_usage_clear(VSContext *ctx);
 int  vs_mcp_add_stdio(VSContext *ctx, const char *name, const char *command);
 int  vs_mcp_add_http(VSContext *ctx, const char *name, const char *url, const char *bearer);

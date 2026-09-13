@@ -9,6 +9,16 @@
 typedef struct { char *p; size_t n; size_t cap; size_t max; int overflow; } Buf;
 typedef struct { char *session; size_t cap; } HdrCtx;
 
+#if LIBCURL_VERSION_NUM >= 0x072000
+static int cancel_xfer(void *ud,curl_off_t dltotal,curl_off_t dlnow,curl_off_t ultotal,curl_off_t ulnow){
+    VSContext *ctx=(VSContext*)ud;(void)dltotal;(void)dlnow;(void)ultotal;(void)ulnow;return vs_cancel_requested(ctx);
+}
+#else
+static int cancel_progress(void *ud,double dltotal,double dlnow,double ultotal,double ulnow){
+    VSContext *ctx=(VSContext*)ud;(void)dltotal;(void)dlnow;(void)ultotal;(void)ulnow;return vs_cancel_requested(ctx);
+}
+#endif
+
 static size_t wr(void *ptr,size_t sz,size_t nm,void *ud){
     Buf *b=(Buf*)ud;size_t k,need,newcap;char *q;
     if(!b||sz==0||nm==0)return 0;
@@ -57,6 +67,14 @@ char *vs_http_post_capture_ctx(VSContext *ctx,const char *url,const char *header
     curl_easy_setopt(c,CURLOPT_WRITEFUNCTION,wr);curl_easy_setopt(c,CURLOPT_WRITEDATA,&b);curl_easy_setopt(c,CURLOPT_HEADERFUNCTION,hdrwr);curl_easy_setopt(c,CURLOPT_HEADERDATA,&hc);curl_easy_setopt(c,CURLOPT_USERAGENT,"vibesolaris/" VS_VERSION);
     curl_easy_setopt(c,CURLOPT_SSL_VERIFYPEER,1L);curl_easy_setopt(c,CURLOPT_SSL_VERIFYHOST,2L);
     curl_easy_setopt(c,CURLOPT_CONNECTTIMEOUT,30L);curl_easy_setopt(c,CURLOPT_TIMEOUT,600L);curl_easy_setopt(c,CURLOPT_NOSIGNAL,1L);
+    if(ctx){
+        curl_easy_setopt(c,CURLOPT_NOPROGRESS,0L);
+#if LIBCURL_VERSION_NUM >= 0x072000
+        curl_easy_setopt(c,CURLOPT_XFERINFOFUNCTION,cancel_xfer);curl_easy_setopt(c,CURLOPT_XFERINFODATA,ctx);
+#else
+        curl_easy_setopt(c,CURLOPT_PROGRESSFUNCTION,cancel_progress);curl_easy_setopt(c,CURLOPT_PROGRESSDATA,ctx);
+#endif
+    }
 #ifdef CURLOPT_TCP_KEEPALIVE
     curl_easy_setopt(c,CURLOPT_TCP_KEEPALIVE,1L);
 #endif
@@ -66,10 +84,15 @@ char *vs_http_post_capture_ctx(VSContext *ctx,const char *url,const char *header
         if(pauth[0]){curl_easy_setopt(c,CURLOPT_PROXYUSERPWD,pauth);curl_easy_setopt(c,CURLOPT_PROXYAUTH,(long)CURLAUTH_BASIC);}
         vs_proxy_redacted(ctx,redacted,sizeof(redacted));snprintf(tracebuf,sizeof(tracebuf),"routing HTTP request via %s",redacted);vs_trace(ctx,"proxy",tracebuf);
     }
+    if(ctx&&vs_cancel_requested(ctx)){curl_slist_free_all(h);curl_easy_cleanup(c);free(b.p);vs_trace(ctx,"cancel","HTTP request cancelled before transfer");return NULL;}
     rc=curl_easy_perform(c);if(status)curl_easy_getinfo(c,CURLINFO_RESPONSE_CODE,status);
     curl_slist_free_all(h);curl_easy_cleanup(c);
     if(rc!=CURLE_OK){
-        if(ctx){if(b.overflow)snprintf(tracebuf,sizeof(tracebuf),"HTTP response exceeded %lu MiB safety limit",(unsigned long)(VS_MAX_HTTP_RESPONSE/(1024U*1024U)));else snprintf(tracebuf,sizeof(tracebuf),"HTTP transport failed: %s",curl_easy_strerror(rc));vs_trace(ctx,b.overflow?"limit":"http-error",tracebuf);}
+        if(ctx){
+            if(vs_cancel_requested(ctx) && rc==CURLE_ABORTED_BY_CALLBACK){snprintf(tracebuf,sizeof(tracebuf),"HTTP request cancelled by user");vs_trace(ctx,"cancel",tracebuf);}
+            else if(b.overflow){snprintf(tracebuf,sizeof(tracebuf),"HTTP response exceeded %lu MiB safety limit",(unsigned long)(VS_MAX_HTTP_RESPONSE/(1024U*1024U)));vs_trace(ctx,"limit",tracebuf);}
+            else {snprintf(tracebuf,sizeof(tracebuf),"HTTP transport failed: %s",curl_easy_strerror(rc));vs_trace(ctx,"http-error",tracebuf);}
+        }
         free(b.p);return NULL;
     }
     return b.p;

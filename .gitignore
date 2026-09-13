@@ -1,1 +1,6 @@
 VIBESOLARIS_AI_CONTEXT.txt
+vibesolaris
+vibesolaris-gui
+*.o
+
+dist/*

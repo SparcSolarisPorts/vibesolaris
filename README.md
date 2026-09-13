@@ -706,19 +706,19 @@ See `MCP.md` for transport/protocol details.
 VibeSolaris records an execution trace for each agent turn. It includes observable actions such as:
 
 - agent turn start/completion
-- model round number
-- provider/model/protocol used
+- full continuation/model input sent by the agent loop
+- model round number and provider/model/protocol used
+- full model output returned to the agent loop
+- provider-returned reasoning/thinking text when the API deliberately exposes it
 - local file read/write requests
-- shell commands and exit status
-- MCP discovery
-- MCP server/tool calls
-- bounded tool/MCP results
+- shell commands, exit status, and captured output
+- MCP discovery, server/tool calls, and results
 
-The TUI prints each trace event live as it occurs, so model rounds, local tools, commands, and MCP calls are visible while the turn is still running. `/trace` shows the completed trace again afterwards.
+The TUI prints each trace event live as it occurs, so model inputs/outputs, public reasoning, local tools, commands, and MCP calls are visible while the turn is still running. `/trace` shows the completed trace again afterwards.
 
-The GUI displays a collapsed per-prompt Activity disclosure row; clicking it reveals selectable/copyable trace text. Recent activity is also surfaced in the interface.
+The GUI displays a collapsed per-prompt Activity disclosure row; clicking it reveals the full selectable/copyable trace text. The model is also instructed to include a short **public rationale** before tool actions and to say when it changes approach, so strategy changes remain understandable without relying on hidden internals.
 
-The trace does not reveal or fabricate hidden model reasoning.
+`[reasoning]` is shown only when a provider deliberately returns a reasoning/thinking field (for example an OpenAI-compatible `reasoning_content`, Anthropic-style `thinking`, a reasoning summary field, or explicit `<think>...</think>` content). VibeSolaris does **not** invent, reconstruct, or bypass a provider's hidden/private chain-of-thought.
 
 ### Conversation token usage
 
@@ -864,6 +864,13 @@ is running you can continue to scroll, select/copy text, resize the window, and 
 the next message into the composer.  Provider/configuration and attachment changes
 are temporarily locked until that turn finishes so that the worker sees a stable
 configuration.
+
+While an agent turn is running, the GUI send button becomes a square **Stop** button;
+click it or press **Esc** to request cancellation. In the TUI, press **Ctrl+C** during
+agent work. Cancellation aborts an in-flight libcurl provider/MCP HTTP transfer,
+terminates a running shell command process group, stops stdio MCP waiting promptly,
+and prevents the agent from starting another tool/model round. The program itself
+stays open and the completed trace records the stop.
 
 Large data is bounded deliberately instead of allowing accidental unlimited RAM
 growth:
@@ -1024,7 +1031,9 @@ The normal per-user location is `~/.vibesolaris/config.enc` when `/etc/vibesolar
 
 The GUI shows an **Activity** disclosure row for every prompt. The row is collapsed by default, but its summary is updated **while the turn is still running**. Model requests, local tools, commands, file operations and MCP calls are appended to that prompt's trace as they happen; you do not need to wait for the final assistant response before seeing progress.
 
-Click the disclosure row to expand or collapse the full numbered trace. The trace is an execution log of observable operations, not hidden model reasoning.
+Click the disclosure row to expand or collapse the full numbered trace. Full model input/output is retained there, along with provider-returned reasoning/thinking when the API exposes it. Hidden/private chain-of-thought is not fabricated or bypassed.
+
+While the agent is working, the send control changes into a square **Stop** button. Click it or press **Esc** to cancel the current turn without closing VibeSolaris.
 
 ## UTF-8, Spanish, Chinese and other languages
 

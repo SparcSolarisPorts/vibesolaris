@@ -48,6 +48,18 @@ static char *extract_text(const char *json){char *r;
     if((r=extract_after(json,"\"content\":")))return r;
     return dupstr(json);
 }
+static char *extract_string_field(const char *json,const char *key){
+    const char *p;if(!json||!key)return NULL;p=strstr(json,key);if(!p)return NULL;p+=strlen(key);while(*p==' '||*p=='\t'||*p=='\r'||*p=='\n')p++;if(*p!=':')return NULL;p++;while(*p==' '||*p=='\t'||*p=='\r'||*p=='\n')p++;if(*p!='\"')return NULL;return json_unescape_string(p+1);
+}
+static void trace_output_reasoning(VSContext *c,const char *json,const char *out){
+    static const char *keys[]={"\"reasoning_content\"","\"reasoning\"","\"thinking\"","\"reasoning_summary\"","\"summary_text\"",NULL};
+    int i;char *r;const char *a,*b;size_t n;char *t;
+    if(!c)return;
+    for(i=0;keys[i];i++){r=extract_string_field(json,keys[i]);if(r){if(*r)vs_trace(c,"reasoning",r);free(r);}}
+    /* Some OpenAI-compatible reasoning models deliberately return public thinking
+       inside <think>...</think> in message content.  Surface that separately too. */
+    if(out&&(a=strstr(out,"<think>"))!=NULL){a+=7;b=strstr(a,"</think>");if(b&&b>a){n=(size_t)(b-a);t=(char*)malloc(n+1);if(t){memcpy(t,a,n);t[n]=0;vs_trace(c,"reasoning",t);free(t);}}}
+}
 static long extract_long(const char *json,const char *needle){const char *p=strstr(json,needle);if(!p)return 0;p+=strlen(needle);while(*p==' '||*p=='\t'||*p==':')p++;return strtol(p,0,10);}
 static void capture_usage(VSContext *c,const char *json){
     long cached=0,cachew=0,in=0,out=0,total=0;int have=0,anthropic_style=0;char b[256];
@@ -102,7 +114,7 @@ static char *request_url(const char *base,VSProtocolKind protocol){
 }
 
 char *vs_build_system_prompt(const VSContext *c){
-    const char *base="You are VibeSolaris, a local coding agent. You may ask the host to use local tools by emitting exactly one directive on a line: [[VS_TOOL read path=\"FILE\"]], [[VS_TOOL run cmd=\"COMMAND\"]], [[VS_TOOL write path=\"FILE\" content=\"TEXT_WITH_\\n_ESCAPES\"]], or [[VS_TOOL image path=\"IMAGE_FILE\"]]. The host will execute it and return TOOL_RESULT as ordinary text in the next continuation message; there is no separate hidden TOOL_RESULT transport/channel for the user to restore. The image tool loads a local PNG/JPEG/GIF/WebP into the next model round as real visual input; use it after creating a screenshot, render, plot, CAD viewport capture, or other image that you need to inspect. When the user attaches an image, inspect the visual content directly rather than pretending it is only text. For GUI screenshots, distinguish visible pixel/layout observations from inferred causes; for CAD images, do not invent hidden dimensions or geometry that are not visible. A useful visual-debug loop is: inspect image -> inspect/edit source -> run/build -> capture a new screenshot/render with the run tool -> load it with the image tool -> compare and continue. MCP tools, when available, are listed below and may be called only with the documented VS_MCP directive. Prefer inspecting files before editing. The local command tool remains available throughout the agent turn: a non-zero exit, timeout, compiler error, or malformed command is a result to inspect and correct, NOT evidence that command execution has been disabled. IMPORTANT: merely writing prose such as `I ran pwd` does not run anything. To execute a command you must emit the literal directive [[VS_TOOL run cmd=\"COMMAND\"]] on its own line. Never report that VS_TOOL, TOOL_RESULT, or the workspace/tool bridge failed unless you actually emitted a VS_TOOL directive and the host explicitly returned COMMAND_RUNNER_STATUS: host_error. If a continuation contains TOOL_RESULT_DELIVERED: yes and COMMAND_RUNNER_STATUS: operational, the tool channel is proven healthy. Do not tell the user that VS_TOOL, TOOL_RESULT, or command execution is unavailable merely because a command failed; correct the command and continue. For execution requests, DO NOT stop after saying what you plan or intend to do and DO NOT ask the user to send another prompt just to continue. Actually execute the work with VS_TOOL/VS_MCP, continuing through build/test/verification as appropriate. IMPORTANT EXECUTION LIFECYCLE: once you begin an execution task, a prose-only status message is never completion. Every response must contain either one executable VS_TOOL/VS_MCP directive, VS_NEED_USER for a genuine blocker, or VS_FINAL when the requested work is actually complete. After the first real tool call, never end an execution turn with prose alone: the host deliberately treats unmarked prose as an intermediate status and will continue the turn. Ask the user only when genuinely blocked by missing information, credentials, destructive-action permission, or a decision that cannot safely be inferred; then emit [[VS_NEED_USER question=\"YOUR QUESTION\"]]. When an execution request is genuinely complete, emit [[VS_FINAL]] before the concise final result. NEVER place [[VS_FINAL]] in the same response as a VS_TOOL or VS_MCP directive: a tool/MCP directive means work is still pending and the host will execute it before any final result is accepted. Ordinary informational questions may be answered normally without tools or markers. Never assume Linux; honour the detected OS and CPU architecture.\n";
+    const char *base="You are VibeSolaris, a local coding agent. You may ask the host to use local tools by emitting exactly one directive on a line: [[VS_TOOL read path=\"FILE\"]], [[VS_TOOL run cmd=\"COMMAND\"]], [[VS_TOOL write path=\"FILE\" content=\"TEXT_WITH_\\n_ESCAPES\"]], or [[VS_TOOL image path=\"IMAGE_FILE\"]]. The host will execute it and return TOOL_RESULT as ordinary text in the next continuation message; there is no separate hidden TOOL_RESULT transport/channel for the user to restore. The image tool loads a local PNG/JPEG/GIF/WebP into the next model round as real visual input; use it after creating a screenshot, render, plot, CAD viewport capture, or other image that you need to inspect. When the user attaches an image, inspect the visual content directly rather than pretending it is only text. For GUI screenshots, distinguish visible pixel/layout observations from inferred causes; for CAD images, do not invent hidden dimensions or geometry that are not visible. A useful visual-debug loop is: inspect image -> inspect/edit source -> run/build -> capture a new screenshot/render with the run tool -> load it with the image tool -> compare and continue. MCP tools, when available, are listed below and may be called only with the documented VS_MCP directive. Prefer inspecting files before editing. The local command tool remains available throughout the agent turn: a non-zero exit, timeout, compiler error, or malformed command is a result to inspect and correct, NOT evidence that command execution has been disabled. IMPORTANT: merely writing prose such as `I ran pwd` does not run anything. To execute a command you must emit the literal directive [[VS_TOOL run cmd=\"COMMAND\"]] on its own line. Never report that VS_TOOL, TOOL_RESULT, or the workspace/tool bridge failed unless you actually emitted a VS_TOOL directive and the host explicitly returned COMMAND_RUNNER_STATUS: host_error. If a continuation contains TOOL_RESULT_DELIVERED: yes and COMMAND_RUNNER_STATUS: operational, the tool channel is proven healthy. Do not tell the user that VS_TOOL, TOOL_RESULT, or command execution is unavailable merely because a command failed; correct the command and continue. For execution requests, DO NOT stop after saying what you plan or intend to do and DO NOT ask the user to send another prompt just to continue. Actually execute the work with VS_TOOL/VS_MCP, continuing through build/test/verification as appropriate. IMPORTANT EXECUTION LIFECYCLE: once you begin an execution task, a prose-only status message is never completion. Every response must contain either one executable VS_TOOL/VS_MCP directive, VS_NEED_USER for a genuine blocker, or VS_FINAL when the requested work is actually complete. After the first real tool call, never end an execution turn with prose alone: the host deliberately treats unmarked prose as an intermediate status and will continue the turn. Ask the user only when genuinely blocked by missing information, credentials, destructive-action permission, or a decision that cannot safely be inferred; then emit [[VS_NEED_USER question=\"YOUR QUESTION\"]]. When an execution request is genuinely complete, emit [[VS_FINAL]] before the concise final result. NEVER place [[VS_FINAL]] in the same response as a VS_TOOL or VS_MCP directive: a tool/MCP directive means work is still pending and the host will execute it before any final result is accepted. Ordinary informational questions may be answered normally without tools or markers. During agent work, make the observable progress understandable: before a tool/MCP directive, include a brief public rationale for the next action, and when changing approach, briefly state what changed and why. Keep this concise and do not expose or fabricate hidden/private chain-of-thought. If the provider explicitly returns a reasoning/thinking field, the host may display that field separately. Never assume Linux; honour the detected OS and CPU architecture.\n";
     char *mcp=vs_mcp_prompt_fragment(c);size_t n=strlen(base)+strlen(c->agent_md)+strlen(c->os_name)+strlen(c->os_release)+strlen(c->arch)+strlen(c->cwd)+(mcp?strlen(mcp):0)+768;char *o=(char*)malloc(n);
     if(!o){if(mcp)free(mcp);return NULL;}
     snprintf(o,n,"%sHost OS: %s %s\nCPU architecture: %s\nWorking directory: %s\n\nAGENT.MD:\n%s\n\nMCP TOOLS:\n%s\n",base,c->os_name,c->os_release,c->arch,c->cwd,c->agent_md[0]?c->agent_md:"(none)",mcp?mcp:"(none)");if(mcp)free(mcp);return o;
@@ -116,14 +128,16 @@ static int add_openai_msg(VSBuf *b,const char *role,const char *content,int *fir
 static char *build_openai_body(VSContext *c,const char *sys,const char *user){
     VSBuf b;int i,first=1;char *x,*t,*e;const char *mime;
     if(binit(&b,8192)!=0)return NULL;
+    if(vs_cancel_requested(c)){free(b.p);return NULL;}
     badd(&b,"{\"model\":");bquoted(&b,c->provider.model);badd(&b,",\"messages\":[");
     if(c->provider.kind==VS_PROVIDER_OPENAI && c->cache_enabled && gpt56plus(c->provider.model)){
         first=0;badd(&b,"{\"role\":\"system\",\"content\":[{\"type\":\"text\",\"text\":");bquoted(&b,sys);badd(&b,",\"prompt_cache_breakpoint\":{\"mode\":\"explicit\"}}]}");
     } else add_openai_msg(&b,"system",sys,&first);
-    for(i=0;i<c->history_count;i++)add_openai_msg(&b,c->history[i].role,c->history[i].content,&first);
+    for(i=0;i<c->history_count;i++){if(vs_cancel_requested(c)){free(b.p);return NULL;}add_openai_msg(&b,c->history[i].role,c->history[i].content,&first);}
     if(!first)badd(&b,",");
     badd(&b,"{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");bquoted(&b,user);badd(&b,"}");
     for(i=0;i<c->attachment_count;i++){
+        if(vs_cancel_requested(c)){free(b.p);return NULL;}
         if(c->attachments[i].is_image){x=vs_cached_base64_file(c,c->attachments[i].path,0);if(x){char *label=(char*)malloc(strlen(c->attachments[i].path)+32);mime=mime_for(c->attachments[i].path);if(label){sprintf(label,"Attached image: %s",c->attachments[i].path);badd(&b,",{\"type\":\"text\",\"text\":");bquoted(&b,label);badd(&b,"}");free(label);}badd(&b,",{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:");badd(&b,mime);badd(&b,";base64,");badd(&b,x);badd(&b,"\"}}");free(x);}}
         else {t=vs_cached_read_file(c,c->attachments[i].path);if(t){t=bounded_attachment(c,t,c->attachments[i].path);if(!t)continue;e=vs_json_escape(t);badd(&b,",{\"type\":\"text\",\"text\":\"Attached file: ");x=vs_json_escape(c->attachments[i].path);badd(&b,x);free(x);badd(&b,"\\n");badd(&b,e);badd(&b,"\"}");free(e);free(t);}}
     }
@@ -135,13 +149,15 @@ static char *build_openai_body(VSContext *c,const char *sys,const char *user){
 static char *build_claude_body(VSContext *c,const char *sys,const char *user){
     VSBuf b;int i,first=1;char *x,*t;const char *mime;
     if(binit(&b,8192)!=0)return NULL;
+    if(vs_cancel_requested(c)){free(b.p);return NULL;}
     badd(&b,"{\"model\":");bquoted(&b,c->provider.model);badd(&b,",\"max_tokens\":8192");
     if(c->cache_enabled)badd(&b,",\"cache_control\":{\"type\":\"ephemeral\"}");
     badd(&b,",\"system\":[{\"type\":\"text\",\"text\":");bquoted(&b,sys);if(c->cache_enabled)badd(&b,",\"cache_control\":{\"type\":\"ephemeral\"}");badd(&b,"}],\"messages\":[");
-    for(i=0;i<c->history_count;i++){if(!first)badd(&b,",");first=0;badd(&b,"{\"role\":");bquoted(&b,!strcmp(c->history[i].role,"assistant")?"assistant":"user");badd(&b,",\"content\":");bquoted(&b,c->history[i].content);badd(&b,"}");}
+    for(i=0;i<c->history_count;i++){if(vs_cancel_requested(c)){free(b.p);return NULL;}if(!first)badd(&b,",");first=0;badd(&b,"{\"role\":");bquoted(&b,!strcmp(c->history[i].role,"assistant")?"assistant":"user");badd(&b,",\"content\":");bquoted(&b,c->history[i].content);badd(&b,"}");}
     if(!first)badd(&b,",");
     badd(&b,"{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");bquoted(&b,user);badd(&b,"}");
     for(i=0;i<c->attachment_count;i++){
+        if(vs_cancel_requested(c)){free(b.p);return NULL;}
         if(c->attachments[i].is_image){x=vs_cached_base64_file(c,c->attachments[i].path,0);if(x){char *label=(char*)malloc(strlen(c->attachments[i].path)+32);mime=mime_for(c->attachments[i].path);if(label){sprintf(label,"Attached image: %s",c->attachments[i].path);badd(&b,",{\"type\":\"text\",\"text\":");bquoted(&b,label);badd(&b,"}");free(label);}badd(&b,",{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":");bquoted(&b,mime);badd(&b,",\"data\":");bquoted(&b,x);badd(&b,"}}");free(x);}}
         else {t=vs_cached_read_file(c,c->attachments[i].path);if(t){t=bounded_attachment(c,t,c->attachments[i].path);if(!t)continue;badd(&b,",{\"type\":\"text\",\"text\":");x=(char*)malloc(strlen(c->attachments[i].path)+strlen(t)+32);if(x){sprintf(x,"Attached file: %s\n%s",c->attachments[i].path,t);bquoted(&b,x);free(x);}else bquoted(&b,t);badd(&b,"}");free(t);}}
     }
@@ -151,11 +167,13 @@ static char *build_claude_body(VSContext *c,const char *sys,const char *user){
 static char *build_gemini_body(VSContext *c,const char *sys,const char *user){
     VSBuf b;int i,first=1;char *x,*t;const char *mime;
     if(binit(&b,8192)!=0)return NULL;
+    if(vs_cancel_requested(c)){free(b.p);return NULL;}
     badd(&b,"{\"system_instruction\":{\"parts\":[{\"text\":");bquoted(&b,sys);badd(&b,"}]},\"contents\":[");
-    for(i=0;i<c->history_count;i++){if(!first)badd(&b,",");first=0;badd(&b,"{\"role\":");bquoted(&b,!strcmp(c->history[i].role,"assistant")?"model":"user");badd(&b,",\"parts\":[{\"text\":");bquoted(&b,c->history[i].content);badd(&b,"}]}");}
+    for(i=0;i<c->history_count;i++){if(vs_cancel_requested(c)){free(b.p);return NULL;}if(!first)badd(&b,",");first=0;badd(&b,"{\"role\":");bquoted(&b,!strcmp(c->history[i].role,"assistant")?"model":"user");badd(&b,",\"parts\":[{\"text\":");bquoted(&b,c->history[i].content);badd(&b,"}]}");}
     if(!first)badd(&b,",");
     badd(&b,"{\"role\":\"user\",\"parts\":[{\"text\":");bquoted(&b,user);badd(&b,"}");
     for(i=0;i<c->attachment_count;i++){
+        if(vs_cancel_requested(c)){free(b.p);return NULL;}
         if(c->attachments[i].is_image){x=vs_cached_base64_file(c,c->attachments[i].path,0);if(x){char *label=(char*)malloc(strlen(c->attachments[i].path)+32);mime=mime_for(c->attachments[i].path);if(label){sprintf(label,"Attached image: %s",c->attachments[i].path);badd(&b,",{\"text\":");bquoted(&b,label);badd(&b,"}");free(label);}badd(&b,",{\"inlineData\":{\"mimeType\":");bquoted(&b,mime);badd(&b,",\"data\":");bquoted(&b,x);badd(&b,"}}");free(x);}}
         else {t=vs_cached_read_file(c,c->attachments[i].path);if(t){t=bounded_attachment(c,t,c->attachments[i].path);if(!t)continue;badd(&b,",{\"text\":");x=(char*)malloc(strlen(c->attachments[i].path)+strlen(t)+32);if(x){sprintf(x,"Attached file: %s\n%s",c->attachments[i].path,t);bquoted(&b,x);free(x);}else bquoted(&b,t);badd(&b,"}");free(t);}}
     }
@@ -173,14 +191,17 @@ char *vs_chat(VSContext *c,const char *user){
     if(c->provider.protocol==VS_PROTOCOL_GEMINI){
         if(!c->provider.api_key[0]){free(sys);return dupstr("No API key configured for Gemini.");}
         body=build_gemini_body(c,sys,user);
-        if(!body){free(sys);return dupstr("Request is too large or memory is exhausted; reduce attachments/context and retry.");}
+        if(!body){free(sys);return dupstr(vs_cancel_requested(c)?"Stopped by user.":"Request is too large or memory is exhausted; reduce attachments/context and retry.");}
         u=(char*)malloc(strlen(c->provider.base_url)+strlen(c->provider.model)+strlen(c->provider.api_key)+64);
         if(!u){free(body);free(sys);return dupstr("Out of memory");}
         sprintf(u,"%s/%s:generateContent?key=%s",c->provider.base_url,c->provider.model,c->provider.api_key);
         h[0]="Content-Type: application/json";
-        resp=vs_http_post_ctx(c,u,h,1,body,&status);free(u);free(body);free(sys);
-        if(!resp)return dupstr("HTTP request failed");
-        capture_usage(c,resp);out=extract_text(resp);free(resp);return out;
+        vs_trace(c,"http-wait","request sent; waiting for provider response");
+        resp=vs_http_post_ctx(c,u,h,1,body,&status);
+        if(resp)vs_trace(c,"http-result","provider response received");
+        free(u);free(body);free(sys);
+        if(!resp)return dupstr(vs_cancel_requested(c)?"Stopped by user.":"HTTP request failed");
+        capture_usage(c,resp);out=extract_text(resp);trace_output_reasoning(c,resp,out);free(resp);return out;
     }
 
     credential=c->provider.api_key;
@@ -199,7 +220,7 @@ char *vs_chat(VSContext *c,const char *user){
 
     if(c->provider.protocol==VS_PROTOCOL_ANTHROPIC){
         body=build_claude_body(c,sys,user);
-        if(!body){free(endpoint);free(sys);return dupstr("Request is too large or memory is exhausted; reduce attachments/context and retry.");}
+        if(!body){free(endpoint);free(sys);return dupstr(vs_cancel_requested(c)?"Stopped by user.":"Request is too large or memory is exhausted; reduce attachments/context and retry.");}
         h[nh++]="Content-Type: application/json";
         if(c->provider.kind==VS_PROVIDER_CLAUDE || c->provider.kind==VS_PROVIDER_DEEPSEEK){
             snprintf(apiheader,sizeof(apiheader),"x-api-key: %s",credential);h[nh++]=apiheader;
@@ -207,15 +228,19 @@ char *vs_chat(VSContext *c,const char *user){
             snprintf(auth,sizeof(auth),"Authorization: Bearer %s",credential);h[nh++]=auth;
         }
         h[nh++]="anthropic-version: 2023-06-01";
+        vs_trace(c,"http-wait","request sent; waiting for provider response");
         resp=vs_http_post_ctx(c,endpoint,h,nh,body,&status);
+        if(resp)vs_trace(c,"http-result","provider response received");
     }else{
         body=build_openai_body(c,sys,user);
-        if(!body){free(endpoint);free(sys);return dupstr("Request is too large or memory is exhausted; reduce attachments/context and retry.");}
+        if(!body){free(endpoint);free(sys);return dupstr(vs_cancel_requested(c)?"Stopped by user.":"Request is too large or memory is exhausted; reduce attachments/context and retry.");}
         snprintf(auth,sizeof(auth),"Authorization: Bearer %s",credential);
         h[0]="Content-Type: application/json";h[1]=auth;
+        vs_trace(c,"http-wait","request sent; waiting for provider response");
         resp=vs_http_post_ctx(c,endpoint,h,2,body,&status);
+        if(resp)vs_trace(c,"http-result","provider response received");
     }
     free(endpoint);free(body);free(sys);
-    if(!resp)return dupstr("HTTP request failed");
-    capture_usage(c,resp);out=extract_text(resp);free(resp);return out;
+    if(!resp)return dupstr(vs_cancel_requested(c)?"Stopped by user.":"HTTP request failed");
+    capture_usage(c,resp);out=extract_text(resp);trace_output_reasoning(c,resp,out);free(resp);return out;
 }

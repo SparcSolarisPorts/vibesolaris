@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <stdarg.h>
+#include <signal.h>
 
 #define T_RESET   "\033[0m"
 #define T_BOLD    "\033[1m"
@@ -20,6 +21,15 @@
 
 static int tui_colour = 0;
 static int tui_colour_mode = -1; /* -1 auto, 0 never, 1 always */
+static VSContext *tui_active_ctx = NULL;
+
+static void tui_sigint(int sig)
+{
+    static const char msg[]="\nStop requested (Ctrl+C). Cancelling the active agent operation...\n";
+    (void)sig;
+    if(tui_active_ctx)tui_active_ctx->cancel_requested=1;
+    (void)write(STDOUT_FILENO,msg,sizeof(msg)-1);
+}
 
 static void copyv(char *dst,size_t cap,const char *src)
 {
@@ -74,6 +84,7 @@ static void errorf(const char *fmt,...)
 static const char *trace_colour(const char *kind)
 {
     if(!kind)return T_DIM;
+    if(strstr(kind,"reasoning"))return T_MAGENTA;
     if(strstr(kind,"mcp"))return T_MAGENTA;
     if(strstr(kind,"model"))return T_CYAN;
     if(strstr(kind,"tool")||strstr(kind,"command"))return T_YELLOW;
@@ -113,7 +124,7 @@ static void print_trace(const VSContext *c)
     for(i=0;i<c->trace_count;i++){
         const char *col=trace_colour(c->trace[i].kind);
         if(tui_colour)fputs(col,stdout);
-        printf("%2d. [%-12s] %s\n",i+1,c->trace[i].kind,c->trace[i].detail);
+        printf("%2d. [%-12s] %s\n",i+1,c->trace[i].kind,c->trace[i].detail?c->trace[i].detail:"");
         if(tui_colour)fputs(T_RESET,stdout);
     }
     if(c->trace_dropped)warnf("... %lu older trace events dropped\n",c->trace_dropped);
@@ -148,7 +159,8 @@ static void help(void)
     cprintf(T_CYAN,"  /cache on|off|status|clear\n");
     cprintf(T_CYAN,"  /history status|clear\n");
     cprintf(T_CYAN,"  /usage                        ");printf("show provider-reported token usage for the current conversation\n");
-    cprintf(T_CYAN,"  /trace                        ");printf("show every model/local-tool/MCP step from the last turn\n");
+    cprintf(T_CYAN,"  /trace                        ");printf("show full model input/output, provider-returned reasoning, local-tool and MCP activity\n");
+    cprintf(T_CYAN,"  Ctrl+C during agent work      ");printf("stop the active provider/MCP/command operation without exiting VibeSolaris\n");
     cprintf(T_BOLD T_BLUE,"\nEncrypted configuration\n");
     cprintf(T_CYAN,"  /globalconfig status|load|save\n");
     cprintf(T_DIM,"  Uses /etc/vibesolaris when writable, otherwise ~/.vibesolaris.\n");
@@ -213,6 +225,9 @@ static void show_banner(const VSContext *c)
 int main(int argc, char **argv)
 {
     VSContext c;
+    /* Agent activity is interactive progress, not batch output.  Disable stdio
+       buffering so terminals and pseudo-terminals never hold a run of steps. */
+    setvbuf(stdout,NULL,_IONBF,0);
     char line[4096];
     int i;
     const char *config_path=NULL;
@@ -330,15 +345,18 @@ int main(int argc, char **argv)
         } else if (line[0] == '/') {
             errorf("Unknown command: %s\n",line);cprintf(T_DIM,"Type /help to see available commands.\n");
         } else if(line[0]) {
-            char *a;
+            char *a;void (*oldint)(int);
             cprintf(T_BOLD T_MAGENTA,"\nActivity (live)\n");
+            vs_cancel_clear(&c);
+            tui_active_ctx=&c;oldint=signal(SIGINT,tui_sigint);
             vs_set_trace_callback(&c,live_trace,NULL);
             a=vs_agent_turn(&c,line);
             vs_set_trace_callback(&c,NULL,NULL);
+            tui_active_ctx=NULL;if(oldint!=SIG_ERR)(void)signal(SIGINT,oldint);
             cprintf(T_BOLD T_GREEN,"\nVibeSolaris answer\n");
             printf("%s\n",a?a:"(no response)");
             usage_status(&c);
-            free(a);vs_clear_attachments(&c);
+            free(a);vs_clear_attachments(&c);vs_cancel_clear(&c);
         }
     }
     vs_shutdown(&c);

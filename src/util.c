@@ -26,6 +26,8 @@ static char *dupstr(const char *s) {
     return p;
 }
 
+static char *vs_base64_file_ctx(VSContext *ctx,const char *path,size_t *out_len);
+
 static unsigned long hash_update(unsigned long h,const char *s) {
     const unsigned char *p=(const unsigned char*)s;
     while(p && *p){h^=(unsigned long)*p++;h*=16777619UL;}
@@ -153,17 +155,17 @@ char *vs_cached_read_file(VSContext *ctx,const char *path) {
 
 char *vs_cached_base64_file(VSContext *ctx,const char *path,size_t *out_len) {
     struct stat st; VSFileCacheEntry *e; char *s; size_t n=0;
-    if(!ctx || !ctx->cache_enabled) return vs_base64_file(path,out_len);
+    if(!ctx || !ctx->cache_enabled) return vs_base64_file_ctx(ctx,path,out_len);
     if(stat(path,&st)!=0) return NULL;
     /* Large images are already expanded ~4/3 by base64.  Caching another copy
        can double peak memory while the request body is being built. */
     if((unsigned long)st.st_size > (unsigned long)VS_FILE_CACHE_BLOB_MAX) {
         ctx->file_cache_misses++;
-        return vs_base64_file(path,out_len);
+        return vs_base64_file_ctx(ctx,path,out_len);
     }
     e=cache_slot(ctx,path,(long)st.st_mtime,(long)st.st_size,1);
     if(e->base64) { ctx->file_cache_hits++; e->hits++; if(out_len)*out_len=e->base64_len; return dupstr(e->base64); }
-    s=vs_base64_file(path,&n); if(!s) return NULL;
+    s=vs_base64_file_ctx(ctx,path,&n); if(!s) return NULL;
     e->base64=dupstr(s); e->base64_len=n; e->hash=vs_hash_string(s); ctx->file_cache_misses++;
     if(out_len)*out_len=n;
     return s;
@@ -223,13 +225,17 @@ void vs_usage_clear(VSContext *ctx) {
     ctx->conversation_input_tokens=0;ctx->conversation_output_tokens=0;ctx->conversation_total_tokens=0;ctx->conversation_usage_responses=0;
 }
 
+void vs_cancel_request(VSContext *ctx) { if(ctx)ctx->cancel_requested=1; }
+void vs_cancel_clear(VSContext *ctx) { if(ctx)ctx->cancel_requested=0; }
+int vs_cancel_requested(const VSContext *ctx) { return ctx && ctx->cancel_requested ? 1 : 0; }
+
 void vs_history_clear(VSContext *ctx) {
     int i;if(!ctx)return;for(i=0;i<ctx->history_count;i++)if(ctx->history[i].content)free(ctx->history[i].content);
     memset(ctx->history,0,sizeof(ctx->history));ctx->history_count=0;ctx->history_bytes=0;ctx->history_evicted=0;
     vs_usage_clear(ctx);
 }
 
-void vs_shutdown(VSContext *ctx) { if(!ctx)return;(void)vs_persist_settings(ctx);vs_mcp_shutdown(ctx);vs_history_clear(ctx);vs_cache_clear(ctx); }
+void vs_shutdown(VSContext *ctx) { if(!ctx)return;(void)vs_persist_settings(ctx);vs_mcp_shutdown(ctx);vs_trace_clear(ctx);vs_history_clear(ctx);vs_cache_clear(ctx); }
 
 int vs_write_file(const char *path, const char *text) {
     FILE *f=fopen(path,"wb"); size_t n=strlen(text);
@@ -251,15 +257,15 @@ const char *vs_command_shell_name(void)
     return "sh";
 }
 
-char *vs_run_command(const char *cmd, int *exit_code) {
-    int fds[2], flags, status=0, child_done=0, eof_seen=0, timed_out=0, detached_output=0;
+char *vs_run_command_ctx(VSContext *ctx, const char *cmd, int *exit_code) {
+    int fds[2], flags, status=0, child_done=0, eof_seen=0, timed_out=0, cancelled=0, detached_output=0;
     pid_t pid;
     char buf[8192];
     size_t head_cap=VS_MAX_COMMAND_CAPTURE/2, tail_cap=VS_MAX_COMMAND_CAPTURE/2;
     size_t head_n=0, tail_n=0, tail_pos=0, total=0, n, i, out_n, marker_n;
     char *head, *tail, *out; int truncated=0;
     const char *marker="\n...[command output truncated by VibeSolaris]...\n";
-    char timeout_marker[160],detached_marker[192];
+    char timeout_marker[160],cancel_marker[160],detached_marker[192];
     long timeout_sec=1800;
     time_t started,child_done_at=0;
     const char *te;
@@ -267,6 +273,7 @@ char *vs_run_command(const char *cmd, int *exit_code) {
 
     if(exit_code)*exit_code=-1;
     if(!cmd||!*cmd)return dupstr("ERROR: empty command");
+    if(vs_cancel_requested(ctx)){if(exit_code)*exit_code=130;return dupstr("...[command cancelled by user before start]...\n");}
     shell=vs_command_shell_name();
     te=getenv("VIBESOLARIS_COMMAND_TIMEOUT");
     if(te&&*te){char *ep=0;long v=strtol(te,&ep,10);if(ep&&*ep==0&&v>=10&&v<=86400)timeout_sec=v;}
@@ -326,6 +333,15 @@ char *vs_run_command(const char *cmd, int *exit_code) {
                agent wait forever for that inherited descriptor. */
             detached_output=1;eof_seen=1;break;
         }
+        if(vs_cancel_requested(ctx) && (!child_done || !eof_seen)){
+            cancelled=1;
+            if(kill(-pid,SIGTERM)!=0 && !child_done)(void)kill(pid,SIGTERM);
+            {struct timeval grace;grace.tv_sec=0;grace.tv_usec=200000;(void)select(0,NULL,NULL,NULL,&grace);}
+            (void)kill(-pid,SIGKILL);
+            if(!child_done){while(waitpid(pid,&status,0)<0&&errno==EINTR){}child_done=1;}
+            eof_seen=1;
+            break;
+        }
         if(time(NULL)-started>=timeout_sec && (!child_done || !eof_seen)){
             timed_out=1;
             if(kill(-pid,SIGTERM)!=0 && !child_done)(void)kill(pid,SIGTERM);
@@ -339,21 +355,24 @@ char *vs_run_command(const char *cmd, int *exit_code) {
     close(fds[0]);
 
     if(exit_code){
-        if(timed_out)*exit_code=124;
+        if(cancelled)*exit_code=130;
+        else if(timed_out)*exit_code=124;
         else if(WIFEXITED(status))*exit_code=WEXITSTATUS(status);
         else if(WIFSIGNALED(status))*exit_code=128+WTERMSIG(status);
         else *exit_code=-1;
     }
 
-    timeout_marker[0]=0;detached_marker[0]=0;
+    timeout_marker[0]=0;cancel_marker[0]=0;detached_marker[0]=0;
     if(timed_out)snprintf(timeout_marker,sizeof(timeout_marker),"\n...[command timed out after %ld seconds; process group terminated]...\n",timeout_sec);
+    if(cancelled)snprintf(cancel_marker,sizeof(cancel_marker),"\n...[command cancelled by user; process group terminated]...\n");
     if(detached_output)snprintf(detached_marker,sizeof(detached_marker),"\n...[command exited; a detached/background child kept the output pipe open, so capture was closed]...\n");
-    marker_n=(truncated?strlen(marker):0)+strlen(timeout_marker)+strlen(detached_marker);
+    marker_n=(truncated?strlen(marker):0)+strlen(timeout_marker)+strlen(cancel_marker)+strlen(detached_marker);
     out_n=head_n+tail_n+marker_n;
     out=(char*)malloc(out_n+1);if(!out){free(head);free(tail);return NULL;}
     memcpy(out,head,head_n);i=head_n;
     if(truncated){memcpy(out+i,marker,strlen(marker));i+=strlen(marker);}
     if(timeout_marker[0]){memcpy(out+i,timeout_marker,strlen(timeout_marker));i+=strlen(timeout_marker);}
+    if(cancel_marker[0]){memcpy(out+i,cancel_marker,strlen(cancel_marker));i+=strlen(cancel_marker);}
     if(detached_marker[0]){memcpy(out+i,detached_marker,strlen(detached_marker));i+=strlen(detached_marker);}
     {
         size_t first=(tail_n==tail_cap)?tail_pos:0,j;
@@ -363,6 +382,8 @@ char *vs_run_command(const char *cmd, int *exit_code) {
     free(head);free(tail);
     return out;
 }
+
+char *vs_run_command(const char *cmd, int *exit_code) { return vs_run_command_ctx(NULL,cmd,exit_code); }
 
 char *vs_compact_text_limit(const char *s,size_t limit,const char *reason){
     size_t n,markn,head,tail,cap;char *o,*mark;
@@ -424,24 +445,28 @@ int vs_attach(VSContext *ctx,const char *path){
 }
 void vs_clear_attachments(VSContext *ctx){ctx->attachment_count=0;}
 
-char *vs_base64_file(const char *path,size_t *out_len){
+static char *vs_base64_file_ctx(VSContext *ctx,const char *path,size_t *out_len){
     static const char T[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     FILE *f=fopen(path,"rb"); long n; size_t olen,j=0,r,i; char *out;
     unsigned char in[49152]; unsigned char carry[3]; size_t carry_n=0;
     if(!f)return NULL;
     if(fseek(f,0,SEEK_END)!=0){fclose(f);return NULL;}n=ftell(f);rewind(f);
     if(n<0||n>20*1024*1024){fclose(f);return NULL;}
+    if(vs_cancel_requested(ctx)){fclose(f);return NULL;}
     olen=4*(((size_t)n+2)/3);out=(char*)malloc(olen+1);if(!out){fclose(f);return NULL;}
     while((r=fread(in,1,sizeof(in),f))>0){
+        if(vs_cancel_requested(ctx)){free(out);fclose(f);return NULL;}
         i=0;
         if(carry_n){while(carry_n<3&&i<r)carry[carry_n++]=in[i++];if(carry_n==3){unsigned t=((unsigned)carry[0]<<16)|((unsigned)carry[1]<<8)|carry[2];out[j++]=T[(t>>18)&63];out[j++]=T[(t>>12)&63];out[j++]=T[(t>>6)&63];out[j++]=T[t&63];carry_n=0;}}
         while(i+3<=r){unsigned t=((unsigned)in[i]<<16)|((unsigned)in[i+1]<<8)|in[i+2];i+=3;out[j++]=T[(t>>18)&63];out[j++]=T[(t>>12)&63];out[j++]=T[(t>>6)&63];out[j++]=T[t&63];}
         while(i<r)carry[carry_n++]=in[i++];
     }
     if(ferror(f)){free(out);fclose(f);return NULL;}fclose(f);
+    if(vs_cancel_requested(ctx)){free(out);return NULL;}
     if(carry_n){unsigned t=(unsigned)carry[0]<<16;if(carry_n>1)t|=(unsigned)carry[1]<<8;out[j++]=T[(t>>18)&63];out[j++]=T[(t>>12)&63];out[j++]=carry_n>1?T[(t>>6)&63]:'=';out[j++]='=';}
     out[j]=0;if(out_len)*out_len=j;return out;
 }
+char *vs_base64_file(const char *path,size_t *out_len){return vs_base64_file_ctx(NULL,path,out_len);}
 
 static int vs_exec_in_path(const char *name)
 {

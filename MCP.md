@@ -59,9 +59,9 @@ VibeSolaris records an execution trace for every agent turn, including:
 - local `read`, `run`, and `write` tool requests
 - command exit status and tool output
 
-The GUI shows recent trace entries in the sidebar and inserts the complete trace as a selectable/copyable message before the final assistant answer. The TUI prints the trace before the final answer and exposes `/trace`.
+The GUI shows recent trace entries in the sidebar and inserts the complete trace as a selectable/copyable message before the final assistant answer. The TUI streams the trace live and exposes `/trace`. Provider-returned reasoning/thinking fields are surfaced when an API deliberately supplies them; hidden/private chain-of-thought is not fabricated or bypassed.
 
-The trace intentionally records observable execution operations; it does not expose or fabricate hidden model chain-of-thought.
+A GUI Stop button/Esc or TUI Ctrl+C cancels an active MCP operation together with the rest of the agent turn. Streamable HTTP cancellation uses libcurl's transfer callback; stdio response waiting polls for cancellation instead of sleeping for the entire MCP timeout.
 
 ## Compatibility note
 

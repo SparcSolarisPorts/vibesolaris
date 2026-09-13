@@ -32,7 +32,14 @@
 typedef struct {
     int role;
     char *text;
+    size_t text_len;
+    size_t text_cap;
     int collapsed;
+    int layout_valid;
+    int layout_cw;
+    int layout_collapsed;
+    int layout_text_height;
+    int layout_step_height;
     char summary[192];
     unsigned long trace_steps;
     int trace_models;
@@ -44,8 +51,8 @@ typedef struct {
 typedef struct {
     int type; /* 1 trace, 2 done */
     int step;
-    char kind[24];
-    char detail[512];
+    char *kind;
+    char *detail;
 } UIWorkerEvent;
 
 typedef enum {
@@ -725,7 +732,7 @@ static void add_message(App *a, int role, const char *text)
     memset(m, 0, sizeof(*m));
     m->role = role;
     m->text = ui_dup(text ? text : "");
-    if (m->text) a->message_count++;
+    if (m->text) { m->text_len=strlen(m->text);m->text_cap=m->text_len+1;m->layout_valid=0;a->message_count++; }
     a->auto_scroll = 1;
 }
 
@@ -753,13 +760,10 @@ static int begin_trace_message(App *a)
 
 static int append_trace_text(UIMessage *m,const char *text)
 {
-    size_t oldn,addn;char *n;if(!m||!text)return -1;oldn=m->text?strlen(m->text):0;addn=strlen(text);
-    /* Bound the GUI copy of a trace.  The core still keeps the most recent
-       VS_MAX_TRACE structured events; this prevents a pathological tool from
-       growing one X11 message forever. */
-    if(oldn>VS_MAX_TOOL_RESULT)return 0;
-    if(addn>VS_MAX_TOOL_RESULT-oldn)addn=VS_MAX_TOOL_RESULT-oldn;
-    n=(char*)realloc(m->text,oldn+addn+1);if(!n)return -1;memcpy(n+oldn,text,addn);n[oldn+addn]=0;m->text=n;return 0;
+    size_t addn,need,cap;char *n;if(!m||!text)return -1;addn=strlen(text);if(!addn)return 0;
+    need=m->text_len+addn+1;
+    if(need>m->text_cap){cap=m->text_cap?m->text_cap:1024;while(cap<need){if(cap>((size_t)-1)/2)return -1;cap*=2;}n=(char*)realloc(m->text,cap);if(!n)return -1;m->text=n;m->text_cap=cap;}
+    memcpy(m->text+m->text_len,text,addn);m->text_len+=addn;m->text[m->text_len]=0;m->layout_valid=0;return 0;
 }
 
 static int worker_write_event(App *a,const UIWorkerEvent *ev)
@@ -769,10 +773,12 @@ static int worker_write_event(App *a,const UIWorkerEvent *ev)
     while(left){n=write(a->worker_pipe[1],p,left);if(n<0){if(errno==EINTR)continue;return -1;}if(n==0)return -1;p+=n;left-=(size_t)n;}return 0;
 }
 
-/* Called on the worker thread.  Never call Xlib or mutate GUI messages here. */
+/* Called on the worker thread.  Payload text is copied on the worker and the
+   main X11 thread takes ownership after reading the small pipe event. */
 static void gui_live_trace(void *userdata,int step,const char *kind,const char *detail)
 {
-    App *a=(App*)userdata;UIWorkerEvent ev;if(!a)return;memset(&ev,0,sizeof(ev));ev.type=1;ev.step=step;snprintf(ev.kind,sizeof(ev.kind),"%s",kind?kind:"activity");snprintf(ev.detail,sizeof(ev.detail),"%.510s",detail?detail:"");(void)worker_write_event(a,&ev);
+    App *a=(App*)userdata;UIWorkerEvent ev;if(!a)return;memset(&ev,0,sizeof(ev));ev.type=1;ev.step=step;ev.kind=ui_dup(kind?kind:"activity");ev.detail=ui_dup(detail?detail:"");
+    if(!ev.kind||!ev.detail||worker_write_event(a,&ev)!=0){free(ev.kind);free(ev.detail);}
 }
 
 static void *agent_worker_main(void *userdata)
@@ -785,12 +791,14 @@ static void *agent_worker_main(void *userdata)
 
 static void apply_worker_trace(App *a,const UIWorkerEvent *ev)
 {
-    UIMessage *m;char line[768];const char *k;
-    if(!a||!ev||a->live_trace_message<0||a->live_trace_message>=a->message_count)return;
-    m=&a->messages[a->live_trace_message];k=ev->kind;
-    snprintf(line,sizeof(line),"%d. [%s] %s\n",ev->step,k[0]?k:"activity",ev->detail);(void)append_trace_text(m,line);
+    UIMessage *m;char prefix[96];const char *k,*d;
+    if(!a||!ev)return;
+    k=ev->kind?ev->kind:"activity";d=ev->detail?ev->detail:"";
+    if(a->live_trace_message<0||a->live_trace_message>=a->message_count)return;
+    m=&a->messages[a->live_trace_message];
+    snprintf(prefix,sizeof(prefix),"%d. [%s] ",ev->step,k[0]?k:"activity");(void)append_trace_text(m,prefix);(void)append_trace_text(m,d);(void)append_trace_text(m,"\n");
     m->trace_steps=(unsigned long)ev->step;if(!strcmp(k,"model-request"))m->trace_models++;else if(!strcmp(k,"tool-read")||!strcmp(k,"tool-run")||!strcmp(k,"tool-write")||!strcmp(k,"tool-image"))m->trace_tools++;else if(!strcmp(k,"mcp-call"))m->trace_mcps++;if(strstr(k,"error"))m->trace_errors++;
-    trace_summary_message(m);snprintf(a->status,sizeof(a->status),"Activity %d: [%s] %.380s",ev->step,k[0]?k:"activity",ev->detail);a->auto_scroll=1;
+    trace_summary_message(m);snprintf(a->status,sizeof(a->status),"Activity %d: [%s] %.380s",ev->step,k[0]?k:"activity",d);a->auto_scroll=1;
 }
 
 static void finish_worker(App *a)
@@ -802,13 +810,13 @@ static void finish_worker(App *a)
     if(ti>=0&&ti<a->message_count)trace_summary(&a->ctx,a->messages[ti].summary,sizeof(a->messages[ti].summary));
     vs_set_trace_callback(&a->ctx,NULL,NULL);
     a->live_trace_message=-1;add_message(a,UI_ROLE_ASSISTANT,reply?reply:"The provider did not return a response.");free(reply);free(a->worker_user);a->worker_user=NULL;
-    vs_clear_attachments(&a->ctx);a->worker_busy=0;a->status[0]=0;a->auto_scroll=1;
+    vs_clear_attachments(&a->ctx);a->worker_busy=0;vs_cancel_clear(&a->ctx);a->status[0]=0;a->auto_scroll=1;
 }
 
 static void process_worker_pipe(App *a)
 {
     UIWorkerEvent ev;ssize_t n;size_t got;
-    for(;;){got=0;while(got<sizeof(ev)){n=read(a->worker_pipe[0],((char*)&ev)+got,sizeof(ev)-got);if(n<0){if(errno==EINTR)continue;if(errno==EAGAIN||errno==EWOULDBLOCK)return;return;}if(n==0)return;got+=(size_t)n;}if(ev.type==1)apply_worker_trace(a,&ev);else if(ev.type==2){finish_worker(a);return;}if(a->worker_pipe[0]<0)return;}
+    for(;;){got=0;memset(&ev,0,sizeof(ev));while(got<sizeof(ev)){n=read(a->worker_pipe[0],((char*)&ev)+got,sizeof(ev)-got);if(n<0){if(errno==EINTR)continue;if(errno==EAGAIN||errno==EWOULDBLOCK)return;return;}if(n==0)return;got+=(size_t)n;}if(ev.type==1){apply_worker_trace(a,&ev);free(ev.kind);free(ev.detail);}else if(ev.type==2){finish_worker(a);return;}if(a->worker_pipe[0]<0)return;}
 }
 
 static void remove_attachment(App *a, int idx)
@@ -849,20 +857,19 @@ static int trace_body_height(App *a, const UIMessage *m, int cw)
 static int message_step_height(App *a, int index, int cw)
 {
     UIMessage *m;
-    int maxbubble, th;
+    int maxbubble, th, step;
     if (index < 0 || index >= a->message_count) return 0;
     m = &a->messages[index];
+    if(m->layout_valid && m->layout_cw==cw && m->layout_collapsed==m->collapsed)return m->layout_step_height;
     maxbubble = (cw * 72) / 100;
     if (m->role == UI_ROLE_USER) {
-        th = wrapped_height(a, a->font, m->text, maxbubble - 28, 20);
-        return th + 34;
+        th = wrapped_height(a, a->font, m->text, maxbubble - 28, 20);step=th+34;
+    } else if (m->role == UI_ROLE_TRACE) {
+        th = trace_body_height(a, m, cw);step=m->collapsed ? 48 : 62 + th;
+    } else {
+        th = wrapped_height(a, a->font, m->text, cw - 50, 20);step=maxi(th + 20, 46) + 18;
     }
-    if (m->role == UI_ROLE_TRACE) {
-        th = trace_body_height(a, m, cw);
-        return m->collapsed ? 48 : 62 + th;
-    }
-    th = wrapped_height(a, a->font, m->text, cw - 50, 20);
-    return maxi(th + 20, 46) + 18;
+    m->layout_valid=1;m->layout_cw=cw;m->layout_collapsed=m->collapsed;m->layout_text_height=th;m->layout_step_height=step;return step;
 }
 
 static int message_total_height(App *a, int cw)
@@ -973,7 +980,7 @@ static void draw_sidebar(App *a)
     if (!a->worker_busy && !sidebar_compact(a) && a->height > y + 205) {
         ty=y+140;draw_text(a,a->small,a->c.muted,margin+4,ty,"ACTIVITY");
         for(ti=maxi(0,a->ctx.trace_count-5);ti<a->ctx.trace_count;ti++){
-            ty+=18;snprintf(b,sizeof(b),"%s: %.90s",a->ctx.trace[ti].kind,a->ctx.trace[ti].detail);
+            ty+=18;snprintf(b,sizeof(b),"%s: %.90s",a->ctx.trace[ti].kind,a->ctx.trace[ti].detail?a->ctx.trace[ti].detail:"");
             draw_ellipsis(a,a->small,a->c.text,margin+4,ty,sbw-(margin+4)*2,b);
         }
     }
@@ -1057,8 +1064,9 @@ static void draw_messages(App *a, int chat_top, int chat_bottom, int cx, int cw)
     y = chat_top + 8 - a->scroll_y;
     maxbubble = (cw * 72) / 100;
     for (i = 0; i < a->message_count; i++) {
+        (void)message_step_height(a,i,cw);
         if (a->messages[i].role == UI_ROLE_USER) {
-            th = wrapped_height(a, a->font, a->messages[i].text, maxbubble - 28, 20);
+            th = a->messages[i].layout_text_height;
             if (!strchr(a->messages[i].text, '\n')) {
                 tw = text_w(a, a->font, a->messages[i].text) + 28;
                 bw = mini(maxbubble, maxi(76, tw));
@@ -1073,7 +1081,7 @@ static void draw_messages(App *a, int chat_top, int chat_bottom, int cx, int cw)
         } else if (a->messages[i].role == UI_ROLE_TRACE) {
             panel_x = cx + 42;
             panel_w = cw - 42;
-            body_h = trace_body_height(a, &a->messages[i], cw);
+            body_h = a->messages[i].layout_text_height;
             panel_h = a->messages[i].collapsed ? 34 : 48 + body_h;
             by = y + 2;
             if (by + panel_h >= chat_top && by <= chat_bottom) {
@@ -1091,7 +1099,7 @@ static void draw_messages(App *a, int chat_top, int chat_bottom, int cx, int cw)
                 }
             }
         } else {
-            th = wrapped_height(a, a->font, a->messages[i].text, cw - 50, 20);
+            th = a->messages[i].layout_text_height;
             if (y + maxi(th, 26) + 28 >= chat_top && y <= chat_bottom) {
                 fill_round(a, cx, y + 4, 28, 28, 14, a->c.accent);
                 draw_text(a, a->bold, a->c.panel, cx + 9, y + 24, "V");
@@ -1153,6 +1161,12 @@ static void draw_send_icon(App *a, int cx, int cy, unsigned long color)
     p[2].x = (short)(cx - 5); p[2].y = (short)(cy - 5);
     XSetForeground(a->dpy, a->gc, color);
     XFillPolygon(a->dpy, a->canvas, a->gc, p, 3, Convex, CoordModeOrigin);
+}
+
+static void draw_stop_icon(App *a, int cx, int cy, unsigned long color)
+{
+    XSetForeground(a->dpy, a->gc, color);
+    XFillRectangle(a->dpy, a->canvas, a->gc, cx - 5, cy - 5, 10, 10);
 }
 
 static void draw_input_text(App *a, int x, int y, int maxw, int max_lines)
@@ -1229,13 +1243,15 @@ static void draw_composer(App *a, int cx, int cw)
 
     sendx = cx + cw - 25;
     fill_round(a, sendx - 14, py + ph - 34, 28, 28, 14,
-               a->input_len ? a->c.accent : a->c.border);
-    draw_send_icon(a, sendx, py + ph - 20, a->c.panel);
+               a->worker_busy ? a->c.danger : (a->input_len ? a->c.accent : a->c.border));
+    if(a->worker_busy)draw_stop_icon(a, sendx, py + ph - 20, a->c.panel);
+    else draw_send_icon(a, sendx, py + ph - 20, a->c.panel);
 
     if (a->status[0]) {
         draw_ellipsis(a, a->small, a->c.muted, cx, a->height - 13, cw, a->status);
     } else {
-        snprintf(b, sizeof(b), "Enter send  -  Ctrl/Meta+V paste  -  Ctrl+C copy  -  Ctrl+O attach  -  drag files to attach");
+        if(a->worker_busy)snprintf(b,sizeof(b),"Agent running  -  click the square Stop button or press Esc to stop");
+        else snprintf(b, sizeof(b), "Enter send  -  Ctrl/Meta+V paste  -  Ctrl+C copy  -  Ctrl+O attach  -  drag files to attach");
         draw_text(a, a->small, a->c.muted, cx + (cw - text_w(a, a->small, b)) / 2,
                   a->height - 13, b);
     }
@@ -1951,6 +1967,15 @@ static void new_chat(App *a)
     strcpy(a->status, "New chat");
 }
 
+static void request_stop(App *a)
+{
+    if(!a||!a->worker_busy)return;
+    if(vs_cancel_requested(&a->ctx)){strcpy(a->status,"Stop already requested; waiting for the current operation to abort");return;}
+    vs_cancel_request(&a->ctx);
+    strcpy(a->status,"Stopping agent... current HTTP/MCP/command operation is being cancelled");
+    a->auto_scroll=1;
+}
+
 static void send_message(App *a)
 {
     char *usercopy;int trace_index,flags;
@@ -1958,10 +1983,11 @@ static void send_message(App *a)
     if(a->worker_pipe[0]<0||a->worker_pipe[1]<0){snprintf(a->status,sizeof(a->status),"Background worker pipe is unavailable");return;}
     if(!a->input_len)return;
     usercopy=ui_dup(a->input);if(!usercopy)return;
+    vs_cancel_clear(&a->ctx);
     add_message(a,UI_ROLE_USER,usercopy);trace_index=begin_trace_message(a);a->live_trace_message=trace_index;
     a->worker_user=usercopy;a->worker_reply=NULL;a->worker_busy=1;vs_set_trace_callback(&a->ctx,gui_live_trace,a);strcpy(a->status,"Working...");
     a->input[0]=0;a->input_len=0;a->input_cursor=0;selection_clear(a);a->auto_scroll=1;redraw(a);XFlush(a->dpy);
-    if(pthread_create(&a->worker_thread,NULL,agent_worker_main,a)!=0){a->worker_busy=0;a->worker_user=NULL;free(usercopy);vs_set_trace_callback(&a->ctx,NULL,NULL);strcpy(a->status,"Could not start background agent worker");return;}
+    if(pthread_create(&a->worker_thread,NULL,agent_worker_main,a)!=0){a->worker_busy=0;a->worker_user=NULL;free(usercopy);vs_cancel_clear(&a->ctx);vs_set_trace_callback(&a->ctx,NULL,NULL);strcpy(a->status,"Could not start background agent worker");return;}
     a->worker_started=1;
     /* Non-blocking read side lets the event loop drain all available activity
        packets without ever stalling X11. */
@@ -2043,6 +2069,7 @@ static void handle_key(App *a, XKeyEvent *ke)
     KeySym k; char b[64]; int n; unsigned int st; int extend;
     a->cursor_visible=1;n=lookup_utf8(a,ke,b,sizeof(b),&k);st=ke->state;extend=(st&ShiftMask)!=0;
     if (a->modal != MODAL_NONE) { handle_modal_key(a, ke); return; }
+    if(a->worker_busy && k==XK_Escape){request_stop(a);return;}
     if(a->worker_busy && shortcut_mod(st) && (k==XK_o||k==XK_O||k==XK_p||k==XK_P||k==XK_m||k==XK_M||k==XK_k||k==XK_K||k==XK_u||k==XK_U||k==XK_r||k==XK_R||k==XK_t||k==XK_T||k==XK_n||k==XK_N||k==XK_y||k==XK_Y)){snprintf(a->status,sizeof(a->status),"Connection/configuration changes are locked while the agent is working");return;}
     if (shortcut_mod(st) && (k==XK_a||k==XK_A)) { select_all_edit(a); return; }
     if (shortcut_mod(st) && (k==XK_c||k==XK_C)) { own_selection(a,1); if(a->clipboard_text)strcpy(a->status,"Copied selection"); return; }
@@ -2360,13 +2387,14 @@ static void handle_click(App *a, XButtonEvent *be)
     cx=content_x(a,&cw);panel_y=a->height-114;panel_h=82;
     if (trace_header_at(a, x, y, &mi)) {
         a->messages[mi].collapsed = !a->messages[mi].collapsed;
+        a->messages[mi].layout_valid = 0;
         selection_clear(a);
         a->auto_scroll = 0;
         return;
     }
     idx=chip_at(a,x,y,cx,cw);if(idx>=0){if(a->worker_busy)strcpy(a->status,"Attachments are locked while the agent is working");else remove_attachment(a,idx);return;}
     if(hit(x,y,cx+11,panel_y+panel_h-34,28,28)){if(a->worker_busy)strcpy(a->status,"Attachments are locked while the agent is working");else open_modal(a,MODAL_ATTACH,"");return;}
-    if(hit(x,y,cx+cw-39,panel_y+panel_h-34,28,28)){send_message(a);return;}
+    if(hit(x,y,cx+cw-39,panel_y+panel_h-34,28,28)){if(a->worker_busy)request_stop(a);else send_message(a);return;}
 
     if(y>=panel_y&&y<=panel_y+panel_h){
         off=input_offset_at(a,x,y,cx,cw);a->input_cursor=off;
@@ -2509,6 +2537,7 @@ static void destroy_app(App *a)
 {
     if (a->oauth_flow.active) vs_oauth_cancel(&a->oauth_flow);
     if(a->worker_started){
+        vs_cancel_request(&a->ctx);
         while(a->worker_started){fd_set rf;struct timeval tv;int rc;FD_ZERO(&rf);FD_SET(a->worker_pipe[0],&rf);tv.tv_sec=0;tv.tv_usec=200000;rc=select(a->worker_pipe[0]+1,&rf,NULL,NULL,&tv);if(rc>0&&FD_ISSET(a->worker_pipe[0],&rf))process_worker_pipe(a);}
     }
     vs_set_trace_callback(&a->ctx,NULL,NULL);
@@ -2592,7 +2621,10 @@ int main(int argc, char **argv)
                 redraw(&a);
             } else if (ev.type == PropertyNotify) {
                 handle_paste_property(&a, &ev.xproperty);
-                if (a.paste_incr || ev.xproperty.atom == a.paste_atom) redraw(&a);
+                /* INCR clipboard transfers can arrive in many chunks.  The editor
+                   is only changed by paste_commit(), so repaint once at completion
+                   instead of repainting the whole chat for every clipboard chunk. */
+                if (!a.paste_incr && ev.xproperty.atom == a.paste_atom) redraw(&a);
             } else if (ev.type == FocusIn) {
                 a.has_focus = 1; a.cursor_visible = 1; if (a.xic) XSetICFocus(a.xic); redraw(&a);
             } else if (ev.type == FocusOut) {

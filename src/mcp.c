@@ -9,6 +9,7 @@
 #include <sys/wait.h>
 #include <sys/select.h>
 #include <unistd.h>
+#include <time.h>
 
 #define VS_MCP_VERSION "2026-07-28"
 #define VS_MCP_LEGACY_VERSION "2025-11-25"
@@ -22,19 +23,52 @@ static int mb_init(MBuf *b,size_t c){b->p=(char*)malloc(c);if(!b->p)return -1;b-
 static int mb_addn(MBuf *b,const char *s,size_t n){char *p;size_t c;if(b->n+n+1>b->cap){c=b->cap?b->cap:1024;while(b->n+n+1>c)c*=2;p=(char*)realloc(b->p,c);if(!p)return -1;b->p=p;b->cap=c;}memcpy(b->p+b->n,s,n);b->n+=n;b->p[b->n]=0;return 0;}
 static int mb_add(MBuf *b,const char *s){return mb_addn(b,s,strlen(s));}
 
+static void trace_drop_oldest(VSContext *c)
+{
+    int i;
+    if(!c||c->trace_count<=0)return;
+    if(c->trace[0].detail){
+        if(c->trace_bytes>=c->trace[0].bytes)c->trace_bytes-=c->trace[0].bytes;
+        else c->trace_bytes=0;
+        free(c->trace[0].detail);
+    }
+    for(i=1;i<c->trace_count;i++)c->trace[i-1]=c->trace[i];
+    c->trace_count--;
+    memset(&c->trace[c->trace_count],0,sizeof(c->trace[c->trace_count]));
+    c->trace_dropped++;
+}
+
 void vs_trace(VSContext *c,const char *kind,const char *detail)
 {
-    int i,step;
+    int step;
+    size_t bytes;
+    char *copy;
     const char *k=kind?kind:"step", *d=detail?detail:"";
     if(!c)return;
-    if(c->trace_count>=VS_MAX_TRACE){for(i=1;i<c->trace_count;i++)c->trace[i-1]=c->trace[i];c->trace_count--;c->trace_dropped++;}
+    bytes=strlen(d);
+    /* The callback receives the complete event immediately.  Stored trace events are
+       also kept complete unless the global trace-memory safety budget is exceeded. */
+    if(c->trace_callback){
+        step=(int)(c->trace_dropped+(unsigned long)c->trace_count+1UL);
+        c->trace_callback(c->trace_callback_data,step,k,d);
+    }
+    if(bytes>(size_t)VS_MAX_TRACE_BYTES){
+        /* One event larger than the whole trace budget cannot be retained safely.
+           Keep the live callback complete and record a compact stored marker. */
+        d="[trace event exceeded 64 MiB storage budget; complete text was delivered live]";
+        bytes=strlen(d);
+    }
+    while(c->trace_count>=VS_MAX_TRACE || (c->trace_count>0 && c->trace_bytes+bytes+1>(size_t)VS_MAX_TRACE_BYTES))trace_drop_oldest(c);
+    copy=(char*)malloc(bytes+1);
+    if(!copy)return;
+    memcpy(copy,d,bytes+1);
     mcopy(c->trace[c->trace_count].kind,sizeof(c->trace[c->trace_count].kind),k);
-    mcopy(c->trace[c->trace_count].detail,sizeof(c->trace[c->trace_count].detail),d);
+    c->trace[c->trace_count].detail=copy;
+    c->trace[c->trace_count].bytes=bytes+1;
+    c->trace_bytes+=bytes+1;
     c->trace_count++;
-    step=(int)(c->trace_dropped+(unsigned long)c->trace_count);
-    if(c->trace_callback)c->trace_callback(c->trace_callback_data,step,k,d);
 }
-void vs_trace_clear(VSContext *c){if(!c)return;memset(c->trace,0,sizeof(c->trace));c->trace_count=0;c->trace_dropped=0;}
+void vs_trace_clear(VSContext *c){int i;if(!c)return;for(i=0;i<c->trace_count;i++)free(c->trace[i].detail);memset(c->trace,0,sizeof(c->trace));c->trace_count=0;c->trace_dropped=0;c->trace_bytes=0;}
 void vs_set_trace_callback(VSContext *c,VSTraceCallback callback,void *userdata){if(!c)return;c->trace_callback=callback;c->trace_callback_data=userdata;}
 
 static int server_index(VSContext *c,const char *name){int i;for(i=0;i<c->mcp_server_count;i++)if(!strcmp(c->mcp_servers[i].name,name))return i;return -1;}
@@ -86,19 +120,21 @@ static int start_stdio(VSContext *c,VSMcpServer *s)
     close(tochild[0]);close(fromchild[1]);s->pid=(long)p;s->in_fd=tochild[1];s->out_fd=fromchild[0];s->io_pos=s->io_len=0;s->initialized=0;s->session_id[0]=0;snprintf(b,sizeof(b),"started stdio MCP server %s (pid %ld)",s->name,s->pid);vs_trace(c,"mcp-start",b);return 0;
 }
 static int write_all(int fd,const char *p,size_t n){size_t o=0;ssize_t w;while(o<n){w=write(fd,p+o,n-o);if(w<0){if(errno==EINTR)continue;return -1;}if(w==0)return -1;o+=(size_t)w;}return 0;}
-static char *read_stdio_line(VSMcpServer *s)
+static char *read_stdio_line(VSContext *c,VSMcpServer *s)
 {
-    MBuf b;fd_set rf;struct timeval tv;ssize_t r;char *nl;size_t take;
+    MBuf b;fd_set rf;struct timeval tv;ssize_t r;char *nl;size_t take;time_t started=time(NULL);
     if(mb_init(&b,4096)!=0)return NULL;
     for(;;){
+        if(vs_cancel_requested(c)){free(b.p);return NULL;}
         if(s->io_pos<s->io_len){nl=(char*)memchr(s->io_buf+s->io_pos,'\n',s->io_len-s->io_pos);if(nl){take=(size_t)(nl-(s->io_buf+s->io_pos));if(mb_addn(&b,s->io_buf+s->io_pos,take)!=0){free(b.p);return NULL;}s->io_pos+=(take+1);return b.p;}if(mb_addn(&b,s->io_buf+s->io_pos,s->io_len-s->io_pos)!=0){free(b.p);return NULL;}s->io_pos=s->io_len=0;if(b.n>VS_MAX_TEXT*4){free(b.p);return NULL;}}
-        FD_ZERO(&rf);FD_SET(s->out_fd,&rf);tv.tv_sec=VS_MCP_READ_TIMEOUT;tv.tv_usec=0;r=select(s->out_fd+1,&rf,NULL,NULL,&tv);if(r<=0){free(b.p);return NULL;}r=read(s->out_fd,s->io_buf,sizeof(s->io_buf));if(r<=0){free(b.p);return NULL;}s->io_pos=0;s->io_len=(size_t)r;
+        if(time(NULL)-started>=VS_MCP_READ_TIMEOUT){free(b.p);return NULL;}
+        FD_ZERO(&rf);FD_SET(s->out_fd,&rf);tv.tv_sec=0;tv.tv_usec=250000;r=select(s->out_fd+1,&rf,NULL,NULL,&tv);if(r<0&&errno!=EINTR){free(b.p);return NULL;}if(r<=0)continue;r=read(s->out_fd,s->io_buf,sizeof(s->io_buf));if(r<=0){free(b.p);return NULL;}s->io_pos=0;s->io_len=(size_t)r;
     }
 }
-static char *stdio_request_raw(VSMcpServer *s,const char *req,unsigned long id)
+static char *stdio_request_raw(VSContext *c,VSMcpServer *s,const char *req,unsigned long id)
 {
-    char *line;char pat[64];int tries=0;size_t n=strlen(req);if(write_all(s->in_fd,req,n)||write_all(s->in_fd,"\n",1))return NULL;snprintf(pat,sizeof(pat),"\"id\":%lu",id);
-    while(tries++<64){line=read_stdio_line(s);if(!line)return NULL;if(strstr(line,pat))return line;free(line);}return NULL;
+    char *line;char pat[64];int tries=0;size_t n=strlen(req);if(vs_cancel_requested(c))return NULL;if(write_all(s->in_fd,req,n)||write_all(s->in_fd,"\n",1))return NULL;snprintf(pat,sizeof(pat),"\"id\":%lu",id);
+    while(tries++<64){line=read_stdio_line(c,s);if(!line)return NULL;if(strstr(line,pat))return line;free(line);}return NULL;
 }
 static int stdio_notify(VSMcpServer *s,const char *json){return write_all(s->in_fd,json,strlen(json))||write_all(s->in_fd,"\n",1)?-1:0;}
 
@@ -121,7 +157,7 @@ static void extract_protocol_version(const char *json,char *out,size_t cap)
 static int legacy_initialize_stdio(VSContext *c,VSMcpServer *s)
 {
     unsigned long id;char req[768];char *r;char pv[32];char b[256];if(start_stdio(c,s)!=0)return -1;if(s->initialized&&s->legacy)return 0;
-    id=s->next_id++;snprintf(req,sizeof(req),"{\"jsonrpc\":\"2.0\",\"id\":%lu,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"%s\",\"capabilities\":{},\"clientInfo\":{\"name\":\"VibeSolaris\",\"version\":\"" VS_VERSION "\"}}}",id,VS_MCP_LEGACY_VERSION);vs_trace(c,"mcp-negotiate","trying legacy MCP initialize over stdio");r=stdio_request_raw(s,req,id);if(!r)return -1;if(strstr(r,"\"error\"")){free(r);return -1;}extract_protocol_version(r,pv,sizeof(pv));free(r);mcopy(s->protocol_version,sizeof(s->protocol_version),pv[0]?pv:VS_MCP_LEGACY_VERSION);if(stdio_notify(s,"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}")!=0)return -1;s->legacy=1;s->initialized=1;snprintf(b,sizeof(b),"%s negotiated legacy MCP %s",s->name,s->protocol_version);vs_trace(c,"mcp-negotiate",b);return 0;
+    id=s->next_id++;snprintf(req,sizeof(req),"{\"jsonrpc\":\"2.0\",\"id\":%lu,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"%s\",\"capabilities\":{},\"clientInfo\":{\"name\":\"VibeSolaris\",\"version\":\"" VS_VERSION "\"}}}",id,VS_MCP_LEGACY_VERSION);vs_trace(c,"mcp-negotiate","trying legacy MCP initialize over stdio");r=stdio_request_raw(c,s,req,id);if(!r)return -1;if(strstr(r,"\"error\"")){free(r);return -1;}extract_protocol_version(r,pv,sizeof(pv));free(r);mcopy(s->protocol_version,sizeof(s->protocol_version),pv[0]?pv:VS_MCP_LEGACY_VERSION);if(stdio_notify(s,"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}")!=0)return -1;s->legacy=1;s->initialized=1;snprintf(b,sizeof(b),"%s negotiated legacy MCP %s",s->name,s->protocol_version);vs_trace(c,"mcp-negotiate",b);return 0;
 }
 static int legacy_initialize_http(VSContext *c,VSMcpServer *s)
 {
@@ -134,7 +170,7 @@ static int legacy_initialize(VSContext *c,VSMcpServer *s){if(s->transport==VS_MC
 
 static char *request_stdio(VSContext *c,VSMcpServer *s,const char *method,const char *name,const char *args)
 {
-    char *req,*line;unsigned long id;if(start_stdio(c,s)!=0)return mdup("{\"error\":\"could not start stdio MCP server\"}");if(s->legacy&&!s->initialized&&legacy_initialize_stdio(c,s)!=0)return mdup("{\"error\":\"legacy stdio MCP initialize failed\"}");id=s->next_id++;req=s->legacy?make_legacy_request(id,method,name,args):make_meta_request(id,method,name,args);if(!req)return NULL;line=stdio_request_raw(s,req,id);free(req);if(!line){server_stop(s);return mdup("{\"error\":\"stdio MCP response timeout or EOF\"}");}return line;
+    char *req,*line;unsigned long id;if(start_stdio(c,s)!=0)return mdup("{\"error\":\"could not start stdio MCP server\"}");if(s->legacy&&!s->initialized&&legacy_initialize_stdio(c,s)!=0)return mdup("{\"error\":\"legacy stdio MCP initialize failed\"}");id=s->next_id++;req=s->legacy?make_legacy_request(id,method,name,args):make_meta_request(id,method,name,args);if(!req)return NULL;line=stdio_request_raw(c,s,req,id);free(req);if(!line){server_stop(s);return mdup("{\"error\":\"stdio MCP response timeout or EOF\"}");}return line;
 }
 static char *request_http(VSContext *c,VSMcpServer *s,const char *method,const char *name,const char *args)
 {
@@ -145,7 +181,7 @@ static char *request_http(VSContext *c,VSMcpServer *s,const char *method,const c
 }
 static char *request_server(VSContext *c,VSMcpServer *s,const char *method,const char *name,const char *args)
 {
-    char b[512];snprintf(b,sizeof(b),"%s -> %s%s%s [%s]",s->name,method,name?" / ":"",name?name:"",s->legacy?(s->protocol_version[0]?s->protocol_version:"legacy"):VS_MCP_VERSION);vs_trace(c,"mcp-request",b);if(s->transport==VS_MCP_STDIO)return request_stdio(c,s,method,name,args);return request_http(c,s,method,name,args);
+    char b[512];if(vs_cancel_requested(c))return mdup("{\"error\":\"cancelled by user\"}");snprintf(b,sizeof(b),"%s -> %s%s%s [%s]",s->name,method,name?" / ":"",name?name:"",s->legacy?(s->protocol_version[0]?s->protocol_version:"legacy"):VS_MCP_VERSION);vs_trace(c,"mcp-request",b);if(s->transport==VS_MCP_STDIO)return request_stdio(c,s,method,name,args);return request_http(c,s,method,name,args);
 }
 
 static const char *skip_ws(const char *p){while(*p==' '||*p=='\t'||*p=='\r'||*p=='\n')p++;return p;}
@@ -165,17 +201,17 @@ static int parse_tools_for_server(VSContext *c,VSMcpServer *s,const char *json)
 }
 int vs_mcp_refresh_server(VSContext *c,int index)
 {
-    char *r,b[320];int rc;if(!c||index<0||index>=c->mcp_server_count)return -1;if(!c->mcp_servers[index].enabled)return 0;r=request_server(c,&c->mcp_servers[index],"tools/list",NULL,NULL);if(!r)return -1;rc=parse_tools_for_server(c,&c->mcp_servers[index],r);free(r);
-    if(rc<0&&!c->mcp_servers[index].legacy){vs_trace(c,"mcp-negotiate","modern MCP request was not accepted; trying 2025-11-25 initialize compatibility");if(legacy_initialize(c,&c->mcp_servers[index])==0){r=request_server(c,&c->mcp_servers[index],"tools/list",NULL,NULL);if(r){rc=parse_tools_for_server(c,&c->mcp_servers[index],r);free(r);}}}
+    char *r,b[320];int rc;if(!c||index<0||index>=c->mcp_server_count)return -1;if(vs_cancel_requested(c))return -1;if(!c->mcp_servers[index].enabled)return 0;r=request_server(c,&c->mcp_servers[index],"tools/list",NULL,NULL);if(!r)return -1;if(vs_cancel_requested(c)){free(r);return -1;}rc=parse_tools_for_server(c,&c->mcp_servers[index],r);free(r);
+    if(rc<0&&!vs_cancel_requested(c)&&!c->mcp_servers[index].legacy){vs_trace(c,"mcp-negotiate","modern MCP request was not accepted; trying 2025-11-25 initialize compatibility");if(legacy_initialize(c,&c->mcp_servers[index])==0&&!vs_cancel_requested(c)){r=request_server(c,&c->mcp_servers[index],"tools/list",NULL,NULL);if(r){rc=parse_tools_for_server(c,&c->mcp_servers[index],r);free(r);}}}
     snprintf(b,sizeof(b),"%s exposed %d tool(s) via %s",c->mcp_servers[index].name,rc<0?0:rc,c->mcp_servers[index].legacy?(c->mcp_servers[index].protocol_version[0]?c->mcp_servers[index].protocol_version:"legacy"):VS_MCP_VERSION);vs_trace(c,rc<0?"mcp-error":"mcp-discover",b);return rc;
 }
 int vs_mcp_refresh_all(VSContext *c,int force)
 {
-    int i,total=0,need=force;if(!c)return -1;if(!force){for(i=0;i<c->mcp_server_count;i++)if(c->mcp_servers[i].enabled&&!c->mcp_servers[i].tools_loaded){need=1;break;}if(!need)return c->mcp_tool_count;}c->mcp_tool_count=0;for(i=0;i<c->mcp_server_count;i++){c->mcp_servers[i].tools_loaded=0;if(c->mcp_servers[i].enabled){int n=vs_mcp_refresh_server(c,i);if(n>0)total+=n;}}return total;
+    int i,total=0,need=force;if(!c)return -1;if(vs_cancel_requested(c))return -1;if(!force){for(i=0;i<c->mcp_server_count;i++)if(c->mcp_servers[i].enabled&&!c->mcp_servers[i].tools_loaded){need=1;break;}if(!need)return c->mcp_tool_count;}c->mcp_tool_count=0;for(i=0;i<c->mcp_server_count;i++){if(vs_cancel_requested(c))return -1;c->mcp_servers[i].tools_loaded=0;if(c->mcp_servers[i].enabled){int n=vs_mcp_refresh_server(c,i);if(n>0)total+=n;}}return total;
 }
 char *vs_mcp_call(VSContext *c,const char *server,const char *tool,const char *args)
 {
-    int i;char *r;char b[512];if(!c||!server||!tool)return mdup("ERROR: invalid MCP call");i=server_index(c,server);if(i<0)return mdup("ERROR: MCP server not configured");if(!args||!*args)args="{}";snprintf(b,sizeof(b),"calling %s.%s args=%.300s",server,tool,args);vs_trace(c,"mcp-call",b);r=request_server(c,&c->mcp_servers[i],"tools/call",tool,args);if(!r)return mdup("ERROR: MCP call failed");snprintf(b,sizeof(b),"%s.%s result %.360s",server,tool,r);vs_trace(c,"mcp-result",b);return r;
+    int i;char *r;char b[512];if(!c||!server||!tool)return mdup("ERROR: invalid MCP call");if(vs_cancel_requested(c))return mdup("ERROR: cancelled by user");i=server_index(c,server);if(i<0)return mdup("ERROR: MCP server not configured");if(!args||!*args)args="{}";snprintf(b,sizeof(b),"calling %s.%s args=%.300s",server,tool,args);vs_trace(c,"mcp-call",b);r=request_server(c,&c->mcp_servers[i],"tools/call",tool,args);if(vs_cancel_requested(c)){if(r)free(r);return mdup("ERROR: cancelled by user");}if(!r)return mdup("ERROR: MCP call failed");snprintf(b,sizeof(b),"%s.%s result %.360s",server,tool,r);vs_trace(c,"mcp-result",b);return r;
 }
 char *vs_mcp_prompt_fragment(const VSContext *c)
 {
