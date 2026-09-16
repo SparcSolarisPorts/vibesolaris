@@ -19,12 +19,6 @@
 #define VS_HISTORY_BUDGET (192*1024)
 #define VS_HISTORY_MESSAGE_MAX (32*1024)
 #define VS_MAX_FILE_CACHE 24
-#define VS_AUTOCOMPACT_MIN_MESSAGES 8
-#define VS_AUTOCOMPACT_KEEP_MESSAGES 8
-#define VS_HISTORY_SUMMARY_MAX (16*1024)
-#define VS_MAX_REPEAT_ROUNDS 3
-#define VS_MAX_STAGNATION_NUDGES 3
-#define VS_MAX_ACTION_REPEATS 2
 #define VS_PROVIDER_SLOT_COUNT 10
 #define VS_OAUTH_TOKEN_MAX 4096
 #define VS_OAUTH_URL_MAX 1024
@@ -220,11 +214,6 @@ typedef struct {
     int history_count;
     size_t history_bytes;
     unsigned long history_evicted;
-    int compact_disabled;
-    int auto_compact_at;
-    unsigned long compactions;
-    unsigned long compacted_messages;
-    char history_summary[VS_HISTORY_SUMMARY_MAX];
 } VSContext;
 
 void vs_init(VSContext *ctx);
@@ -260,7 +249,6 @@ void vs_cache_invalidate(VSContext *ctx, const char *path);
 void vs_cache_clear(VSContext *ctx);
 void vs_history_add(VSContext *ctx, const char *role, const char *content);
 void vs_history_clear(VSContext *ctx);
-int  vs_history_compact(VSContext *ctx);
 int  vs_write_file(const char *path, const char *text);
 char *vs_run_command(const char *cmd, int *exit_code);
 char *vs_run_command_ctx(VSContext *ctx, const char *cmd, int *exit_code);
