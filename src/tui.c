@@ -158,6 +158,8 @@ static void help(void)
     cprintf(T_CYAN,"  /run COMMAND                  ");printf("run a local shell command\n");
     cprintf(T_CYAN,"  /cache on|off|status|clear\n");
     cprintf(T_CYAN,"  /history status|clear\n");
+    cprintf(T_CYAN,"  /compact                      ");printf("fold older turns into a running summary now\n");
+    cprintf(T_CYAN,"  /autocompact on|off|status    ");printf("keep long conversations going automatically (default on)\n");
     cprintf(T_CYAN,"  /usage                        ");printf("show provider-reported token usage for the current conversation\n");
     cprintf(T_CYAN,"  /trace                        ");printf("show full model input/output, provider-returned reasoning, local-tool and MCP activity\n");
     cprintf(T_CYAN,"  Ctrl+C during agent work      ");printf("stop the active provider/MCP/command operation without exiting VibeSolaris\n");
@@ -311,7 +313,20 @@ int main(int argc, char **argv)
             vs_history_clear(&c);successf("conversation history cleared\n");
         } else if (!strcmp(line, "/history") || !strcmp(line, "/history status")) {
             printf("history_messages=%d history_bytes=%lu history_evicted=%lu\n",c.history_count,(unsigned long)c.history_bytes,c.history_evicted);
+            printf("auto-compact=%s compactions=%lu compacted_messages=%lu summary_bytes=%lu\n",c.compact_disabled?"off":"on",c.compactions,c.compacted_messages,(unsigned long)strlen(c.history_summary));
             usage_status(&c);
+        } else if (!strcmp(line, "/compact")) {
+            int d=vs_history_compact(&c);
+            if(d>0)successf("compacted %d older message(s) into the running summary\n",d);
+            else if(d==0)warnf("nothing to compact yet\n");
+            else errorf("compaction failed\n");
+            printf("auto-compact=%s compactions=%lu compacted_messages=%lu summary_bytes=%lu\n",c.compact_disabled?"off":"on",c.compactions,c.compacted_messages,(unsigned long)strlen(c.history_summary));
+        } else if (!strcmp(line, "/autocompact on")) {
+            c.compact_disabled=0;(void)vs_persist_settings(&c);successf("auto-compaction enabled\n");
+        } else if (!strcmp(line, "/autocompact off")) {
+            c.compact_disabled=1;(void)vs_persist_settings(&c);warnf("auto-compaction disabled; history will evict oldest turns when full\n");
+        } else if (!strcmp(line, "/autocompact") || !strcmp(line, "/autocompact status")) {
+            printf("auto-compact=%s keep=%d history_messages=%d compactions=%lu compacted_messages=%lu summary_bytes=%lu\n",c.compact_disabled?"off":"on",c.auto_compact_at>0?c.auto_compact_at:VS_AUTOCOMPACT_KEEP_MESSAGES,c.history_count,c.compactions,c.compacted_messages,(unsigned long)strlen(c.history_summary));
         } else if (!strcmp(line, "/usage")) {
             usage_status(&c);
         } else if (!strncmp(line, "/saveconfig ", 12)) {

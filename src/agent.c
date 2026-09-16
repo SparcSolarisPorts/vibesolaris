@@ -93,7 +93,7 @@ static char *tool_channel_recovery_prompt(const char *task,const char *last_resu
 
 
 char *vs_agent_turn(VSContext *c,const char *user){
-    char *prompt=dupstr(user),*ans=0,*original=dupstr(user),*task_anchor=0,*last_tool_result=0;int round,plan_continues=0,tool_recoveries=0,command_runner_confirmed=0,actual_tool_seen=0,execution_mode=0,cancelled=0,max_rounds=VS_MAX_TOOL_ROUNDS;
+    char *prompt=dupstr(user),*ans=0,*original=dupstr(user),*task_anchor=0,*last_tool_result=0,*prev_ans=0;int round,plan_continues=0,tool_recoveries=0,command_runner_confirmed=0,actual_tool_seen=0,execution_mode=0,cancelled=0,max_rounds=VS_MAX_TOOL_ROUNDS;int repeat_rounds=0,action_repeats=0,stagnation_nudges=0;char prev_action[512];
     char step[512];
     {const char *mr=getenv("VIBESOLARIS_MAX_AGENT_ROUNDS");if(mr&&*mr){char *ep=0;long v=strtol(mr,&ep,10);if(ep&&*ep==0&&v>=8&&v<=256)max_rounds=(int)v;}}
     if(!prompt||!original){free(prompt);free(original);return dupstr("out of memory");}
@@ -101,6 +101,7 @@ char *vs_agent_turn(VSContext *c,const char *user){
     if(!task_anchor)task_anchor=dupstr(original);
     if(!task_anchor){free(prompt);free(original);return dupstr("out of memory");}
     execution_mode=execution_intent(original);
+    prev_action[0]=0;
     vs_trace_clear(c);
     vs_trace(c,"agent","starting agent turn");
     if(vs_cancel_requested(c)){cancelled=1;vs_trace(c,"cancel","agent turn stopped by user before work began");}
@@ -110,12 +111,14 @@ char *vs_agent_turn(VSContext *c,const char *user){
         if(vs_cancel_requested(c)){cancelled=1;vs_trace(c,"cancel","agent turn stopped by user");break;}
         if(round>0 && (round%VS_LONG_TASK_CHECKPOINT)==0){snprintf(step,sizeof(step),"long-task checkpoint: %d rounds completed; local command and MCP tools remain available",round);vs_trace(c,"checkpoint",step);}
         snprintf(step,sizeof(step),"model round %d",round+1);vs_trace(c,"model",step);
+        if(round>0&&prev_ans&&ans&&!strcmp(prev_ans,ans))repeat_rounds++;else repeat_rounds=0;
         vs_trace(c,"model-input",prompt);
         vs_trace(c,"model-wait","requesting provider response");
-        free(ans);ans=vs_chat(c,prompt);if(!ans){free(prompt);free(original);free(task_anchor);free(last_tool_result);return dupstr("provider error");}
+        free(ans);ans=vs_chat(c,prompt);if(!ans){free(prev_ans);free(prompt);free(original);free(task_anchor);free(last_tool_result);return dupstr("provider error");}
         if(vs_cancel_requested(c)){cancelled=1;free(ans);ans=dupstr("Stopped by user.");vs_trace(c,"cancel","agent turn stopped while waiting for the provider");break;}
         vs_trace(c,"model-output",ans);
         vs_trace(c,"model-result","model response received");
+        {free(prev_ans);prev_ans=dupstr(ans);}
 
         /* Parse executable directives BEFORE lifecycle markers.  Some models
            embed a VS_TOOL/VS_MCP directive in prose and also append VS_FINAL.
@@ -127,6 +130,13 @@ char *vs_agent_turn(VSContext *c,const char *user){
             char *clean=strip_marker(ans,"[[VS_FINAL]]");
             vs_trace(c,"protocol","deferred premature VS_FINAL because an executable directive is pending");
             if(clean){free(ans);ans=clean;tool=strstr(ans,"[[VS_TOOL ");mcp=strstr(ans,"[[VS_MCP ");}
+        }
+
+        if(repeat_rounds>=VS_MAX_REPEAT_ROUNDS){
+            snprintf(step,sizeof(step),"model returned the same response %d times; stopping instead of circling",repeat_rounds+1);vs_trace(c,"stagnation",step);
+            vs_history_add(c,"user",prompt);vs_history_add(c,"assistant",ans);
+            {free(ans);ans=dupstr("Stopped: the model repeated the same response without making progress. The task was not marked complete. Narrow the next request, or raise VIBESOLARIS_MAX_AGENT_ROUNDS and continue from the current files and conversation state.");}
+            break;
         }
 
         /* A model may hallucinate a broken tool bridge without ever emitting a
@@ -194,6 +204,40 @@ char *vs_agent_turn(VSContext *c,const char *user){
         }
 
         plan_continues=0;
+        {
+            /* Repeated identical tool directives with no new information are a
+               loop, not progress.  Warn first, then stop instead of grinding. */
+            char action[512];
+            action[0]=0;
+            if(tool){size_t z=strlen(tool);if(z>sizeof(action)-1)z=sizeof(action)-1;memcpy(action,tool,z);action[z]=0;}
+            else if(mcp){size_t z=strlen(mcp);if(z>sizeof(action)-1)z=sizeof(action)-1;memcpy(action,mcp,z);action[z]=0;}
+            {char *nl=strchr(action,'\n');if(nl)*nl=0;}
+            if(action[0]&&!strcmp(action,prev_action))action_repeats++;else action_repeats=0;
+            if(action[0]){size_t z=strlen(action);if(z>sizeof(prev_action)-1)z=sizeof(prev_action)-1;memcpy(prev_action,action,z);prev_action[z]=0;}
+            else prev_action[0]=0;
+            if(action[0]&&action_repeats>=1){
+                if(stagnation_nudges<VS_MAX_STAGNATION_NUDGES){
+                    stagnation_nudges++;
+                    snprintf(step,sizeof(step),"repeated identical tool action (%d); nudging toward a different approach",action_repeats+1);vs_trace(c,"stagnation",step);
+                    vs_history_add(c,"user",prompt);vs_history_add(c,"assistant",ans);
+                    {char *nudge=(char*)malloc(strlen(task_anchor)+strlen(action)+1024);
+                     if(nudge){snprintf(nudge,strlen(task_anchor)+strlen(action)+1024,
+                        "ACTIVE_TASK (persistent anchor):\n%s\n\nSTAGNATION_WARNING:\nYou already ran the identical directive below %d time(s) and it produced no new information:\n%s\nDo not repeat it again. Take a different concrete step: read a different file, run a different command, change the edit, or explain the specific blocker. If a file/command is genuinely missing or you need a decision you cannot infer, emit [[VS_NEED_USER question=\"YOUR QUESTION\"]] now. Otherwise emit exactly one [[VS_TOOL ...]] directive or [[VS_FINAL]] with a concise result.",
+                        task_anchor?task_anchor:"",action_repeats+1,action);
+                     free(prompt);prompt=nudge;}
+                     else {snprintf(step,sizeof(step),"memory error while building stagnation nudge");vs_trace(c,"memory-error",step);}}
+                    if(!prompt){free(result);result=0;break;}
+                    free(result);result=0;
+                    action_repeats=0;prev_action[0]=0;
+                    continue;
+                }
+                snprintf(step,sizeof(step),"model kept repeating the identical tool action (%d); stopping instead of circling",action_repeats+1);vs_trace(c,"stagnation",step);
+                vs_history_add(c,"user",prompt);vs_history_add(c,"assistant",ans);
+                {free(ans);ans=dupstr("Stopped: the model repeated the same tool action without progress. The task was not marked complete. Adjust the request or inspect the last tool output, then continue.");}
+                free(result);result=0;
+                break;
+            }
+        }
         actual_tool_seen=1;
         execution_mode=1;
         if(vs_cancel_requested(c)){cancelled=1;vs_trace(c,"cancel","agent turn stopped before the next tool action");break;}
@@ -253,5 +297,5 @@ char *vs_agent_turn(VSContext *c,const char *user){
         if(execution_mode || (ans && (strstr(ans,"[[VS_TOOL ")||strstr(ans,"[[VS_MCP ")))){free(ans);ans=dupstr("The single-turn autonomous safety ceiling was reached while work was still in progress. Local command execution is still available; the task was not marked complete. For unusually large jobs, raise VIBESOLARIS_MAX_AGENT_ROUNDS (up to 256) and continue from the existing files and conversation state.");}
     }
     if(cancelled){free(ans);ans=dupstr("Stopped by user.");}
-    free(prompt);free(original);free(task_anchor);free(last_tool_result);return ans;
+    free(prev_ans);free(prompt);free(original);free(task_anchor);free(last_tool_result);return ans;
 }

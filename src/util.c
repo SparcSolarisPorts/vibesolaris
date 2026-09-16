@@ -210,10 +210,69 @@ static void history_drop_oldest(VSContext *ctx) {
     else history_drop_one(ctx);
 }
 
+/* Auto-compaction keeps long conversations going: the oldest turns are folded
+   into a durable running summary that is re-injected as a synthetic
+   user/assistant pair, instead of being silently discarded. */
+static void history_summary_append(VSContext *ctx,const char *role,const char *content){
+    char line[768];size_t used,rlen,drop;
+    if(!ctx||!content)return;
+    snprintf(line,sizeof(line),"- %.16s: %.640s\n",role?role:"?",content);
+    rlen=strlen(line);used=strlen(ctx->history_summary);
+    if(used+rlen+1>=sizeof(ctx->history_summary)){
+        drop=(used+rlen+1-sizeof(ctx->history_summary))+512;
+        if(drop>used)drop=used;
+        memmove(ctx->history_summary,ctx->history_summary+drop,used-drop+1);
+        used-=drop;
+    }
+    memcpy(ctx->history_summary+used,line,rlen);ctx->history_summary[used+rlen]=0;
+}
+
+int vs_history_compact(VSContext *ctx){
+    int keep,total,drop,i;
+    char *blk;
+    if(!ctx)return -1;
+    total=ctx->history_count;
+    keep=ctx->auto_compact_at>0?ctx->auto_compact_at:VS_AUTOCOMPACT_KEEP_MESSAGES;
+    if(keep<2)keep=2;
+    if(total<VS_AUTOCOMPACT_MIN_MESSAGES||total<=keep)return 0;
+    drop=total-keep;
+    if((drop%2)!=0)drop++;
+    if(drop>=total)drop=total-2;
+    if(drop<=0)return 0;
+    for(i=0;i<drop;i++){
+        history_summary_append(ctx,ctx->history[i].role,ctx->history[i].content?ctx->history[i].content:"");
+        if(ctx->history[i].content)free(ctx->history[i].content);
+        if(ctx->history_bytes>=ctx->history[i].bytes)ctx->history_bytes-=ctx->history[i].bytes;else ctx->history_bytes=0;
+        ctx->history[i].content=0;ctx->history[i].bytes=0;
+        ctx->compacted_messages++;
+    }
+    for(i=drop;i<total;i++)ctx->history[i-drop]=ctx->history[i];
+    memset(&ctx->history[total-drop],0,sizeof(ctx->history[0])*(size_t)drop);
+    ctx->history_count=total-drop;
+    if(ctx->history_summary[0] && ctx->history_count+2<=VS_MAX_HISTORY){
+        size_t n=strlen(ctx->history_summary)+192;
+        blk=(char*)malloc(n);
+        memmove(&ctx->history[2],&ctx->history[0],sizeof(ctx->history[0])*(size_t)ctx->history_count);
+        memset(&ctx->history[0],0,sizeof(ctx->history[0])*2);
+        strncpy(ctx->history[0].role,"user",sizeof(ctx->history[0].role)-1);
+        if(blk){snprintf(blk,n,"[Compacted earlier conversation summary]\n%s\n[End of compacted summary; continue the same task without asking the user to repeat it.]",ctx->history_summary);ctx->history[0].content=blk;}
+        else ctx->history[0].content=dupstr("[Compacted earlier conversation summary]");
+        ctx->history[0].bytes=ctx->history[0].content?strlen(ctx->history[0].content):0;
+        strncpy(ctx->history[1].role,"assistant",sizeof(ctx->history[1].role)-1);
+        ctx->history[1].content=dupstr("Understood. Continuing from that compacted context.");
+        ctx->history[1].bytes=ctx->history[1].content?strlen(ctx->history[1].content):0;
+        ctx->history_bytes+=ctx->history[0].bytes+ctx->history[1].bytes;
+        ctx->history_count+=2;
+    }
+    ctx->compactions++;
+    return drop;
+}
+
 void vs_history_add(VSContext *ctx,const char *role,const char *content) {
     char *c; size_t n;
     if(!ctx||!content)return;
     c=compact_copy(content);if(!c)return;n=strlen(c);
+    if(!ctx->compact_disabled && (ctx->history_count>=VS_MAX_HISTORY-VS_AUTOCOMPACT_KEEP_MESSAGES || (ctx->history_count>0 && ctx->history_bytes+n>VS_HISTORY_BUDGET*3/4)))vs_history_compact(ctx);
     while(ctx->history_count>=VS_MAX_HISTORY || (ctx->history_count>0 && ctx->history_bytes+n>VS_HISTORY_BUDGET))history_drop_oldest(ctx);
     strncpy(ctx->history[ctx->history_count].role,role?role:"user",sizeof(ctx->history[ctx->history_count].role)-1);
     ctx->history[ctx->history_count].content=c;ctx->history[ctx->history_count].bytes=n;ctx->history_bytes+=n;ctx->history_count++;
@@ -232,6 +291,7 @@ int vs_cancel_requested(const VSContext *ctx) { return ctx && ctx->cancel_reques
 void vs_history_clear(VSContext *ctx) {
     int i;if(!ctx)return;for(i=0;i<ctx->history_count;i++)if(ctx->history[i].content)free(ctx->history[i].content);
     memset(ctx->history,0,sizeof(ctx->history));ctx->history_count=0;ctx->history_bytes=0;ctx->history_evicted=0;
+    ctx->compactions=0;ctx->compacted_messages=0;ctx->history_summary[0]=0;
     vs_usage_clear(ctx);
 }
 
