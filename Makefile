@@ -16,7 +16,7 @@ CRYPTO_LIBS = -lcrypto
 X11_LIBS = -lX11
 THREAD_LIBS = -lpthread
 
-CORE = src/util.o src/http.o src/config.o src/secure_config.o src/sha256.o src/oauth.o src/mcp.o src/provider.o src/agent.o
+CORE = src/util.o src/http.o src/web.o src/graph.o src/config.o src/secure_config.o src/sha256.o src/oauth.o src/mcp.o src/provider.o src/agent.o
 
 all: vibesolaris vibesolaris-gui
 
@@ -31,6 +31,12 @@ src/util.o: src/util.c include/vibesolaris.h
 
 src/http.o: src/http.c include/vibesolaris.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c src/http.c -o src/http.o
+
+src/web.o: src/web.c include/vibesolaris.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c src/web.c -o src/web.o
+
+src/graph.o: src/graph.c include/vibesolaris.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c src/graph.c -o src/graph.o
 
 src/config.o: src/config.c include/vibesolaris.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c src/config.c -o src/config.o
@@ -62,3 +68,19 @@ src/gui.o: src/gui.c include/vibesolaris.h
 
 clean:
 	rm -f *.o src/*.o vibesolaris vibesolaris-gui
+
+test-agent:
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/agent_lifecycle_test.c src/agent.c -o /tmp/vibesolaris-agent-lifecycle-test
+	/tmp/vibesolaris-agent-lifecycle-test
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/agent_strict_execution_test.c src/agent.c -o /tmp/vibesolaris-agent-strict-test
+	/tmp/vibesolaris-agent-strict-test
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/agent_compaction_test.c src/agent.c -o /tmp/vibesolaris-agent-compaction-test
+	/tmp/vibesolaris-agent-compaction-test
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/agent_native_tools_test.c src/agent.c -o /tmp/vibesolaris-agent-native-tools-test
+	/tmp/vibesolaris-agent-native-tools-test
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/graph_test.c src/graph.c -o /tmp/vibesolaris-graph-test
+	/tmp/vibesolaris-graph-test
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/web_test.c src/web.c -o /tmp/vibesolaris-web-test
+	/tmp/vibesolaris-web-test
+
+test: test-agent

@@ -1,4 +1,4 @@
-# VibeSolaris 0.10.7
+# VibeSolaris 0.12.0
 
 VibeSolaris is a lightweight local AI coding client intended to run on old and new Unix systems without requiring Electron, Qt, GTK, Java, Node.js, or a browser engine.
 
@@ -419,6 +419,23 @@ The GUI is intentionally pure Xlib. It does not load a web browser engine and do
 
 Mouse dragging selects text in the composer and chat messages. Selection can be copied into other X11 applications.
 
+### Project graph and online research
+
+VibeSolaris 0.12.0 adds an Obsidian-style project graph directly to the Xlib GUI. Click **Graph** in the top bar, press `Ctrl/Meta+G`, or type `/graph files` to open a force-directed file dependency view. `Ctrl/Meta+Shift+G` or `/graph fields` switches to a C/C++ structure-field view. The graph understands quoted C/C++ includes, common quoted import/require forms, Markdown links and `[[wiki links]]`. Click a node to see its source path. Large repositories are deliberately bounded; point the agent or TUI graph command at a narrower subtree when you want a denser local view.
+
+The agent also has native web tools:
+
+```text
+[[VS_TOOL web_search query="Solaris 11.4 libthread documentation" count="5"]]
+[[VS_TOOL web_fetch url="https://example.invalid/relevant-page"]]
+```
+
+`web_search` finds current pages without requiring a GNU command-line browser. `web_fetch` retrieves a selected page and converts it to bounded readable text. In the GUI, `/web QUERY` asks the agent to search first and fetch only useful result pages. This is intended for current documentation, APIs, release notes and obscure platform details where guessing is wasteful.
+
+### Slash completion and GUI shortcuts
+
+When the GUI composer begins with `/`, matching commands appear above the composer. Press `Tab` to complete. The lightweight local commands `/graph files`, `/graph fields`, `/usage`, `/trace`, `/help`, and `/clear` do not consume a model round.
+
 ### File and image attachments
 
 You can attach files in three ways:
@@ -429,7 +446,33 @@ You can attach files in three ways:
 
 Attachment chips appear in the composer area. Click a chip to remove it before sending.
 
-The current build supports up to 16 attachments per request.
+The current build supports up to 16 attachments per request. During an autonomous
+agent turn, the original attachments are sent only on the first provider round;
+later rounds send only images newly loaded with `VS_TOOL image`. This avoids paying
+for the same large source archive, log, or screenshot on every tool cycle. The model
+can still reread an attached local file explicitly with `VS_TOOL read` when it needs
+the exact content again.
+
+### Native repository inspection tools
+
+VibeSolaris 0.11.0 adds host-native file inspection so the model does not need to
+construct a GNU-specific `find | grep | sed` pipeline for ordinary source browsing:
+
+```text
+[[VS_TOOL list path="src" depth="2" limit="300"]]
+[[VS_TOOL search path="src" query="ForeignGlobals" limit="100"]]
+[[VS_TOOL read path="src/agent.c" start_line="120" max_lines="160"]]
+```
+
+`list` and `search` use the C/POSIX filesystem APIs directly, skip version-control
+metadata directories during recursive walks, and return bounded output. `search`
+is a literal text search and supports `case_insensitive="1"`. Ranged `read` avoids
+sending an entire large source file merely to inspect a small function.
+
+The model may also place up to eight independent `VS_TOOL`/`VS_MCP` directives in
+one response. They are executed in order and returned as one batch result. This is
+intended for independent inspections; work that depends on seeing an earlier result
+should still be split across rounds.
 
 ### Vision, screenshots, GUI debugging and CAD renders
 
@@ -550,14 +593,23 @@ Provider/model setup:
 /key KEY
 ```
 
-Attachments and local tools:
+Attachments, local tools, web and graphs:
 
 ```text
 /attach PATH
 /clearattach
 /read PATH
 /run COMMAND
+/web QUERY
+/fetch URL
+/graph files [PATH]
+/graph fields [PATH]
+/graph dot files PATH OUTPUT.dot
 ```
+
+The TUI has lightweight line editing: `Tab` completes `/` commands, Up/Down recalls command history, `Ctrl+U` clears the current input, and `Ctrl+L` clears/redraws the screen. UTF-8 input is preserved.
+
+Long compiler output, huge file listings, model-input traces and other noisy activity are **not painted in full by default**. Compact mode shows a short bounded preview and byte/line counts while the useful bounded result remains available to the agent. Use `/output normal` for more detail or `/output full` when you explicitly need every stored line; `/trace full` does the same temporarily for the activity trace. This avoids making a terminal crawl merely because a compiler emitted thousands of warnings.
 
 Cache/history:
 
@@ -877,13 +929,16 @@ growth:
 
 - HTTP responses are capped at 64 MiB.
 - Constructed provider request bodies are capped at 96 MiB.
-- Command output is captured in a bounded 4 MiB head/tail buffer; excess output is
+- Command output is captured in a bounded 1 MiB head/tail buffer; excess output is
   drained so the child process cannot block merely because VibeSolaris stopped
   reading it.
-- A tool or MCP result is compacted to at most 2 MiB before it is fed back to the
-  next model round.
+- Raw command capture remains bounded at 1 MiB, but command output sent back to the
+  model is compacted to about 96 KiB. A combined tool/MCP batch is bounded to about
+  192 KiB. Large-file reads should use `start_line`/`max_lines` rather than relying
+  on head/tail truncation.
 - Large text attachments are compacted to 4 MiB for model context while preserving
   both their beginning and end.
+- Activity trace storage is capped at 8 MiB, and any individual trace event is compacted to about 128 KiB before retention. Front ends compact the live rendering separately, so a huge prompt or warning dump cannot consume terminal paint time or tens of MiB of trace memory.
 - Multi-megabyte files/images are not duplicated in the in-memory file cache.
 - Image base64 encoding is streamed from a fixed-size input buffer rather than
   loading both the complete binary image and its expanded base64 form at once.
@@ -893,13 +948,24 @@ files that a command edits on disk; they limit how much command/API/attachment d
 VibeSolaris keeps or sends in one in-memory operation.  When a limit is reached the
 Activity trace records a `limit` event instead of silently exhausting memory.
 
-Long autonomous turns are also protected against a different failure mode: losing
-the task or command capability after many model/tool cycles. VibeSolaris 0.10.5
-raises the per-turn autonomous ceiling from 16 to 64 model rounds, keeps a compact
-copy of the original user task anchored in every continuation prompt, and emits a
-visible long-task checkpoint every 16 rounds. History compaction can therefore drop
-older intermediate chatter without dropping the instruction the agent is currently
-executing.
+Long autonomous turns now use a separate bounded working context instead of adding
+every tool cycle to permanent conversation history. The original task remains
+anchored in each continuation prompt. By default, every eight autonomous rounds (or
+earlier when the working-context budget is becoming full), VibeSolaris asks the
+selected model for a dense internal working-state checkpoint and then discards the
+older raw intermediate exchanges. The checkpoint preserves important files, errors,
+tests, decisions and remaining work while dropping repeated protocol text and bulky
+logs. The checkpoint itself is bounded to 24 KiB and the recent un-compacted working
+set is bounded to roughly 96 KiB.
+
+Set `VIBESOLARIS_AGENT_COMPACT_ROUNDS=4..64` to change the interval, or `0` to
+disable semantic compaction. Compaction is an extra provider request at each
+checkpoint, but for long jobs it prevents the prompt from growing every round and
+usually saves substantially more repeated input than the checkpoint request costs.
+
+When an autonomous turn finishes, only the original user request and final assistant
+answer are added to normal conversation history. Tool transcripts remain visible in
+Activity for the current turn but do not permanently consume future model context.
 
 The command runner now captures **both stdout and stderr**, always returns the
 command exit status to the model, and explicitly tells the model that the command
@@ -1098,6 +1164,37 @@ VibeSolaris 0.10.5 also handles a model that claims the tool bridge is broken **
 This prevents a model from confusing *describing a command* with *actually asking VibeSolaris to execute it*. A user prompt is required only when the host probe itself fails or the task truly needs missing information, credentials, destructive-action permission, or an unsafe-to-infer decision.
 
 
+
+## 0.12.0 — project graphs, web research, and quieter interactive UIs
+
+The GUI now includes an interactive force-directed project graph with file-dependency and C/C++ structure-field modes. Graph construction is implemented with native filesystem parsing rather than an external indexing service, and the same graph data is available to the coding agent and TUI. The TUI can print a compact graph summary or export Graphviz DOT.
+
+The agent now has native `web_search` and `web_fetch` tools. Search uses a lightweight HTML search endpoint by default (override with `VIBESOLARIS_SEARCH_URL`) and page fetches are converted to bounded text before entering model context. This lets Solaris hosts research current documentation without assuming a GNU/Linux browser or shell utility stack.
+
+Terminal rendering is deliberately decoupled from retained agent/tool data. Large model prompts, command output, file dumps and traces are collapsed to short previews in compact mode instead of repainting thousands of lines. `/output compact|normal|full` controls the policy. The TUI also adds portable command history and `/` autocomplete, while the GUI adds slash suggestions, graph/web top-bar actions, bounded live activity previews, and local instant slash commands.
+
+## 0.11.0 — bounded agent context, batching, and Solaris-native inspection
+
+Long coding turns no longer append every intermediate tool prompt and model response
+to permanent conversation history. VibeSolaris keeps a bounded ephemeral working
+history, semantically compacts it into a dense checkpoint every eight rounds by
+default, and stores only the original request plus final result when the turn ends.
+Original attachments are one-shot within the autonomous turn, so a large file or
+image is not retransmitted on every model/tool cycle.
+
+The agent protocol now supports up to eight independent tool/MCP directives in one
+model response. New native `list`, literal `search`, and ranged `read` tools replace
+many source-navigation shell pipelines and make repository inspection independent of
+whether the host utilities are GNU, BSD, or Solaris variants. Command results sent
+to the model are also much more tightly bounded so a compiler dump cannot dominate
+subsequent reasoning.
+
+On SunOS/Solaris, the system prompt now explicitly treats utilities as Solaris/POSIX
+unless GNU behavior was verified, prefers the native repository tools, names the
+XPG4 shell/grep/awk choices, and points the model toward Solaris administration tools
+instead of Linux-only commands. If a failed command looks like an unsupported option
+or missing Linux/GNU utility, the host appends a Solaris-specific correction hint so
+the model does not waste rounds retrying the same syntax.
 
 ## 0.10.7 — strict execution lifecycle and Solaris shell hardening
 

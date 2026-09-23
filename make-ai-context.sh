@@ -47,7 +47,10 @@ cd "$ROOT"
 # Prefer Git's view of the repository. This avoids build products and ignored
 # files automatically. If Git is unavailable, fall back to find(1).
 if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    git ls-files > "$ALL_FILES"
+    # Include tracked files plus relevant new/untracked files while still
+    # respecting .gitignore. This matters when the context snapshot is made
+    # before a newly added test or source file has been committed.
+    git ls-files --cached --others --exclude-standard > "$ALL_FILES"
 else
     find . -type f -print | sed 's|^\./||' > "$ALL_FILES"
 fi

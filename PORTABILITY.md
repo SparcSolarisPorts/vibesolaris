@@ -32,6 +32,20 @@ SVR4 package creation is architecture metadata plus payload; it does not cross-c
 
 The Makefile intentionally uses only traditional/POSIX make assignments (`=`), not GNU Make extensions such as `?=`. This allows `/usr/bin/make` on Solaris 8 through Solaris 11.4 to parse the project. `build.sh` passes compiler and flag variables on the make command line, so they still override the Makefile defaults.
 
+## Solaris-aware agent tooling (0.11.0)
+
+The coding agent no longer needs GNU command-line behavior for ordinary repository
+navigation. Native `VS_TOOL list`, literal `search`, and ranged `read` operations use
+`opendir`/`readdir`, `lstat`, and standard C file I/O and therefore behave the same
+way on Solaris, illumos, Linux, BSD, and Darwin.
+
+On a SunOS host the model is explicitly instructed to treat utilities as
+Solaris/POSIX by default. `/usr/xpg4/bin/sh` remains the preferred command shell when
+present; the prompt also points to XPG4 `grep`/`awk` behavior rather than assuming
+GNU options. Linux-specific administration commands and common GNU-only flags are
+called out as non-portable, and a failed command that looks like a command-family
+mismatch receives a Solaris-specific hint before the next model round.
+
 
 ## Linux
 

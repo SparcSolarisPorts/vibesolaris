@@ -100,3 +100,47 @@ char *vs_http_post_capture_ctx(VSContext *ctx,const char *url,const char *header
 char *vs_http_post_ctx(VSContext *ctx,const char *url,const char *headers[],int nheaders,const char *body,long *status){return vs_http_post_capture_ctx(ctx,url,headers,nheaders,body,status,NULL,0);}
 char *vs_http_post_capture(const char *url,const char *headers[],int nheaders,const char *body,long *status,char *session_id,size_t session_cap){return vs_http_post_capture_ctx(NULL,url,headers,nheaders,body,status,session_id,session_cap);}
 char *vs_http_post(const char *url,const char *headers[],int nheaders,const char *body,long *status){return vs_http_post_ctx(NULL,url,headers,nheaders,body,status);}
+char *vs_http_get_ctx(VSContext *ctx,const char *url,long *status,size_t max_bytes){
+    CURL *c;Buf b;CURLcode rc;char phost[1024],pauth[1024],redacted[1024],tracebuf[1200];
+    if(!url||!*url)return NULL;
+    if(max_bytes<4096)max_bytes=4096;
+    if(max_bytes>(size_t)VS_MAX_HTTP_RESPONSE)max_bytes=(size_t)VS_MAX_HTTP_RESPONSE;
+    b.cap=8192;if(b.cap>max_bytes+1)b.cap=max_bytes+1;b.max=max_bytes;b.n=0;b.overflow=0;
+    b.p=(char*)malloc(b.cap);if(!b.p)return NULL;b.p[0]=0;
+    if(status)*status=0;
+    c=curl_easy_init();if(!c){free(b.p);return NULL;}
+    curl_easy_setopt(c,CURLOPT_URL,url);
+    curl_easy_setopt(c,CURLOPT_HTTPGET,1L);
+    curl_easy_setopt(c,CURLOPT_WRITEFUNCTION,wr);curl_easy_setopt(c,CURLOPT_WRITEDATA,&b);
+    curl_easy_setopt(c,CURLOPT_USERAGENT,"Mozilla/5.0 (X11; SunOS) VibeSolaris/" VS_VERSION);
+    curl_easy_setopt(c,CURLOPT_SSL_VERIFYPEER,1L);curl_easy_setopt(c,CURLOPT_SSL_VERIFYHOST,2L);
+    curl_easy_setopt(c,CURLOPT_CONNECTTIMEOUT,20L);curl_easy_setopt(c,CURLOPT_TIMEOUT,60L);curl_easy_setopt(c,CURLOPT_NOSIGNAL,1L);
+    curl_easy_setopt(c,CURLOPT_FOLLOWLOCATION,1L);curl_easy_setopt(c,CURLOPT_MAXREDIRS,5L);
+#ifdef CURLOPT_ACCEPT_ENCODING
+    curl_easy_setopt(c,CURLOPT_ACCEPT_ENCODING,"");
+#endif
+    if(ctx){
+        curl_easy_setopt(c,CURLOPT_NOPROGRESS,0L);
+#if LIBCURL_VERSION_NUM >= 0x072000
+        curl_easy_setopt(c,CURLOPT_XFERINFOFUNCTION,cancel_xfer);curl_easy_setopt(c,CURLOPT_XFERINFODATA,ctx);
+#else
+        curl_easy_setopt(c,CURLOPT_PROGRESSFUNCTION,cancel_progress);curl_easy_setopt(c,CURLOPT_PROGRESSDATA,ctx);
+#endif
+    }
+#ifdef CURLOPT_TCP_KEEPALIVE
+    curl_easy_setopt(c,CURLOPT_TCP_KEEPALIVE,1L);
+#endif
+    if(ctx&&ctx->proxy_enabled&&ctx->proxy[0]){
+        proxy_parts(ctx->proxy,phost,sizeof(phost),pauth,sizeof(pauth));
+        if(phost[0]){curl_easy_setopt(c,CURLOPT_PROXY,phost);curl_easy_setopt(c,CURLOPT_NOPROXY,"");}
+        if(pauth[0]){curl_easy_setopt(c,CURLOPT_PROXYUSERPWD,pauth);curl_easy_setopt(c,CURLOPT_PROXYAUTH,(long)CURLAUTH_BASIC);}
+        vs_proxy_redacted(ctx,redacted,sizeof(redacted));snprintf(tracebuf,sizeof(tracebuf),"routing HTTP GET via %s",redacted);vs_trace(ctx,"proxy",tracebuf);
+    }
+    if(ctx&&vs_cancel_requested(ctx)){curl_easy_cleanup(c);free(b.p);return NULL;}
+    rc=curl_easy_perform(c);if(status)curl_easy_getinfo(c,CURLINFO_RESPONSE_CODE,status);curl_easy_cleanup(c);
+    if(rc!=CURLE_OK){
+        if(ctx){if(vs_cancel_requested(ctx)&&rc==CURLE_ABORTED_BY_CALLBACK)vs_trace(ctx,"cancel","HTTP GET cancelled by user");else if(b.overflow)vs_trace(ctx,"limit","HTTP GET response exceeded configured search/download limit");else{snprintf(tracebuf,sizeof(tracebuf),"HTTP GET failed: %s",curl_easy_strerror(rc));vs_trace(ctx,"http-error",tracebuf);}}
+        free(b.p);return NULL;
+    }
+    return b.p;
+}

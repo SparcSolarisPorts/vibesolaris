@@ -45,23 +45,19 @@ void vs_trace(VSContext *c,const char *kind,const char *detail)
     char *copy;
     const char *k=kind?kind:"step", *d=detail?detail:"";
     if(!c)return;
-    bytes=strlen(d);
-    /* The callback receives the complete event immediately.  Stored trace events are
-       also kept complete unless the global trace-memory safety budget is exceeded. */
+    /* Live front ends decide independently how much to paint. The retained trace
+       is also bounded per event so a huge prompt/compiler dump cannot quietly
+       consume tens of MiB after the UI has already hidden it. */
     if(c->trace_callback){
         step=(int)(c->trace_dropped+(unsigned long)c->trace_count+1UL);
         c->trace_callback(c->trace_callback_data,step,k,d);
     }
-    if(bytes>(size_t)VS_MAX_TRACE_BYTES){
-        /* One event larger than the whole trace budget cannot be retained safely.
-           Keep the live callback complete and record a compact stored marker. */
-        d="[trace event exceeded 64 MiB storage budget; complete text was delivered live]";
-        bytes=strlen(d);
-    }
-    while(c->trace_count>=VS_MAX_TRACE || (c->trace_count>0 && c->trace_bytes+bytes+1>(size_t)VS_MAX_TRACE_BYTES))trace_drop_oldest(c);
-    copy=(char*)malloc(bytes+1);
+    bytes=strlen(d);
+    if(bytes>(size_t)VS_TRACE_EVENT_MAX)copy=vs_compact_text_limit(d,VS_TRACE_EVENT_MAX,"stored trace event compacted");
+    else copy=mdup(d);
     if(!copy)return;
-    memcpy(copy,d,bytes+1);
+    bytes=strlen(copy);
+    while(c->trace_count>=VS_MAX_TRACE || (c->trace_count>0 && c->trace_bytes+bytes+1>(size_t)VS_MAX_TRACE_BYTES))trace_drop_oldest(c);
     mcopy(c->trace[c->trace_count].kind,sizeof(c->trace[c->trace_count].kind),k);
     c->trace[c->trace_count].detail=copy;
     c->trace[c->trace_count].bytes=bytes+1;

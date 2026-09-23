@@ -15,4 +15,14 @@ int vs_mcp_refresh_all(VSContext*c,int f){(void)c;(void)f;return 0;}char*vs_mcp_
 char*vs_compact_text_limit(const char*s,size_t z,const char*r){(void)z;(void)r;return d(s?s:"");}void vs_history_add(VSContext*c,const char*r,const char*x){(void)c;(void)r;(void)x;}
 char*vs_cached_read_file(VSContext*c,const char*p){(void)c;(void)p;return d("file");}int vs_attach(VSContext*c,const char*p){(void)c;(void)p;return 0;}int vs_is_image_path(const char*p){(void)p;return 1;}void vs_cache_invalidate(VSContext*c,const char*p){(void)c;(void)p;}int vs_write_file(const char*p,const char*t){(void)p;(void)t;return 0;}
 const char *vs_command_shell_name(void){return "/bin/sh";}char*vs_run_command(const char*cmd,int*st){runs++;*st=0;return d(strstr(cmd,"second")?"second":"first");}
+char*vs_run_command_ctx(VSContext*c,const char*cmd,int*st){(void)c;return vs_run_command(cmd,st);}int vs_cancel_requested(const VSContext*c){(void)c;return 0;}
+
+/* Stubs for optional agent-integrated project/web tools; these lifecycle tests
+   exercise the agent state machine, not the graph or network implementations. */
+static char *optional_tool_stub_text(const char *s){size_t n=strlen(s);char *p=(char*)malloc(n+1);if(p)memcpy(p,s,n+1);return p;}
+char *vs_web_search(VSContext*c,const char*q,int n){(void)c;(void)q;(void)n;return optional_tool_stub_text("web");}
+char *vs_web_fetch(VSContext*c,const char*u,size_t n){(void)c;(void)u;(void)n;return optional_tool_stub_text("page");}
+int vs_graph_build(VSContext*c,const char*r,VSGraphMode m,VSGraph*g){(void)c;(void)r;if(g){memset(g,0,sizeof(*g));g->mode=m;}return 0;}
+char *vs_graph_summary(const VSGraph*g,int n){(void)g;(void)n;return optional_tool_stub_text("graph");}
+
 int main(void){VSContext c;char*out;memset(&c,0,sizeof(c));out=vs_agent_turn(&c,"ok sounds good, do all that");printf("%s chats=%d runs=%d\n",out,chats,runs);if(strcmp(out,"complete")||chats!=4||runs!=2)return 1;free(out);return 0;}

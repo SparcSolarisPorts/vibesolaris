@@ -26,13 +26,19 @@ Use:
     /cache off
     /cache on
 
-## 3. Append-only conversation context with compaction
+## 3. Persistent conversation history + ephemeral agent working context
 
-Conversation and tool-call history is retained as real user/assistant messages rather than rebuilding one giant changing prompt. This is important because provider KV caches rely on exact prompt-prefix matches.
+Normal completed turns are retained as real user/assistant messages and remain bounded to 48 messages / approximately 192 KiB. Very large individual messages are locally compacted and the oldest user/assistant pair is evicted when necessary.
 
-Each tool round appends the prior user request and assistant tool directive before sending the tool result. The next provider request can therefore reuse the exact previous prefix.
+Autonomous tool work is different in 0.11.0. Intermediate tool cycles are kept in a separate ephemeral working history rather than being appended permanently. The recent working set is bounded to roughly 96 KiB, with individual intermediate messages bounded to 24 KiB.
 
-History is bounded to 48 messages and approximately 192 KiB. Very large individual messages are locally compacted to their beginning and end. When the total budget is exceeded, the oldest user/assistant pair is evicted. This bounds token growth without continually rewriting the recent prefix.
+Every eight autonomous rounds by default, or earlier when the working set reaches about 75% of its budget, VibeSolaris issues an internal compaction request to the selected model. The result is a dense working-state checkpoint capped at 24 KiB. The raw intermediate exchanges are then dropped. The checkpoint is carried forward with the active task and latest tool result so the model retains important files, errors, decisions, test results and remaining work without repeatedly receiving every old compiler log and protocol reminder.
+
+Use `VIBESOLARIS_AGENT_COMPACT_ROUNDS=N` to set an interval from 4 through 64. Set it to `0` to disable semantic checkpoints. A checkpoint costs one additional provider request, but long agent runs avoid the much larger cumulative cost of repeatedly resending a continually growing transcript.
+
+At completion, only the original user request and final answer are committed to persistent conversation history. This also improves future provider prompt-cache locality because old autonomous scratch work is not carried into unrelated later turns.
+
+Attachments are similarly one-shot during an autonomous turn: the first model round receives the user's attachments, and later rounds receive only newly loaded images. Exact file contents can be requested again with the native `read` tool when needed.
 
 Use:
 
@@ -43,4 +49,4 @@ The GUI displays cache state and the most recent provider cached-token count in 
 
 ## Important distinction
 
-The local file cache saves disk I/O and repeated base64 work. It does **not** by itself reduce provider token billing. Provider-side prompt/context caching is what can reduce cached-input cost and latency. History compaction limits how much context is sent at all.
+The local file cache saves disk I/O and repeated base64 work. It does **not** by itself reduce provider token billing. Provider-side prompt/context caching can reduce cached-input cost and latency, while autonomous working-context compaction and one-shot attachments reduce how much content needs to be sent at all.

@@ -182,9 +182,21 @@ typedef struct {
     int worker_started;
     char *worker_reply;
     char *worker_user;
+
+    /* Project relationship explorer.  Coordinates are normalized 0..1 and
+       laid out with a small deterministic force simulation when opened. */
+    int graph_open;
+    VSGraphMode graph_mode;
+    VSGraph graph;
+    double graph_x[VS_GRAPH_MAX_NODES];
+    double graph_y[VS_GRAPH_MAX_NODES];
+    double graph_vx[VS_GRAPH_MAX_NODES];
+    double graph_vy[VS_GRAPH_MAX_NODES];
+    int graph_selected;
 } App;
 
 static void redraw(App *a);
+static int sidebar_w(const App *a);
 
 static const char *provider_names[] = {
     "openai", "claude", "gemini", "glm", "glm-coding",
@@ -195,6 +207,10 @@ static const char *provider_labels[] = {
     "Kimi", "Qwen", "ERNIE", "DeepSeek", "Custom API"
 };
 #define PROVIDER_COUNT 10
+
+static const char *gui_slash_commands[] = {
+    "/web ", "/graph files", "/graph fields", "/trace", "/usage", "/help", "/clear", NULL
+};
 
 
 static char *ui_dup(const char *s)
@@ -557,6 +573,84 @@ static int hit(int px, int py, int x, int y, int w, int h)
     return px >= x && px < x + w && py >= y && py < y + h;
 }
 
+static void graph_layout(App *a)
+{
+    int i,j,k,iters,n=a->graph.node_count;double dx,dy,d2,f,desired=0.11;
+    if(n<=0)return;
+    for(i=0;i<n;i++){unsigned long h=vs_hash_string(a->graph.nodes[i].label);a->graph_x[i]=0.08+0.84*(double)(h&0xffffUL)/65535.0;a->graph_y[i]=0.08+0.84*(double)((h>>16)&0xffffUL)/65535.0;a->graph_vx[i]=a->graph_vy[i]=0.0;}
+    iters=n>180?35:(n>100?55:80);
+    for(k=0;k<iters;k++){
+        for(i=0;i<n;i++){a->graph_vx[i]*=0.72;a->graph_vy[i]*=0.72;}
+        for(i=0;i<n;i++)for(j=i+1;j<n;j++){
+            dx=a->graph_x[i]-a->graph_x[j];dy=a->graph_y[i]-a->graph_y[j];d2=dx*dx+dy*dy+0.0025;f=0.00008/d2;
+            a->graph_vx[i]+=dx*f;a->graph_vy[i]+=dy*f;a->graph_vx[j]-=dx*f;a->graph_vy[j]-=dy*f;
+        }
+        for(i=0;i<a->graph.edge_count;i++){
+            int u=a->graph.edges[i].from,v=a->graph.edges[i].to;if(u>=n||v>=n)continue;dx=a->graph_x[v]-a->graph_x[u];dy=a->graph_y[v]-a->graph_y[u];d2=dx*dx+dy*dy;f=0.045*(d2-desired*desired);
+            a->graph_vx[u]+=dx*f;a->graph_vy[u]+=dy*f;a->graph_vx[v]-=dx*f;a->graph_vy[v]-=dy*f;
+        }
+        for(i=0;i<n;i++){
+            a->graph_vx[i]+=(0.5-a->graph_x[i])*0.002;a->graph_vy[i]+=(0.5-a->graph_y[i])*0.002;
+            a->graph_x[i]+=a->graph_vx[i];a->graph_y[i]+=a->graph_vy[i];
+            if(a->graph_x[i]<0.035)a->graph_x[i]=0.035;
+            if(a->graph_x[i]>0.965)a->graph_x[i]=0.965;
+            if(a->graph_y[i]<0.045)a->graph_y[i]=0.045;
+            if(a->graph_y[i]>0.955)a->graph_y[i]=0.955;
+        }
+    }
+}
+
+static void open_graph(App *a,VSGraphMode mode)
+{
+    int n;if(!a)return;if(a->worker_busy){snprintf(a->status,sizeof(a->status),"Project graph is available after the active agent operation finishes");return;}
+    a->graph_mode=mode;a->graph_selected=-1;snprintf(a->status,sizeof(a->status),"Building %s graph...",mode==VS_GRAPH_FIELDS?"field":"file");
+    n=vs_graph_build(&a->ctx,a->ctx.cwd,mode,&a->graph);if(n<0){a->graph_open=0;snprintf(a->status,sizeof(a->status),"Could not build project graph");return;}
+    graph_layout(a);a->graph_open=1;snprintf(a->status,sizeof(a->status),"%s graph: %d nodes, %d edges%s",mode==VS_GRAPH_FIELDS?"Field":"File",a->graph.node_count,a->graph.edge_count,a->graph.truncated?" (bounded)":"");
+}
+
+static void graph_canvas_rect(App *a,int *x,int *y,int *w,int *h)
+{
+    int sb=sidebar_w(a);*x=sb+12;*y=70;*w=a->width-sb-24;*h=a->height-82;if(*w<320)*w=320;if(*h<260)*h=260;
+}
+
+static void draw_graph_overlay(App *a)
+{
+    int x,y,w,h,cx,cy,cw,ch,i,u,v,nx,ny,nx2,ny2,r;char b[256];
+    if(!a->graph_open)return;
+    graph_canvas_rect(a,&x,&y,&w,&h);
+    fill_round(a,x,y,w,h,12,a->c.panel);stroke_round(a,x,y,w,h,12,a->c.border);
+    draw_text(a,a->bold,a->c.text,x+18,y+28,"Project graph");
+    fill_round(a,x+142,y+10,86,28,7,a->graph_mode==VS_GRAPH_FILES?a->c.soft:a->c.panel);stroke_round(a,x+142,y+10,86,28,7,a->c.border);draw_text(a,a->small,a->c.text,x+160,y+29,"Files");
+    fill_round(a,x+236,y+10,86,28,7,a->graph_mode==VS_GRAPH_FIELDS?a->c.soft:a->c.panel);stroke_round(a,x+236,y+10,86,28,7,a->c.border);draw_text(a,a->small,a->c.text,x+249,y+29,"Fields");
+    fill_round(a,x+w-70,y+10,52,28,7,a->c.soft);draw_text(a,a->small,a->c.text,x+w-56,y+29,"Close");
+    snprintf(b,sizeof(b),"%d nodes  |  %d edges%s  |  click a node for its path",a->graph.node_count,a->graph.edge_count,a->graph.truncated?"  |  bounded":"");draw_ellipsis(a,a->small,a->c.muted,x+18,y+51,w-36,b);
+    cx=x+14;cy=y+62;cw=w-28;ch=h-78;fill_round(a,cx,cy,cw,ch,9,a->c.sidebar);
+    XSetForeground(a->dpy,a->gc,a->c.border);
+    for(i=0;i<a->graph.edge_count;i++){u=a->graph.edges[i].from;v=a->graph.edges[i].to;if(u>=a->graph.node_count||v>=a->graph.node_count)continue;nx=cx+(int)(a->graph_x[u]*(double)cw);ny=cy+(int)(a->graph_y[u]*(double)ch);nx2=cx+(int)(a->graph_x[v]*(double)cw);ny2=cy+(int)(a->graph_y[v]*(double)ch);XDrawLine(a->dpy,a->canvas,a->gc,nx,ny,nx2,ny2);}
+    for(i=0;i<a->graph.node_count;i++){nx=cx+(int)(a->graph_x[i]*(double)cw);ny=cy+(int)(a->graph_y[i]*(double)ch);r=3+(int)(a->graph.nodes[i].weight>5?5:a->graph.nodes[i].weight);if(i==a->graph_selected)r+=3;XSetForeground(a->dpy,a->gc,i==a->graph_selected?a->c.accent_dark:(a->graph.nodes[i].kind==3?a->c.accent:a->c.text));XFillArc(a->dpy,a->canvas,a->gc,nx-r,ny-r,(unsigned)(2*r),(unsigned)(2*r),0,360*64);if(i==a->graph_selected||a->graph.nodes[i].weight>=5)draw_ellipsis(a,a->small,a->c.text,nx+r+3,ny+4,150,a->graph.nodes[i].label);}
+    if(a->graph_selected>=0&&a->graph_selected<a->graph.node_count){VSGraphNode *gn=&a->graph.nodes[a->graph_selected];snprintf(b,sizeof(b),"%s%s%s",gn->label,gn->path[0]?"  -  ":"",gn->path);draw_ellipsis(a,a->small,a->c.text,cx+10,cy+ch-10,cw-20,b);}
+}
+
+static int handle_graph_click(App *a,int px,int py)
+{
+    int x,y,w,h,cx,cy,cw,ch,i,nx,ny,dx,dy,r;if(!a->graph_open)return 0;graph_canvas_rect(a,&x,&y,&w,&h);
+    if(hit(px,py,x+w-70,y+10,52,28)){a->graph_open=0;return 1;}
+    if(hit(px,py,x+142,y+10,86,28)){if(a->graph_mode!=VS_GRAPH_FILES)open_graph(a,VS_GRAPH_FILES);return 1;}
+    if(hit(px,py,x+236,y+10,86,28)){if(a->graph_mode!=VS_GRAPH_FIELDS)open_graph(a,VS_GRAPH_FIELDS);return 1;}
+    cx=x+14;cy=y+62;cw=w-28;ch=h-78;if(!hit(px,py,cx,cy,cw,ch))return 1;
+    for(i=0;i<a->graph.node_count;i++){nx=cx+(int)(a->graph_x[i]*(double)cw);ny=cy+(int)(a->graph_y[i]*(double)ch);r=8+(int)(a->graph.nodes[i].weight>5?5:a->graph.nodes[i].weight);dx=px-nx;dy=py-ny;if(dx*dx+dy*dy<=r*r){a->graph_selected=i;snprintf(a->status,sizeof(a->status),"%s%s%s",a->graph.nodes[i].label,a->graph.nodes[i].path[0]?" - ":"",a->graph.nodes[i].path);return 1;}}
+    a->graph_selected=-1;return 1;
+}
+
+static int slash_matches(const char *input,const char **out,int cap)
+{
+    int i,n=0;size_t z=input?strlen(input):0;if(!input||input[0]!='/')return 0;for(i=0;gui_slash_commands[i]&&n<cap;i++)if(!strncmp(gui_slash_commands[i],input,z))out[n++]=gui_slash_commands[i];return n;
+}
+static void gui_complete_slash(App *a)
+{
+    const char *m[16];int n,i;size_t p=0,cur,add;if(!a)return;n=slash_matches(a->input,m,16);if(n<=0)return;cur=a->input_len;while(m[0][p]){for(i=1;i<n;i++)if(m[i][p]!=m[0][p])goto done;p++;}done:if(p<=cur&&n==1)p=strlen(m[0]);if(p<=cur)return;add=p-cur;if(cur+add>=sizeof(a->input))add=sizeof(a->input)-cur-1;memcpy(a->input+cur,m[0]+cur,add);a->input_len=cur+add;a->input[a->input_len]=0;a->input_cursor=a->input_len;selection_clear(a);
+}
+
 static const char *oauth_status_label(const VSContext *c)
 {
     if (vs_oauth_is_signed_in(c)) return "Signed in";
@@ -777,7 +871,9 @@ static int worker_write_event(App *a,const UIWorkerEvent *ev)
    main X11 thread takes ownership after reading the small pipe event. */
 static void gui_live_trace(void *userdata,int step,const char *kind,const char *detail)
 {
-    App *a=(App*)userdata;UIWorkerEvent ev;if(!a)return;memset(&ev,0,sizeof(ev));ev.type=1;ev.step=step;ev.kind=ui_dup(kind?kind:"activity");ev.detail=ui_dup(detail?detail:"");
+    App *a=(App*)userdata;UIWorkerEvent ev;size_t limit=8192;if(!a)return;memset(&ev,0,sizeof(ev));ev.type=1;ev.step=step;ev.kind=ui_dup(kind?kind:"activity");
+    if(kind&&(!strcmp(kind,"model-input")||!strcmp(kind,"tool-output")||!strcmp(kind,"model-output")))limit=4096;
+    ev.detail=vs_compact_text_limit(detail?detail:"",limit,"GUI activity preview shortened; large events are retained only in bounded form");
     if(!ev.kind||!ev.detail||worker_write_event(a,&ev)!=0){free(ev.kind);free(ev.detail);}
 }
 
@@ -1014,7 +1110,7 @@ static void draw_topbar(App *a)
     XDrawLine(a->dpy, a->canvas, a->gc, sbw, UI_TOPBAR_H - 1, a->width, UI_TOPBAR_H - 1);
     cx = content_x(a, &cw);
     draw_text(a, a->bold, a->c.text, cx, 35, "VibeSolaris");
-    token_x=cx+text_w(a, a->bold,"VibeSolaris")+14;
+    {int tx=cx+text_w(a,a->bold,"VibeSolaris")+14;fill_round(a,tx,14,58,28,7,a->graph_open?a->c.soft:a->c.panel);stroke_round(a,tx,14,58,28,7,a->c.border);draw_text(a,a->small,a->c.text,tx+12,33,"Graph");fill_round(a,tx+66,14,50,28,7,a->c.panel);stroke_round(a,tx+66,14,50,28,7,a->c.border);draw_text(a,a->small,a->c.text,tx+80,33,"Web");token_x=tx+128;}
     if(a->worker_busy)snprintf(tb,sizeof(tb),"working...");
     else if(a->ctx.conversation_usage_responses>0)snprintf(tb,sizeof(tb),"%lu tokens",a->ctx.conversation_total_tokens);
     else snprintf(tb,sizeof(tb),"0 tokens");
@@ -1246,6 +1342,10 @@ static void draw_composer(App *a, int cx, int cw)
                a->worker_busy ? a->c.danger : (a->input_len ? a->c.accent : a->c.border));
     if(a->worker_busy)draw_stop_icon(a, sendx, py + ph - 20, a->c.panel);
     else draw_send_icon(a, sendx, py + ph - 20, a->c.panel);
+
+    if(a->input[0]=='/' && !a->worker_busy){
+        const char *m[8];int mn=slash_matches(a->input,m,8),si;if(mn>0){int sh=22+mn*20,sy=py-sh-8;fill_round(a,cx+34,sy,cw-68,sh,10,a->c.panel);stroke_round(a,cx+34,sy,cw-68,sh,10,a->c.border);draw_text(a,a->small,a->c.muted,cx+46,sy+17,"Tab to complete");for(si=0;si<mn;si++)draw_ellipsis(a,a->small,a->c.text,cx+46,sy+38+si*20,cw-92,m[si]);}
+    }
 
     if (a->status[0]) {
         draw_ellipsis(a, a->small, a->c.muted, cx, a->height - 13, cw, a->status);
@@ -1552,6 +1652,7 @@ static void redraw(App *a)
     if (a->message_count == 0) draw_empty_state(a, chat_top, chat_bottom, cx, cw);
     else draw_messages(a, chat_top, chat_bottom, cx, cw);
     draw_composer(a, cx, cw);
+    draw_graph_overlay(a);
     draw_modal(a);
     if (buffered) {
         XCopyArea(a->dpy, a->back_buffer, a->win, a->gc, 0, 0,
@@ -1978,16 +2079,40 @@ static void request_stop(App *a)
 
 static void send_message(App *a)
 {
-    char *usercopy;int trace_index,flags;
+    char *usercopy,*worker_prompt=NULL;int trace_index,flags;char info[1024];
     if(a->worker_busy){snprintf(a->status,sizeof(a->status),"Agent is already working; the window remains responsive while it finishes");return;}
-    if(a->worker_pipe[0]<0||a->worker_pipe[1]<0){snprintf(a->status,sizeof(a->status),"Background worker pipe is unavailable");return;}
     if(!a->input_len)return;
+
+    /* Lightweight slash commands stay local to the GUI. They should feel like
+       UI actions, not consume an LLM round just to open a panel or show stats. */
+    if(!strcmp(a->input,"/graph files")){open_graph(a,VS_GRAPH_FILES);a->input[0]=0;a->input_len=a->input_cursor=0;selection_clear(a);return;}
+    if(!strcmp(a->input,"/graph fields")){open_graph(a,VS_GRAPH_FIELDS);a->input[0]=0;a->input_len=a->input_cursor=0;selection_clear(a);return;}
+    if(!strcmp(a->input,"/clear")){new_chat(a);return;}
+    if(!strcmp(a->input,"/usage")){
+        snprintf(info,sizeof(info),"Conversation usage: %lu input + %lu output = %lu tokens across %lu provider response%s. Last provider response: %ld input, %ld output, %ld total.",a->ctx.conversation_input_tokens,a->ctx.conversation_output_tokens,a->ctx.conversation_total_tokens,a->ctx.conversation_usage_responses,a->ctx.conversation_usage_responses==1?"":"s",a->ctx.provider_input_tokens,a->ctx.provider_output_tokens,a->ctx.provider_total_tokens);
+        add_message(a,UI_ROLE_ASSISTANT,info);a->input[0]=0;a->input_len=a->input_cursor=0;selection_clear(a);return;
+    }
+    if(!strcmp(a->input,"/trace")){
+        trace_summary(&a->ctx,info,sizeof(info));add_message(a,UI_ROLE_ASSISTANT,info);a->input[0]=0;a->input_len=a->input_cursor=0;selection_clear(a);return;
+    }
+    if(!strcmp(a->input,"/help")){
+        add_message(a,UI_ROLE_ASSISTANT,"Quick commands: /web QUERY searches online; /graph files opens the dependency graph; /graph fields opens the C/C++ struct-field graph; /usage shows token use; /trace summarizes recent activity; /clear starts a clean chat. Press Tab while typing / to complete. Ctrl+G opens the file graph and Ctrl+Shift+G opens the field graph.");
+        a->input[0]=0;a->input_len=a->input_cursor=0;selection_clear(a);return;
+    }
+
+    if(a->worker_pipe[0]<0||a->worker_pipe[1]<0){snprintf(a->status,sizeof(a->status),"Background worker pipe is unavailable");return;}
     usercopy=ui_dup(a->input);if(!usercopy)return;
+    if(!strncmp(a->input,"/web ",5)&&a->input[5]){
+        size_t z=strlen(a->input+5)+256;worker_prompt=(char*)malloc(z);
+        if(!worker_prompt){free(usercopy);return;}
+        snprintf(worker_prompt,z,"Search the web for the following request. Use web_search first, web_fetch only on relevant result pages, then give a concise sourced answer. Request: %s",a->input+5);
+    }else worker_prompt=ui_dup(a->input);
+    if(!worker_prompt){free(usercopy);return;}
     vs_cancel_clear(&a->ctx);
-    add_message(a,UI_ROLE_USER,usercopy);trace_index=begin_trace_message(a);a->live_trace_message=trace_index;
-    a->worker_user=usercopy;a->worker_reply=NULL;a->worker_busy=1;vs_set_trace_callback(&a->ctx,gui_live_trace,a);strcpy(a->status,"Working...");
+    add_message(a,UI_ROLE_USER,usercopy);free(usercopy);trace_index=begin_trace_message(a);a->live_trace_message=trace_index;
+    a->worker_user=worker_prompt;a->worker_reply=NULL;a->worker_busy=1;vs_set_trace_callback(&a->ctx,gui_live_trace,a);strcpy(a->status,"Working...");
     a->input[0]=0;a->input_len=0;a->input_cursor=0;selection_clear(a);a->auto_scroll=1;redraw(a);XFlush(a->dpy);
-    if(pthread_create(&a->worker_thread,NULL,agent_worker_main,a)!=0){a->worker_busy=0;a->worker_user=NULL;free(usercopy);vs_cancel_clear(&a->ctx);vs_set_trace_callback(&a->ctx,NULL,NULL);strcpy(a->status,"Could not start background agent worker");return;}
+    if(pthread_create(&a->worker_thread,NULL,agent_worker_main,a)!=0){a->worker_busy=0;a->worker_user=NULL;free(worker_prompt);vs_cancel_clear(&a->ctx);vs_set_trace_callback(&a->ctx,NULL,NULL);strcpy(a->status,"Could not start background agent worker");return;}
     a->worker_started=1;
     /* Non-blocking read side lets the event loop drain all available activity
        packets without ever stalling X11. */
@@ -2069,6 +2194,9 @@ static void handle_key(App *a, XKeyEvent *ke)
     KeySym k; char b[64]; int n; unsigned int st; int extend;
     a->cursor_visible=1;n=lookup_utf8(a,ke,b,sizeof(b),&k);st=ke->state;extend=(st&ShiftMask)!=0;
     if (a->modal != MODAL_NONE) { handle_modal_key(a, ke); return; }
+    if(a->graph_open && k==XK_Escape){a->graph_open=0;return;}
+    if(shortcut_mod(st) && (k==XK_g||k==XK_G)){open_graph(a,(st&ShiftMask)?VS_GRAPH_FIELDS:VS_GRAPH_FILES);return;}
+    if(k==XK_Tab && a->input[0]=='/'){gui_complete_slash(a);return;}
     if(a->worker_busy && k==XK_Escape){request_stop(a);return;}
     if(a->worker_busy && shortcut_mod(st) && (k==XK_o||k==XK_O||k==XK_p||k==XK_P||k==XK_m||k==XK_M||k==XK_k||k==XK_K||k==XK_u||k==XK_U||k==XK_r||k==XK_R||k==XK_t||k==XK_T||k==XK_n||k==XK_N||k==XK_y||k==XK_Y)){snprintf(a->status,sizeof(a->status),"Connection/configuration changes are locked while the agent is working");return;}
     if (shortcut_mod(st) && (k==XK_a||k==XK_A)) { select_all_edit(a); return; }
@@ -2347,6 +2475,8 @@ static void handle_click(App *a, XButtonEvent *be)
     if(be->button==Button2){request_paste(a,XA_PRIMARY);return;}
     if(be->button!=Button1)return;
     if(a->modal!=MODAL_NONE){handle_modal_click(a,x,y);return;}
+    if(a->graph_open && x>=sidebar_w(a) && y>=58){if(handle_graph_click(a,x,y))return;}
+    if(y<UI_TOPBAR_H && x>=sidebar_w(a)){int tcw,tcx=content_x(a,&tcw),tx=tcx+text_w(a,a->bold,"VibeSolaris")+14;if(hit(x,y,tx,14,58,28)){open_graph(a,VS_GRAPH_FILES);return;}if(hit(x,y,tx+66,14,50,28)){if(a->worker_busy){snprintf(a->status,sizeof(a->status),"Web search can be started after the current agent operation finishes");return;}strcpy(a->input,"/web ");a->input_len=a->input_cursor=5;selection_clear(a);return;}}
     if(a->worker_busy && x<sidebar_w(a)){snprintf(a->status,sizeof(a->status),"Connection/configuration controls are locked while the agent is working");return;}
 
     is_openai=a->ctx.provider.kind==VS_PROVIDER_OPENAI;
@@ -2446,6 +2576,8 @@ static void init_app(App *a, int argc, char **argv)
     a->cursor_visible = 1;
     a->oauth_flow.listener_fd = -1;
     a->live_trace_message = -1;
+    a->graph_selected = -1;
+    a->graph_mode = VS_GRAPH_FILES;
     selection_clear(a);
     a->dpy = XOpenDisplay(NULL);
     if (!a->dpy) return;

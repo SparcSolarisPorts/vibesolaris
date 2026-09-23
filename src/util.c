@@ -232,6 +232,11 @@ int vs_cancel_requested(const VSContext *ctx) { return ctx && ctx->cancel_reques
 void vs_history_clear(VSContext *ctx) {
     int i;if(!ctx)return;for(i=0;i<ctx->history_count;i++)if(ctx->history[i].content)free(ctx->history[i].content);
     memset(ctx->history,0,sizeof(ctx->history));ctx->history_count=0;ctx->history_bytes=0;ctx->history_evicted=0;
+    for(i=0;i<ctx->agent_history_count;i++)if(ctx->agent_history[i].content)free(ctx->agent_history[i].content);
+    memset(ctx->agent_history,0,sizeof(ctx->agent_history));ctx->agent_history_count=0;ctx->agent_history_bytes=0;
+    if(ctx->agent_checkpoint)free(ctx->agent_checkpoint);
+    ctx->agent_checkpoint=NULL;ctx->agent_checkpoint_bytes=0;
+    ctx->attachment_send_from=0;
     vs_usage_clear(ctx);
 }
 

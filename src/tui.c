@@ -7,6 +7,8 @@
 #include <time.h>
 #include <stdarg.h>
 #include <signal.h>
+#include <termios.h>
+#include <errno.h>
 
 #define T_RESET   "\033[0m"
 #define T_BOLD    "\033[1m"
@@ -22,6 +24,103 @@
 static int tui_colour = 0;
 static int tui_colour_mode = -1; /* -1 auto, 0 never, 1 always */
 static VSContext *tui_active_ctx = NULL;
+static void cprintf(const char *colour,const char *fmt,...);
+static int tui_output_mode = 0; /* 0 compact, 1 normal, 2 full */
+
+#define TUI_HISTORY_MAX 32
+static char tui_history[TUI_HISTORY_MAX][4096];
+static int tui_history_count = 0;
+
+static const char *tui_completions[] = {
+    "/help","/quit","/usage","/trace","/trace full","/output compact","/output normal","/output full","/output status",
+    "/provider openai","/provider claude","/provider gemini","/provider glm","/provider glm-coding","/provider kimi","/provider qwen","/provider ernie","/provider deepseek","/provider custom",
+    "/protocol openai","/protocol anthropic","/model ","/base ","/key ","/proxy status","/proxy on","/proxy off",
+    "/oauth status","/oauth login","/oauth logout","/oauth save","/login","/logout",
+    "/attach ","/clearattach","/read ","/run ","/web ","/fetch ","/graph files","/graph fields","/graph dot files ","/graph dot fields ",
+    "/cache status","/cache on","/cache off","/cache clear","/history status","/history clear",
+    "/globalconfig status","/globalconfig load","/globalconfig save","/saveconfig ",
+    "/mcp list","/mcp refresh","/mcp tools","/mcp add-stdio ","/mcp add-http ","/mcp remove ",
+    "/colour auto","/colour on","/colour off","/colour status",NULL
+};
+
+static unsigned long count_lines(const char *s)
+{
+    unsigned long n=1;if(!s||!*s)return 0;for(;*s;s++)if(*s=='\n')n++;return n;
+}
+
+static void one_line_preview(const char *s,char *out,size_t cap,size_t maxchars)
+{
+    size_t n=0;int space=0;if(!out||cap==0)return;out[0]=0;if(!s)return;
+    while(*s&&n+1<cap&&n<maxchars){unsigned char c=(unsigned char)*s++;if(c=='\n'||c=='\r'||c=='\t'||c==' '){space=1;continue;}if(space&&n&&n+1<cap)out[n++]=' ';space=0;if(c<32||c==127)c='?';out[n++]=(char)c;}out[n]=0;
+}
+
+static void tui_print_detail(const char *kind,const char *detail)
+{
+    size_t bytes=detail?strlen(detail):0;unsigned long lines=count_lines(detail);char preview[320];char *q;
+    if(!detail)detail="";
+    if(tui_output_mode>=2){printf("%s",detail);if(bytes&&detail[bytes-1]!='\n')putchar('\n');return;}
+    if(tui_output_mode==1 && bytes<=4096 && lines<=40){printf("%s",detail);if(bytes&&detail[bytes-1]!='\n')putchar('\n');return;}
+    if(tui_output_mode==1){q=vs_compact_text_limit(detail,4096,"TUI display compacted; use /trace full for complete output");if(q){printf("%s",q);if(*q&&q[strlen(q)-1]!='\n')putchar('\n');free(q);}return;}
+    if(bytes<=260&&lines<=3){printf("%s",detail);if(bytes&&detail[bytes-1]!='\n')putchar('\n');return;}
+    one_line_preview(detail,preview,sizeof(preview),220);
+    if(kind&&(!strcmp(kind,"model-input")||!strcmp(kind,"tool-output")||!strcmp(kind,"command-output")))
+        printf("%s%s[%lu bytes, %lu lines; display compacted]\n",preview,*preview?" ... ":"",(unsigned long)bytes,lines);
+    else printf("%s%s[%lu bytes, %lu lines]\n",preview,*preview?" ... ":"",(unsigned long)bytes,lines);
+}
+
+static void tui_print_bounded(const char *s,size_t compact_limit,size_t normal_limit)
+{
+    size_t limit;char *q;if(!s)return;if(tui_output_mode>=2){printf("%s",s);if(*s&&s[strlen(s)-1]!='\n')putchar('\n');return;}
+    limit=tui_output_mode==1?normal_limit:compact_limit;q=vs_compact_text_limit(s,limit,"display output shortened; switch /output full to print everything");if(q){printf("%s",q);if(*q&&q[strlen(q)-1]!='\n')putchar('\n');free(q);}
+}
+
+static void tui_prompt(void){cprintf(T_BOLD T_CYAN,"vs> ");fflush(stdout);}
+
+static void history_add_line(const char *s)
+{
+    int i;if(!s||!*s)return;if(tui_history_count&& !strcmp(tui_history[tui_history_count-1],s))return;
+    if(tui_history_count>=TUI_HISTORY_MAX){for(i=1;i<TUI_HISTORY_MAX;i++)memcpy(tui_history[i-1],tui_history[i],sizeof(tui_history[0]));tui_history_count=TUI_HISTORY_MAX-1;}
+    {size_t n=strlen(s);if(n>=sizeof(tui_history[0]))n=sizeof(tui_history[0])-1;memcpy(tui_history[tui_history_count],s,n);tui_history[tui_history_count][n]=0;}tui_history_count++;
+}
+
+static void redraw_input_line(const char *buf)
+{
+    fputs("\r\033[2K",stdout);tui_prompt();fputs(buf?buf:"",stdout);fflush(stdout);
+}
+
+static size_t common_prefix_len(const char **m,int n)
+{
+    size_t p=0;int i;if(n<=0)return 0;while(m[0][p]){for(i=1;i<n;i++)if(m[i][p]!=m[0][p])return p;p++;}return p;
+}
+
+static void complete_slash(char *buf,size_t cap,size_t *len)
+{
+    const char *m[64];int i,n=0;size_t pre,cur=*len;if(!buf||!len||buf[0]!='/')return;
+    for(i=0;tui_completions[i]&&n<(int)(sizeof(m)/sizeof(m[0]));i++)if(!strncmp(tui_completions[i],buf,cur))m[n++]=tui_completions[i];
+    if(n==0){fputc('\a',stdout);return;}pre=common_prefix_len(m,n);
+    if(pre>cur){size_t add=pre-cur;if(cur+add>=cap)add=cap-cur-1;memcpy(buf+cur,m[0]+cur,add);cur+=add;buf[cur]=0;*len=cur;fwrite(m[0]+(cur-add),1,add,stdout);fflush(stdout);return;}
+    if(n==1&&cur+1<cap&&m[0][cur]==0&&cur>0&&buf[cur-1]!=' '){buf[cur++]=' ';buf[cur]=0;*len=cur;fputc(' ',stdout);fflush(stdout);return;}
+    printf("\n");for(i=0;i<n&&i<12;i++){cprintf(T_CYAN,"  %s",m[i]);if((i%2)==1||i==n-1||i==11)printf("\n");else printf("    ");}if(n>12)printf("  ... %d more\n",n-12);redraw_input_line(buf);
+}
+
+static int tui_read_line(char *buf,size_t cap)
+{
+    struct termios oldt,raw;size_t len=0;int hist=tui_history_count;unsigned char ch;ssize_t rr;
+    if(!isatty(STDIN_FILENO)||tcgetattr(STDIN_FILENO,&oldt)!=0){if(!fgets(buf,(int)cap,stdin))return 0;buf[strcspn(buf,"\r\n")]=0;return 1;}
+    raw=oldt;raw.c_lflag&=(tcflag_t)~(ICANON|ECHO);raw.c_iflag&=(tcflag_t)~(IXON|ICRNL);raw.c_cc[VMIN]=1;raw.c_cc[VTIME]=0;if(tcsetattr(STDIN_FILENO,TCSAFLUSH,&raw)!=0){if(!fgets(buf,(int)cap,stdin))return 0;buf[strcspn(buf,"\r\n")]=0;return 1;}
+    buf[0]=0;
+    for(;;){rr=read(STDIN_FILENO,&ch,1);if(rr<=0){if(rr<0&&errno==EINTR)continue;tcsetattr(STDIN_FILENO,TCSAFLUSH,&oldt);return 0;}
+        if(ch=='\r'||ch=='\n'){putchar('\n');break;}
+        if(ch==4){if(len==0){tcsetattr(STDIN_FILENO,TCSAFLUSH,&oldt);return 0;}continue;}
+        if(ch==127||ch==8){if(len){len--;buf[len]=0;fputs("\b \b",stdout);fflush(stdout);}continue;}
+        if(ch==21){while(len){fputs("\b \b",stdout);len--;}buf[0]=0;fflush(stdout);continue;}
+        if(ch==12){fputs("\033[2J\033[H",stdout);redraw_input_line(buf);continue;}
+        if(ch=='\t'){complete_slash(buf,cap,&len);continue;}
+        if(ch==27){unsigned char a=0,b=0;if(read(STDIN_FILENO,&a,1)==1&&a=='['&&read(STDIN_FILENO,&b,1)==1&&(b=='A'||b=='B')){if(b=='A'&&hist>0)hist--;else if(b=='B'&&hist<tui_history_count)hist++;if(hist>=0&&hist<tui_history_count){strncpy(buf,tui_history[hist],cap-1);buf[cap-1]=0;len=strlen(buf);}else{buf[0]=0;len=0;}redraw_input_line(buf);}continue;}
+        if(ch>=32&&ch!=127){if(len+1<cap){buf[len++]=(char)ch;buf[len]=0;(void)write(STDOUT_FILENO,&ch,1);}else fputc('\a',stdout);continue;}
+    }
+    tcsetattr(STDIN_FILENO,TCSAFLUSH,&oldt);history_add_line(buf);return 1;
+}
 
 static void tui_sigint(int sig)
 {
@@ -99,7 +198,8 @@ static void live_trace(void *userdata,int step,const char *kind,const char *deta
     const char *col=trace_colour(kind);
     (void)userdata;
     if(tui_colour)fputs(col,stdout);
-    printf("%2d. [%-12s] %s\n",step,kind?kind:"step",detail?detail:"");
+    printf("%2d. [%-12s] ",step,kind?kind:"step");
+    tui_print_detail(kind,detail);
     if(tui_colour)fputs(T_RESET,stdout);
     fflush(stdout);
 }
@@ -124,7 +224,8 @@ static void print_trace(const VSContext *c)
     for(i=0;i<c->trace_count;i++){
         const char *col=trace_colour(c->trace[i].kind);
         if(tui_colour)fputs(col,stdout);
-        printf("%2d. [%-12s] %s\n",i+1,c->trace[i].kind,c->trace[i].detail?c->trace[i].detail:"");
+        printf("%2d. [%-12s] ",i+1,c->trace[i].kind);
+        tui_print_detail(c->trace[i].kind,c->trace[i].detail?c->trace[i].detail:"");
         if(tui_colour)fputs(T_RESET,stdout);
     }
     if(c->trace_dropped)warnf("... %lu older trace events dropped\n",c->trace_dropped);
@@ -155,11 +256,14 @@ static void help(void)
     cprintf(T_CYAN,"  /attach PATH                  ");printf("attach a file or image to the next request\n");
     cprintf(T_CYAN,"  /clearattach                  ");printf("clear pending attachments\n");
     cprintf(T_CYAN,"  /read PATH                    ");printf("read a local file directly\n");
-    cprintf(T_CYAN,"  /run COMMAND                  ");printf("run a local shell command\n");
+    cprintf(T_CYAN,"  /run COMMAND                  ");printf("run a local shell command (display is bounded by default)\n");
+    cprintf(T_CYAN,"  /web QUERY                    ");printf("search the web without leaving VibeSolaris\n");
+    cprintf(T_CYAN,"  /fetch URL                    ");printf("fetch a web page as compact readable text\n");
+    cprintf(T_CYAN,"  /graph files|fields [PATH]    ");printf("inspect project relationships; add dot MODE PATH OUT.dot to export\n");
     cprintf(T_CYAN,"  /cache on|off|status|clear\n");
     cprintf(T_CYAN,"  /history status|clear\n");
     cprintf(T_CYAN,"  /usage                        ");printf("show provider-reported token usage for the current conversation\n");
-    cprintf(T_CYAN,"  /trace                        ");printf("show full model input/output, provider-returned reasoning, local-tool and MCP activity\n");
+    cprintf(T_CYAN,"  /trace                        ");printf("show compact activity trace; /trace full shows the bounded stored trace\n");
     cprintf(T_CYAN,"  Ctrl+C during agent work      ");printf("stop the active provider/MCP/command operation without exiting VibeSolaris\n");
     cprintf(T_BOLD T_BLUE,"\nEncrypted configuration\n");
     cprintf(T_CYAN,"  /globalconfig status|load|save\n");
@@ -172,6 +276,8 @@ static void help(void)
     cprintf(T_CYAN,"  /mcp remove NAME\n");
     cprintf(T_BOLD T_BLUE,"\nDisplay\n");
     cprintf(T_CYAN,"  /colour auto|on|off|status    ");printf("ANSI colour control; /color remains a compatibility alias; NO_COLOR is respected in auto mode\n");
+    cprintf(T_CYAN,"  /output compact|normal|full   ");printf("control how much command/trace output is painted to the terminal\n");
+    cprintf(T_DIM,"  Tab completes / commands. Up/Down recalls history. Ctrl+U clears input; Ctrl+L clears the screen.\n");
     cprintf(T_CYAN,"  /help                         ");printf("show this help\n");
     cprintf(T_CYAN,"  /quit                         ");printf("exit\n");
 }
@@ -214,12 +320,28 @@ static void oauth_set(VSContext *c,const char *which,const char *value)
     if(vs_oauth_save_profile(c)==0){(void)vs_persist_settings(c);successf("OAuth %s updated and saved.\n",which);}else warnf("OAuth %s updated, but profile save failed.\n",which);
 }
 
+static char *tui_next_word(char **cursor)
+{
+    char *p,*start;
+    if(!cursor||!*cursor)return NULL;
+    p=*cursor;while(*p==' '||*p=='\t')p++;
+    if(!*p){*cursor=p;return NULL;}
+    start=p;while(*p&&*p!=' '&&*p!='\t')p++;
+    if(*p)*p++=0;
+    *cursor=p;return start;
+}
+
+static char *tui_rest(char **cursor)
+{
+    char *p;if(!cursor||!*cursor)return NULL;p=*cursor;while(*p==' '||*p=='\t')p++;*cursor=p;return *p?p:NULL;
+}
+
 static void show_banner(const VSContext *c)
 {
     cprintf(T_BOLD T_CYAN,"VibeSolaris %s TUI\n",VS_VERSION);
     cprintf(T_DIM,"  %s %s / %s\n",c->os_name,c->os_release,c->arch);
     cprintf(T_BLUE,"  provider=%s  model=%s  protocol=%s  cache=%s\n",c->provider.name,c->provider.model,vs_protocol_name(c->provider.protocol),c->cache_enabled?"on":"off");
-    cprintf(T_DIM,"  Type /help for commands. Type a message to start chatting.\n");
+    cprintf(T_DIM,"  Type /help for commands. Tab completes / commands; long output is compacted on screen.\n");
 }
 
 int main(int argc, char **argv)
@@ -242,9 +364,8 @@ int main(int argc, char **argv)
     if (config_path) vs_load_config(&c, config_path);
     show_banner(&c);
     while (1) {
-        printf("\n");cprintf(T_BOLD T_CYAN,"vs> ");fflush(stdout);
-        if (!fgets(line, sizeof(line), stdin)) break;
-        line[strcspn(line, "\r\n")] = 0;
+        printf("\n");tui_prompt();
+        if (!tui_read_line(line, sizeof(line))) break;
         if (!strcmp(line, "/quit")) break;
         else if (!strcmp(line,"/help"))help();
         else if (!strcmp(line,"/colour")||!strcmp(line,"/colour status")||!strcmp(line,"/color")||!strcmp(line,"/color status")){
@@ -296,9 +417,32 @@ int main(int argc, char **argv)
         } else if (!strcmp(line, "/clearattach")) {
             vs_clear_attachments(&c);successf("attachments cleared\n");
         } else if (!strncmp(line, "/read ", 6)) {
-            char *x = vs_cached_read_file(&c, line + 6);if(x){cprintf(T_DIM,"--- %s ---\n",line+6);printf("%s\n",x);}else errorf("read failed: %s\n",line+6);free(x);
+            char *x = vs_cached_read_file(&c, line + 6);if(x){cprintf(T_DIM,"--- %s ---\n",line+6);tui_print_bounded(x,12U*1024U,64U*1024U);}else errorf("read failed: %s\n",line+6);free(x);
         } else if (!strncmp(line, "/run ", 5)) {
-            int st;char *x=vs_run_command(line+5,&st);cprintf(T_YELLOW,"$ %s\n",line+5);if(x)printf("%s\n",x);if(st==0)successf("exit %d\n",st);else errorf("exit %d\n",st);free(x);
+            int st;char *x=vs_run_command_ctx(&c,line+5,&st);cprintf(T_YELLOW,"$ %s\n",line+5);if(x)tui_print_bounded(x,4U*1024U,64U*1024U);if(st==0)successf("exit %d\n",st);else errorf("exit %d\n",st);free(x);
+        } else if (!strcmp(line,"/output") || !strcmp(line,"/output status")) {
+            printf("output=%s\n",tui_output_mode==0?"compact":(tui_output_mode==1?"normal":"full"));
+        } else if (!strncmp(line,"/output ",8)) {
+            const char *v=line+8;if(!strcmp(v,"compact"))tui_output_mode=0;else if(!strcmp(v,"normal"))tui_output_mode=1;else if(!strcmp(v,"full"))tui_output_mode=2;else {errorf("usage: /output compact|normal|full|status\n");continue;}successf("output display=%s\n",v);
+        } else if (!strncmp(line,"/web ",5)) {
+            char *x=vs_web_search(&c,line+5,8);if(x){cprintf(T_BOLD T_BLUE,"Web search\n");tui_print_bounded(x,20U*1024U,64U*1024U);}else errorf("web search failed\n");free(x);
+        } else if (!strncmp(line,"/fetch ",7)) {
+            char *x=vs_web_fetch(&c,line+7,128U*1024U);if(x){cprintf(T_BOLD T_BLUE,"Web page\n");tui_print_bounded(x,24U*1024U,96U*1024U);}else errorf("web fetch failed\n");free(x);
+        } else if (!strncmp(line,"/graph ",7)) {
+            char tmp[4096],*cur,*p0,*p1,*p2,*p3;VSGraph g;VSGraphMode mode;char *sum;
+            copyv(tmp,sizeof(tmp),line+7);cur=tmp;p0=tui_next_word(&cur);p1=tui_next_word(&cur);
+            if(p0&&!strcmp(p0,"dot")){
+                p2=tui_next_word(&cur);p3=tui_rest(&cur);
+                mode=(p1&&(!strcmp(p1,"fields")||!strcmp(p1,"field")))?VS_GRAPH_FIELDS:VS_GRAPH_FILES;
+                if(!p1||!p2||!p3){errorf("usage: /graph dot files|fields PATH OUTPUT.dot\n");continue;}
+                if(vs_graph_build(&c,p2,mode,&g)<0||vs_graph_export_dot(&g,p3)!=0)errorf("graph export failed\n");
+                else successf("graph exported: %s (%d nodes, %d edges)\n",p3,g.node_count,g.edge_count);
+            }else{
+                mode=(p0&&(!strcmp(p0,"fields")||!strcmp(p0,"field")))?VS_GRAPH_FIELDS:VS_GRAPH_FILES;
+                if(p0&&strcmp(p0,"files")&&strcmp(p0,"file")&&strcmp(p0,"fields")&&strcmp(p0,"field")){errorf("usage: /graph files|fields [PATH]\n");continue;}
+                if(vs_graph_build(&c,p1&&*p1?p1:c.cwd,mode,&g)<0){errorf("graph build failed\n");continue;}
+                sum=vs_graph_summary(&g,100);if(sum){cprintf(T_BOLD T_BLUE,"Project graph\n");tui_print_bounded(sum,24U*1024U,64U*1024U);free(sum);}
+            }
         } else if (!strcmp(line, "/cache on")) {
             c.cache_enabled=1;(void)vs_persist_settings(&c);successf("cache enabled\n");
         } else if (!strcmp(line, "/cache off")) {
@@ -340,8 +484,8 @@ int main(int argc, char **argv)
             char *p=line+14,*sp=strchr(p,' '),*url,*tok=NULL,*sp2;if(!sp)errorf("usage: /mcp add-http NAME URL [TOKEN]\n");else {*sp=0;url=sp+1;sp2=strchr(url,' ');if(sp2){*sp2=0;tok=sp2+1;}if(vs_mcp_add_http(&c,p,url,tok)==0)successf("remote MCP saved: %s\n",p);else errorf("MCP add failed\n");}
         } else if (!strncmp(line, "/mcp remove ", 12)) {
             if(vs_mcp_remove(&c,line+12)==0)successf("MCP server removed: %s\n",line+12);else errorf("MCP server not found: %s\n",line+12);
-        } else if (!strcmp(line, "/trace")) {
-            cprintf(T_BOLD T_MAGENTA,"Activity trace\n");print_trace(&c);
+        } else if (!strcmp(line, "/trace") || !strcmp(line,"/trace full")) {
+            int old=tui_output_mode;if(!strcmp(line,"/trace full"))tui_output_mode=2;cprintf(T_BOLD T_MAGENTA,"Activity trace\n");print_trace(&c);tui_output_mode=old;
         } else if (line[0] == '/') {
             errorf("Unknown command: %s\n",line);cprintf(T_DIM,"Type /help to see available commands.\n");
         } else if(line[0]) {
@@ -354,7 +498,7 @@ int main(int argc, char **argv)
             vs_set_trace_callback(&c,NULL,NULL);
             tui_active_ctx=NULL;if(oldint!=SIG_ERR)(void)signal(SIGINT,oldint);
             cprintf(T_BOLD T_GREEN,"\nVibeSolaris answer\n");
-            printf("%s\n",a?a:"(no response)");
+            tui_print_bounded(a?a:"(no response)",32U*1024U,128U*1024U);
             usage_status(&c);
             free(a);vs_clear_attachments(&c);vs_cancel_clear(&c);
         }

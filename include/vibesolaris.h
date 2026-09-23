@@ -2,7 +2,7 @@
 #ifndef VIBESOLARIS_H
 #define VIBESOLARIS_H
 
-#define VS_VERSION "0.10.7"
+#define VS_VERSION "0.12.0"
 
 #include <stddef.h>
 #include <signal.h>
@@ -14,7 +14,16 @@
 #define VS_MAX_PLAN_CONTINUES 16
 #define VS_MAX_TOOL_RECOVERIES 12
 #define VS_ACTIVE_TASK_MAX (16U*1024U)
-#define VS_LONG_TASK_CHECKPOINT 16
+#define VS_LONG_TASK_CHECKPOINT 8
+#define VS_AGENT_COMPACT_ROUNDS 8
+#define VS_MAX_AGENT_HISTORY 16
+#define VS_AGENT_HISTORY_BUDGET (96U*1024U)
+#define VS_AGENT_HISTORY_MESSAGE_MAX (24U*1024U)
+#define VS_AGENT_CHECKPOINT_MAX (24U*1024U)
+#define VS_AGENT_READ_RESULT_MAX (128U*1024U)
+#define VS_AGENT_COMMAND_RESULT_MAX (96U*1024U)
+#define VS_AGENT_TOOL_RESULT_MAX (192U*1024U)
+#define VS_MAX_BATCH_TOOLS 8
 #define VS_MAX_HISTORY 48
 #define VS_HISTORY_BUDGET (192*1024)
 #define VS_HISTORY_MESSAGE_MAX (32*1024)
@@ -26,17 +35,51 @@
 #define VS_MAX_MCP_TOOLS 64
 #define VS_MCP_SCHEMA_MAX 4096
 #define VS_MAX_TRACE 512
-#define VS_MAX_TRACE_BYTES (64U*1024U*1024U)
+#define VS_TRACE_EVENT_MAX (128U*1024U)
+#define VS_MAX_TRACE_BYTES (8U*1024U*1024U)
 
 /* Resource guards for long-running/large agent operations.  These are deliberately
    generous, but finite: a provider, command, or MCP server must not be able to
    grow the process until the desktop starts swapping or the GUI appears dead. */
 #define VS_MAX_HTTP_RESPONSE (64U*1024U*1024U)
 #define VS_MAX_REQUEST_BODY (96U*1024U*1024U)
-#define VS_MAX_COMMAND_CAPTURE (4U*1024U*1024U)
+#define VS_MAX_COMMAND_CAPTURE (1U*1024U*1024U)
 #define VS_MAX_TOOL_RESULT (2U*1024U*1024U)
 #define VS_MAX_ATTACHMENT_TEXT (4U*1024U*1024U)
 #define VS_FILE_CACHE_BLOB_MAX (2U*1024U*1024U)
+
+
+#define VS_GRAPH_MAX_NODES 240
+#define VS_GRAPH_MAX_EDGES 960
+#define VS_GRAPH_LABEL_MAX 128
+#define VS_GRAPH_PATH_MAX 512
+
+typedef enum {
+    VS_GRAPH_FILES = 1,
+    VS_GRAPH_FIELDS = 2
+} VSGraphMode;
+
+typedef struct {
+    char label[VS_GRAPH_LABEL_MAX];
+    char path[VS_GRAPH_PATH_MAX];
+    int kind;
+    unsigned long weight;
+} VSGraphNode;
+
+typedef struct {
+    unsigned short from;
+    unsigned short to;
+} VSGraphEdge;
+
+typedef struct {
+    VSGraphMode mode;
+    char root[VS_MAX_PATH];
+    VSGraphNode nodes[VS_GRAPH_MAX_NODES];
+    VSGraphEdge edges[VS_GRAPH_MAX_EDGES];
+    int node_count;
+    int edge_count;
+    int truncated;
+} VSGraph;
 
 #define VS_GLOBAL_CONFIG_DIR "/etc/vibesolaris"
 #define VS_GLOBAL_CONFIG_FILE "/etc/vibesolaris/config.enc"
@@ -214,6 +257,19 @@ typedef struct {
     int history_count;
     size_t history_bytes;
     unsigned long history_evicted;
+
+    /* Ephemeral context for the currently executing autonomous turn.  Unlike
+       history[], this is discarded after the turn and periodically summarized
+       so a long coding task does not grow the provider prompt every round. */
+    VSHistoryMessage agent_history[VS_MAX_AGENT_HISTORY];
+    int agent_history_count;
+    size_t agent_history_bytes;
+    char *agent_checkpoint;
+    size_t agent_checkpoint_bytes;
+
+    /* Attachments are one-shot within an autonomous turn.  The first request
+       sends the user's attachments; later rounds send only newly loaded images. */
+    int attachment_send_from;
 } VSContext;
 
 void vs_init(VSContext *ctx);
@@ -257,6 +313,12 @@ char *vs_chat(VSContext *ctx, const char *user_text);
 char *vs_agent_turn(VSContext *ctx, const char *user_text);
 char *vs_build_system_prompt(const VSContext *ctx);
 char *vs_http_post(const char *url, const char *headers[], int nheaders, const char *body, long *status);
+char *vs_http_get_ctx(VSContext *ctx, const char *url, long *status, size_t max_bytes);
+char *vs_web_search(VSContext *ctx, const char *query, int max_results);
+char *vs_web_fetch(VSContext *ctx, const char *url, size_t max_text);
+int  vs_graph_build(VSContext *ctx, const char *root, VSGraphMode mode, VSGraph *out);
+char *vs_graph_summary(const VSGraph *graph, int max_lines);
+int  vs_graph_export_dot(const VSGraph *graph, const char *path);
 char *vs_http_post_capture(const char *url, const char *headers[], int nheaders, const char *body, long *status, char *session_id, size_t session_cap);
 char *vs_http_post_ctx(VSContext *ctx, const char *url, const char *headers[], int nheaders, const char *body, long *status);
 char *vs_http_post_capture_ctx(VSContext *ctx, const char *url, const char *headers[], int nheaders, const char *body, long *status, char *session_id, size_t session_cap);

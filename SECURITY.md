@@ -50,3 +50,9 @@ Set `VIBESOLARIS_GLOBAL_CONFIG_DIR` to explicitly override automatic location se
 Location selection is evaluated for the current Unix account. If `/etc/vibesolaris` exists but that user lacks write/execute permission, VibeSolaris does not fail autosave and does not require elevation; it switches to `$HOME/.vibesolaris`. If the system directory does not exist, `/etc` itself must be writable before VibeSolaris will choose the system location. `HOME` is preferred; if it is absent, the account home directory is obtained from the password database.
 
 The fallback directory is mode `0700`; `config.enc` and `master.key` are mode `0600`. Different Unix accounts therefore do not share API keys, models, MCP bearer tokens, or OAuth data by default.
+
+## Web search and fetched pages
+
+`/web`, `web_search`, and `web_fetch` make outbound HTTP(S) requests. Search queries are sent to the configured search endpoint (DuckDuckGo HTML by default; override with `VIBESOLARIS_SEARCH_URL`) and page fetches contact the selected result URL. The normal VibeSolaris proxy and TLS-verification settings apply.
+
+Fetched page text is treated as **untrusted reference content** in the agent system prompt. A web page can contain prompt-injection text just as a source file or issue comment can. The agent is explicitly instructed not to treat page instructions as authority for revealing credentials, changing files, or running commands. Review consequential agent actions in the Activity trace, especially when a task involves unfamiliar sites.
