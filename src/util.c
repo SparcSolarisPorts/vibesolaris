@@ -227,7 +227,11 @@ void vs_usage_clear(VSContext *ctx) {
 
 void vs_cancel_request(VSContext *ctx) { if(ctx)ctx->cancel_requested=1; }
 void vs_cancel_clear(VSContext *ctx) { if(ctx)ctx->cancel_requested=0; }
-int vs_cancel_requested(const VSContext *ctx) { return ctx && ctx->cancel_requested ? 1 : 0; }
+int vs_cancel_requested(const VSContext *ctx) {
+    /* A subagent is stopped when any ancestor is stopped. */
+    while(ctx){ if(ctx->cancel_requested) return 1; ctx=(const VSContext*)ctx->subagent_parent; }
+    return 0;
+}
 
 void vs_history_clear(VSContext *ctx) {
     int i;if(!ctx)return;for(i=0;i<ctx->history_count;i++)if(ctx->history[i].content)free(ctx->history[i].content);

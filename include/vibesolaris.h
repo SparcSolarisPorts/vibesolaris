@@ -37,6 +37,9 @@
 #define VS_MAX_TRACE 512
 #define VS_TRACE_EVENT_MAX (128U*1024U)
 #define VS_MAX_TRACE_BYTES (8U*1024U*1024U)
+#define VS_MAX_SUBAGENT_DEPTH 2
+#define VS_MAX_SUBAGENTS_PER_TURN 6
+#define VS_SUBAGENT_RESULT_MAX (48U*1024U)
 
 /* Resource guards for long-running/large agent operations.  These are deliberately
    generous, but finite: a provider, command, or MCP server must not be able to
@@ -132,11 +135,19 @@ typedef struct {
     long expires_at;
 } VSOAuthConfig;
 
+/* Each OAuth credential slot is independent so that signing in with one
+   provider can never overwrite the other's tokens. */
+typedef enum {
+    VS_OAUTH_OPENAI = 0,
+    VS_OAUTH_CLAUDE = 1
+} VSOAuthProvider;
+
 typedef struct {
     int active;
     int listener_fd;
     int port;
     long started_at;
+    VSOAuthProvider provider;
     char state[96];
     char verifier[160];
     char redirect_uri[512];
@@ -217,6 +228,7 @@ typedef struct {
     char provider_anthropic_urls[VS_PROVIDER_SLOT_COUNT][512];
     int provider_protocols[VS_PROVIDER_SLOT_COUNT];
     VSOAuthConfig oauth;
+    VSOAuthConfig claude_oauth;
 
     int proxy_enabled;
     char proxy[1024];
@@ -270,6 +282,14 @@ typedef struct {
     /* Attachments are one-shot within an autonomous turn.  The first request
        sends the user's attachments; later rounds send only newly loaded images. */
     int attachment_send_from;
+
+    /* Subagents run in isolated child contexts (see subagent.c).  At top level
+       subagent_parent is NULL.  Children forward cancellation and trace events
+       to their parent; they never own the parent's MCP processes or history. */
+    void *subagent_parent;
+    int subagent_depth;
+    int subagent_id;
+    int subagent_serial;
 } VSContext;
 
 void vs_init(VSContext *ctx);
@@ -311,6 +331,9 @@ char *vs_run_command_ctx(VSContext *ctx, const char *cmd, int *exit_code);
 const char *vs_command_shell_name(void);
 char *vs_chat(VSContext *ctx, const char *user_text);
 char *vs_agent_turn(VSContext *ctx, const char *user_text);
+char *vs_subagent_run(VSContext *parent, const char *task);
+char *vs_subagent_request_prompt(const char *task);
+int   vs_trace_phase(const char *kind, const char *detail, char *out, size_t cap);
 char *vs_build_system_prompt(const VSContext *ctx);
 char *vs_http_post(const char *url, const char *headers[], int nheaders, const char *body, long *status);
 char *vs_http_get_ctx(VSContext *ctx, const char *url, long *status, size_t max_bytes);
@@ -357,6 +380,16 @@ int  vs_oauth_login_blocking(VSContext *ctx, char *msg, size_t msg_cap);
 int  vs_oauth_refresh(VSContext *ctx, char *err, size_t err_cap);
 int  vs_oauth_ensure_access_token(VSContext *ctx, char *err, size_t err_cap);
 void vs_oauth_logout(VSContext *ctx);
+VSOAuthConfig *vs_oauth_config(VSContext *ctx, VSOAuthProvider which);
+int  vs_oauth_is_configured_for(const VSContext *ctx, VSOAuthProvider which);
+int  vs_oauth_is_signed_in_for(const VSContext *ctx, VSOAuthProvider which);
+int  vs_oauth_begin_for(VSContext *ctx, VSOAuthProvider which, VSOAuthFlow *flow, char *url_out, size_t url_cap, char *err, size_t err_cap);
+int  vs_oauth_login_blocking_for(VSContext *ctx, VSOAuthProvider which, char *msg, size_t msg_cap);
+int  vs_oauth_refresh_for(VSContext *ctx, VSOAuthProvider which, char *err, size_t err_cap);
+int  vs_oauth_ensure_access_token_for(VSContext *ctx, VSOAuthProvider which, char *err, size_t err_cap);
+void vs_oauth_logout_for(VSContext *ctx, VSOAuthProvider which);
+int  vs_claude_oauth_policy_check(const VSOAuthConfig *cfg, char *err, size_t err_cap);
+int  vs_claude_oauth_bearer_url_ok(const char *url);
 int  vs_oauth_save_profile(const VSContext *ctx);
 int  vs_oauth_load_profile(VSContext *ctx);
 const char *vs_oauth_profile_path(void);

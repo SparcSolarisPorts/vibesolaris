@@ -27,4 +27,7 @@ char *vs_web_fetch(VSContext*c,const char*u,size_t n){(void)c;(void)u;(void)n;re
 int vs_graph_build(VSContext*c,const char*r,VSGraphMode m,VSGraph*g){(void)c;(void)r;if(g){memset(g,0,sizeof(*g));g->mode=m;}return 0;}
 char *vs_graph_summary(const VSGraph*g,int n){(void)g;(void)n;return optional_tool_stub_text("graph");}
 
+/* Subagent isolation helpers used by agent.c; no state to release in this test. */
+void vs_history_clear(VSContext *c){(void)c;}
+void vs_cache_clear(VSContext *c){(void)c;}
 int main(void){VSContext c;char*out;FILE*f;snprintf(root,sizeof(root),"/tmp/vibesolaris-native-%ld",(long)getpid());mkdir(root,0700);snprintf(file1,sizeof(file1),"%s/a.txt",root);snprintf(file2,sizeof(file2),"%s/b.txt",root);f=fopen(file1,"w");fputs("first line\nneedle is here\nthird line\n",f);fclose(f);f=fopen(file2,"w");fputs("other needle\n",f);fclose(f);memset(&c,0,sizeof(c));out=vs_agent_turn(&c,"inspect these files and finish the task");printf("out=%s chats=%d batch=%d range=%d persisted=%d\n",out?out:"(null)",chats,batch_seen,range_seen,persisted);unlink(file1);unlink(file2);rmdir(root);if(!out||strcmp(out,"native tools ok")||chats!=3||!batch_seen||!range_seen||persisted!=2){free(out);return 1;}free(out);return 0;}

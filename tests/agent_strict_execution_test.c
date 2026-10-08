@@ -25,4 +25,7 @@ char *vs_web_fetch(VSContext*c,const char*u,size_t n){(void)c;(void)u;(void)n;re
 int vs_graph_build(VSContext*c,const char*r,VSGraphMode m,VSGraph*g){(void)c;(void)r;if(g){memset(g,0,sizeof(*g));g->mode=m;}return 0;}
 char *vs_graph_summary(const VSGraph*g,int n){(void)g;(void)n;return optional_tool_stub_text("graph");}
 
+/* Subagent isolation helpers used by agent.c; no state to release in this test. */
+void vs_history_clear(VSContext *c){(void)c;}
+void vs_cache_clear(VSContext *c){(void)c;}
 int main(void){VSContext c;char*out;memset(&c,0,sizeof(c));out=vs_agent_turn(&c,"ok sounds good, do all that");printf("%s chats=%d runs=%d\n",out,chats,runs);if(strcmp(out,"complete")||chats!=4||runs!=2)return 1;free(out);return 0;}

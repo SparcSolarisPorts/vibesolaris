@@ -22,9 +22,11 @@ If both credentials exist, a valid OAuth bearer is preferred for OpenAI. If an e
 Provider: `claude`  
 Protocol: Anthropic Messages  
 Default URL: `https://api.anthropic.com/v1/messages`  
-Authentication: Anthropic API key (`x-api-key`)
+Authentication: Anthropic API key (`x-api-key`), or an Anthropic-issued OAuth session (`Authorization: Bearer`) when one is configured
 
 The API URL is editable, so a compatible proxy/gateway or alternate officially supported Anthropic endpoint can be used without recompiling.
+
+**Claude OAuth** is optional and separate from the OpenAI OAuth slot. It works only with a client ID that Anthropic issues to VibeSolaris, and only towards `https://api.anthropic.com`. Claude.ai and Claude Code subscription logins are not used. See `OAUTH.md` for setup and the compliance rules. If an OAuth session is not available, the API key path is used unchanged.
 
 ## Qwen / Alibaba Cloud Model Studio
 

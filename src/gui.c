@@ -11,6 +11,7 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -150,6 +151,10 @@ typedef struct {
     int provider_sel;
     int protocol_sel;
     int oauth_field;
+    VSOAuthProvider oauth_provider;
+    char busy_label[128];
+    long busy_since;
+    unsigned spin_frame;
     VSOAuthFlow oauth_flow;
     char oauth_url[4096];
     char status[512];
@@ -651,11 +656,25 @@ static void gui_complete_slash(App *a)
     const char *m[16];int n,i;size_t p=0,cur,add;if(!a)return;n=slash_matches(a->input,m,16);if(n<=0)return;cur=a->input_len;while(m[0][p]){for(i=1;i<n;i++)if(m[i][p]!=m[0][p])goto done;p++;}done:if(p<=cur&&n==1)p=strlen(m[0]);if(p<=cur)return;add=p-cur;if(cur+add>=sizeof(a->input))add=sizeof(a->input)-cur-1;memcpy(a->input+cur,m[0]+cur,add);a->input_len=cur+add;a->input[a->input_len]=0;a->input_cursor=a->input_len;selection_clear(a);
 }
 
-static const char *oauth_status_label(const VSContext *c)
+static VSOAuthConfig *app_oauth_cfg(App *a)
 {
-    if (vs_oauth_is_signed_in(c)) return "Signed in";
-    if (c->oauth.access_token[0]) return "Refresh needed";
-    if (vs_oauth_is_configured(c)) return "Ready to sign in";
+    return vs_oauth_config(&a->ctx, a->oauth_provider);
+}
+
+/* Claude settings and tokens live in the encrypted config only; OpenAI keeps its
+   existing compatibility profile. */
+static int app_oauth_save(App *a)
+{
+    if (a->oauth_provider == VS_OAUTH_CLAUDE) return vs_persist_settings(&a->ctx);
+    return vs_oauth_save_profile(&a->ctx);
+}
+
+static const char *oauth_status_label(const VSContext *c, VSOAuthProvider p)
+{
+    const VSOAuthConfig *o = p == VS_OAUTH_CLAUDE ? &c->claude_oauth : &c->oauth;
+    if (vs_oauth_is_signed_in_for(c, p)) return "Signed in";
+    if (o->access_token[0]) return "Refresh needed";
+    if (vs_oauth_is_configured_for(c, p)) return "Ready to sign in";
     return "Not configured";
 }
 
@@ -668,11 +687,12 @@ static void start_oauth_login(App *a)
     }
     err[0] = 0;
     a->oauth_url[0] = 0;
-    if (vs_oauth_begin(&a->ctx, &a->oauth_flow, a->oauth_url, sizeof(a->oauth_url), err, sizeof(err)) != 0) {
+    if (vs_oauth_begin_for(&a->ctx, a->oauth_provider, &a->oauth_flow, a->oauth_url, sizeof(a->oauth_url), err, sizeof(err)) != 0) {
         snprintf(a->status, sizeof(a->status), "OAuth login could not start: %.430s", err);
         return;
     }
     if (err[0]) snprintf(a->status, sizeof(a->status), "%.470s", err);
+    else if (a->oauth_provider == VS_OAUTH_CLAUDE) strcpy(a->status, "Browser opened. Complete Claude/Anthropic authorisation; VibeSolaris is waiting on the loopback callback.");
     else strcpy(a->status, "Browser opened. Complete ChatGPT/OpenAI authorisation; VibeSolaris is waiting on the loopback callback.");
 }
 
@@ -912,7 +932,7 @@ static void finish_worker(App *a)
 static void process_worker_pipe(App *a)
 {
     UIWorkerEvent ev;ssize_t n;size_t got;
-    for(;;){got=0;memset(&ev,0,sizeof(ev));while(got<sizeof(ev)){n=read(a->worker_pipe[0],((char*)&ev)+got,sizeof(ev)-got);if(n<0){if(errno==EINTR)continue;if(errno==EAGAIN||errno==EWOULDBLOCK)return;return;}if(n==0)return;got+=(size_t)n;}if(ev.type==1){apply_worker_trace(a,&ev);free(ev.kind);free(ev.detail);}else if(ev.type==2){finish_worker(a);return;}if(a->worker_pipe[0]<0)return;}
+    for(;;){got=0;memset(&ev,0,sizeof(ev));while(got<sizeof(ev)){n=read(a->worker_pipe[0],((char*)&ev)+got,sizeof(ev)-got);if(n<0){if(errno==EINTR)continue;if(errno==EAGAIN||errno==EWOULDBLOCK)return;return;}if(n==0)return;got+=(size_t)n;}if(ev.type==1){vs_trace_phase(ev.kind,ev.detail,a->busy_label,sizeof(a->busy_label));apply_worker_trace(a,&ev);free(ev.kind);free(ev.detail);}else if(ev.type==2){finish_worker(a);return;}if(a->worker_pipe[0]<0)return;}
 }
 
 static void remove_attachment(App *a, int idx)
@@ -1022,6 +1042,7 @@ static void draw_sidebar(App *a)
     char b[256], proxyb[512];
     int y, cache_title_y, cache_btn_y, project_y, global_btn_y, mcp_btn_y, ti, ty, sbw, margin;
     int is_openai = a->ctx.provider.kind == VS_PROVIDER_OPENAI;
+    int is_claude = a->ctx.provider.kind == VS_PROVIDER_CLAUDE;
     sbw = sidebar_w(a);
     margin = sidebar_compact(a) ? 10 : 14;
     XSetForeground(a->dpy, a->gc, a->c.sidebar);
@@ -1043,9 +1064,9 @@ static void draw_sidebar(App *a)
     draw_sidebar_button(a, 262, "Proxy", proxyb, 1);
 
     draw_text(a, a->small, a->c.muted, margin + 4, sidebar_y(a,316), "AUTHENTICATION");
-    if (is_openai) {
-        draw_sidebar_button(a, 328, "ChatGPT OAuth", a->worker_busy ? "In use" : oauth_status_label(&a->ctx), 1);
-        draw_sidebar_button(a, 370, "OpenAI API key", a->ctx.provider.api_key[0] ? "Configured" : "Not set", 1);
+    if (is_openai || is_claude) {
+        draw_sidebar_button(a, 328, is_claude ? "Claude OAuth" : "ChatGPT OAuth", a->worker_busy ? "In use" : oauth_status_label(&a->ctx, is_claude ? VS_OAUTH_CLAUDE : VS_OAUTH_OPENAI), 1);
+        draw_sidebar_button(a, 370, is_claude ? "Anthropic API key" : "OpenAI API key", a->ctx.provider.api_key[0] ? "Configured" : "Not set", 1);
         cache_title_y = 424; cache_btn_y = 436; project_y = 572;
     } else {
         snprintf(b,sizeof(b),"%s API key",a->ctx.provider.name);
@@ -1111,7 +1132,11 @@ static void draw_topbar(App *a)
     cx = content_x(a, &cw);
     draw_text(a, a->bold, a->c.text, cx, 35, "VibeSolaris");
     {int tx=cx+text_w(a,a->bold,"VibeSolaris")+14;fill_round(a,tx,14,58,28,7,a->graph_open?a->c.soft:a->c.panel);stroke_round(a,tx,14,58,28,7,a->c.border);draw_text(a,a->small,a->c.text,tx+12,33,"Graph");fill_round(a,tx+66,14,50,28,7,a->c.panel);stroke_round(a,tx+66,14,50,28,7,a->c.border);draw_text(a,a->small,a->c.text,tx+80,33,"Web");token_x=tx+128;}
-    if(a->worker_busy)snprintf(tb,sizeof(tb),"working...");
+    if(a->worker_busy){
+        static const char frames[]="|/-\\";
+        long el=(long)(time(NULL)-a->busy_since);
+        snprintf(tb,sizeof(tb),"%c %s %lds",frames[(a->spin_frame++)&3],a->busy_label[0]?a->busy_label:"Working",el);
+    }
     else if(a->ctx.conversation_usage_responses>0)snprintf(tb,sizeof(tb),"%lu tokens",a->ctx.conversation_total_tokens);
     else snprintf(tb,sizeof(tb),"0 tokens");
     draw_text(a,a->small,a->c.muted,token_x,34,tb);
@@ -1369,28 +1394,28 @@ static const char *oauth_field_label(int f)
     }
 }
 
-static const char *oauth_field_value(const VSContext *c, int f)
+static const char *oauth_field_value(const VSOAuthConfig *o, int f)
 {
     switch (f) {
-        case 0: return c->oauth.client_id;
-        case 1: return c->oauth.authorize_url;
-        case 2: return c->oauth.token_url;
-        case 3: return c->oauth.scopes;
-        case 4: return c->oauth.redirect_uri;
+        case 0: return o->client_id;
+        case 1: return o->authorize_url;
+        case 2: return o->token_url;
+        case 3: return o->scopes;
+        case 4: return o->redirect_uri;
         default: return "";
     }
 }
 
-static void oauth_field_store(VSContext *c, int f, const char *v)
+static void oauth_field_store(VSOAuthConfig *o, int f, const char *v)
 {
     char *dst;
     size_t cap;
     dst = NULL; cap = 0;
-    if (f == 0) { dst = c->oauth.client_id; cap = sizeof(c->oauth.client_id); }
-    else if (f == 1) { dst = c->oauth.authorize_url; cap = sizeof(c->oauth.authorize_url); }
-    else if (f == 2) { dst = c->oauth.token_url; cap = sizeof(c->oauth.token_url); }
-    else if (f == 3) { dst = c->oauth.scopes; cap = sizeof(c->oauth.scopes); }
-    else if (f == 4) { dst = c->oauth.redirect_uri; cap = sizeof(c->oauth.redirect_uri); }
+    if (f == 0) { dst = o->client_id; cap = sizeof(o->client_id); }
+    else if (f == 1) { dst = o->authorize_url; cap = sizeof(o->authorize_url); }
+    else if (f == 2) { dst = o->token_url; cap = sizeof(o->token_url); }
+    else if (f == 3) { dst = o->scopes; cap = sizeof(o->scopes); }
+    else if (f == 4) { dst = o->redirect_uri; cap = sizeof(o->redirect_uri); }
     if (dst && cap) {
         size_t n;
         if (!v) v = "";
@@ -1469,13 +1494,16 @@ static void draw_modal(App *a)
     if (a->modal == MODAL_ACCOUNT) {
         const char *stext;
         unsigned long scolor;
-        stext = oauth_status_label(&a->ctx);
-        scolor = vs_oauth_is_signed_in(&a->ctx) ? a->c.accent_dark : a->c.text;
-        draw_text(a, a->bold, a->c.text, x + 24, y + 35, "ChatGPT / OpenAI authentication");
+        int claude = a->oauth_provider == VS_OAUTH_CLAUDE;
+        const char *cfg_label = claude ? "Configure Claude OAuth" : "Configure ChatGPT OAuth";
+        const char *signin_label = claude ? "Sign in with Claude / Anthropic" : "Sign in with ChatGPT / OpenAI";
+        stext = oauth_status_label(&a->ctx, a->oauth_provider);
+        scolor = vs_oauth_is_signed_in_for(&a->ctx, a->oauth_provider) ? a->c.accent_dark : a->c.text;
+        draw_text(a, a->bold, a->c.text, x + 24, y + 35, claude ? "Claude / Anthropic authentication" : "ChatGPT / OpenAI authentication");
         draw_text(a, a->small, a->c.muted, x + 24, y + 58,
-                  "OAuth 2.0 Authorisation Code + PKCE for a native desktop client.");
+                  claude ? "OAuth 2.0 PKCE with the client ID Anthropic issues to VibeSolaris." : "OAuth 2.0 Authorisation Code + PKCE for a native desktop client.");
         draw_text(a, a->small, a->c.muted, x + 24, y + 77,
-                  "VibeSolaris never asks for your ChatGPT password and does not read browser cookies.");
+                  claude ? "Claude Code and claude.ai subscription logins are refused; API keys still work." : "VibeSolaris never asks for your ChatGPT password and does not read browser cookies.");
 
         fill_round(a, x + 24, y + 94, w - 48, 58, 9, a->c.soft);
         stroke_round(a, x + 24, y + 94, w - 48, 58, 9, a->c.border);
@@ -1483,23 +1511,23 @@ static void draw_modal(App *a)
         draw_text(a, a->bold, scolor, x + 38, y + 138, stext);
 
         fill_round(a, x + 24, y + 169, w - 48, 44, 9,
-                   (!vs_oauth_is_configured(&a->ctx) || !vs_oauth_is_signed_in(&a->ctx)) ? a->c.accent : a->c.soft);
+                   (!vs_oauth_is_configured_for(&a->ctx, a->oauth_provider) || !vs_oauth_is_signed_in_for(&a->ctx, a->oauth_provider)) ? a->c.accent : a->c.soft);
         if (a->oauth_flow.active) {
             draw_text(a, a->bold, a->c.panel,
                       x + 24 + ((w - 48) - text_w(a, a->bold, "Waiting for browser callback...")) / 2,
                       y + 197, "Waiting for browser callback...");
-        } else if (!vs_oauth_is_configured(&a->ctx)) {
+        } else if (!vs_oauth_is_configured_for(&a->ctx, a->oauth_provider)) {
             draw_text(a, a->bold, a->c.panel,
-                      x + 24 + ((w - 48) - text_w(a, a->bold, "Configure ChatGPT OAuth")) / 2,
-                      y + 197, "Configure ChatGPT OAuth");
-        } else if (vs_oauth_is_signed_in(&a->ctx)) {
+                      x + 24 + ((w - 48) - text_w(a, a->bold, cfg_label)) / 2,
+                      y + 197, cfg_label);
+        } else if (vs_oauth_is_signed_in_for(&a->ctx, a->oauth_provider)) {
             draw_text(a, a->bold, a->c.text,
                       x + 24 + ((w - 48) - text_w(a, a->bold, "OAuth session active")) / 2,
                       y + 197, "OAuth session active");
         } else {
             draw_text(a, a->bold, a->c.panel,
-                      x + 24 + ((w - 48) - text_w(a, a->bold, "Sign in with ChatGPT / OpenAI")) / 2,
-                      y + 197, "Sign in with ChatGPT / OpenAI");
+                      x + 24 + ((w - 48) - text_w(a, a->bold, signin_label)) / 2,
+                      y + 197, signin_label);
         }
 
         fill_round(a, x + 24, y + 232, 178, 38, 8, a->c.panel);
@@ -1514,7 +1542,7 @@ static void draw_modal(App *a)
             fill_round(a, x + 24, y + 286, 142, 36, 8, a->c.panel);
             stroke_round(a, x + 24, y + 286, 142, 36, 8, a->c.danger);
             draw_text(a, a->font, a->c.danger, x + 48, y + 309, "Cancel login");
-        } else if (a->ctx.oauth.access_token[0]) {
+        } else if (app_oauth_cfg(a)->access_token[0]) {
             fill_round(a, x + 24, y + 286, 142, 36, 8, a->c.panel);
             stroke_round(a, x + 24, y + 286, 142, 36, 8, a->c.danger);
             draw_text(a, a->font, a->c.danger, x + 54, y + 309, "Sign out");
@@ -1530,7 +1558,7 @@ static void draw_modal(App *a)
     }
 
     if (a->modal == MODAL_OAUTH_CONFIG) {
-        draw_text(a, a->bold, a->c.text, x + 24, y + 34, "OAuth / PKCE settings");
+        draw_text(a, a->bold, a->c.text, x + 24, y + 34, a->oauth_provider == VS_OAUTH_CLAUDE ? "Claude OAuth / PKCE settings" : "OAuth / PKCE settings");
         draw_text(a, a->small, a->c.muted, x + 24, y + 55,
                   "Use the exact values supplied when VibeSolaris is registered as a native/public OAuth client.");
         draw_text(a, a->small, a->c.muted, x + 24, y + 73,
@@ -1541,7 +1569,7 @@ static void draw_modal(App *a)
             stroke_round(a, x + 24, by, w - 48, 44, 8, i == a->oauth_field ? a->c.accent : a->c.border);
             draw_text(a, a->small, a->c.muted, x + 36, by + 15, oauth_field_label(i));
             draw_ellipsis(a, a->font, a->c.text, x + 36, by + 34, w - 72,
-                          oauth_field_value(&a->ctx, i)[0] ? oauth_field_value(&a->ctx, i) : "(not set)");
+                          oauth_field_value(app_oauth_cfg(a), i)[0] ? oauth_field_value(app_oauth_cfg(a), i) : "(not set)");
         }
         fill_round(a, x + 24, y + h - 50, 160, 32, 8, a->c.panel);
         stroke_round(a, x + 24, y + h - 50, 160, 32, 8, a->c.border);
@@ -1728,8 +1756,8 @@ static void apply_modal(App *a)
         if(!strcmp(transport,"stdio")||!strcmp(transport,"stdin"))rc=vs_mcp_add_stdio(&a->ctx,name,target);else if(!strcmp(transport,"http")||!strcmp(transport,"remote"))rc=vs_mcp_add_http(&a->ctx,name,target,auth);else rc=-1;
         if(rc==0){(void)vs_mcp_refresh_all(&a->ctx,1);snprintf(a->status,sizeof(a->status),"MCP server %.120s saved to encrypted config",name);}else strcpy(a->status,"Could not add MCP server");
     } else if (a->modal == MODAL_OAUTH_EDIT) {
-        oauth_field_store(&a->ctx, a->oauth_field, a->modal_text);
-        if (vs_oauth_save_profile(&a->ctx) == 0) {
+        oauth_field_store(app_oauth_cfg(a), a->oauth_field, a->modal_text);
+        if (app_oauth_save(a) == 0) {
             (void)vs_persist_settings(&a->ctx);
             snprintf(a->status, sizeof(a->status), "%s saved", oauth_field_label(a->oauth_field));
         }
@@ -2106,11 +2134,12 @@ static void send_message(App *a)
         size_t z=strlen(a->input+5)+256;worker_prompt=(char*)malloc(z);
         if(!worker_prompt){free(usercopy);return;}
         snprintf(worker_prompt,z,"Search the web for the following request. Use web_search first, web_fetch only on relevant result pages, then give a concise sourced answer. Request: %s",a->input+5);
-    }else worker_prompt=ui_dup(a->input);
+    }else if(!strncmp(a->input,"/subagent ",10)&&a->input[10]){worker_prompt=vs_subagent_request_prompt(a->input+10);}
+    else worker_prompt=ui_dup(a->input);
     if(!worker_prompt){free(usercopy);return;}
     vs_cancel_clear(&a->ctx);
     add_message(a,UI_ROLE_USER,usercopy);free(usercopy);trace_index=begin_trace_message(a);a->live_trace_message=trace_index;
-    a->worker_user=worker_prompt;a->worker_reply=NULL;a->worker_busy=1;vs_set_trace_callback(&a->ctx,gui_live_trace,a);strcpy(a->status,"Working...");
+    a->worker_user=worker_prompt;a->worker_reply=NULL;a->worker_busy=1;a->busy_since=(long)time(NULL);strcpy(a->busy_label,"Thinking");vs_set_trace_callback(&a->ctx,gui_live_trace,a);strcpy(a->status,"Working...");
     a->input[0]=0;a->input_len=0;a->input_cursor=0;selection_clear(a);a->auto_scroll=1;redraw(a);XFlush(a->dpy);
     if(pthread_create(&a->worker_thread,NULL,agent_worker_main,a)!=0){a->worker_busy=0;a->worker_user=NULL;free(worker_prompt);vs_cancel_clear(&a->ctx);vs_set_trace_callback(&a->ctx,NULL,NULL);strcpy(a->status,"Could not start background agent worker");return;}
     a->worker_started=1;
@@ -2133,8 +2162,8 @@ static void handle_modal_key(App *a, XKeyEvent *ke)
     if (a->modal == MODAL_ACCOUNT) {
         if (k == XK_Return || k == XK_KP_Enter) {
             if (a->oauth_flow.active) return;
-            if (!vs_oauth_is_configured(&a->ctx)) open_modal(a, MODAL_OAUTH_CONFIG, "");
-            else if (!vs_oauth_is_signed_in(&a->ctx)) start_oauth_login(a);
+            if (!vs_oauth_is_configured_for(&a->ctx, a->oauth_provider)) open_modal(a, MODAL_OAUTH_CONFIG, "");
+            else if (!vs_oauth_is_signed_in_for(&a->ctx, a->oauth_provider)) start_oauth_login(a);
         }
         return;
     }
@@ -2142,7 +2171,7 @@ static void handle_modal_key(App *a, XKeyEvent *ke)
         if (k == XK_Up && a->oauth_field > 0) a->oauth_field--;
         else if (k == XK_Down && a->oauth_field < 4) a->oauth_field++;
         else if (k == XK_Return || k == XK_KP_Enter)
-            open_modal(a, MODAL_OAUTH_EDIT, oauth_field_value(&a->ctx, a->oauth_field));
+            open_modal(a, MODAL_OAUTH_EDIT, oauth_field_value(app_oauth_cfg(a), a->oauth_field));
         return;
     }
     if (a->modal == MODAL_PROTOCOL) {
@@ -2398,8 +2427,8 @@ static void handle_modal_click(App *a, int px, int py)
     if (a->modal == MODAL_ACCOUNT) {
         if (hit(px, py, x + 24, y + 169, w - 48, 44)) {
             if (a->oauth_flow.active) return;
-            if (!vs_oauth_is_configured(&a->ctx)) open_modal(a, MODAL_OAUTH_CONFIG, "");
-            else if (!vs_oauth_is_signed_in(&a->ctx)) start_oauth_login(a);
+            if (!vs_oauth_is_configured_for(&a->ctx, a->oauth_provider)) open_modal(a, MODAL_OAUTH_CONFIG, "");
+            else if (!vs_oauth_is_signed_in_for(&a->ctx, a->oauth_provider)) start_oauth_login(a);
         } else if (hit(px, py, x + 24, y + 232, 178, 38)) {
             open_modal(a, MODAL_OAUTH_CONFIG, "");
         } else if (hit(px, py, x + 214, y + 232, 142, 38)) {
@@ -2408,8 +2437,8 @@ static void handle_modal_click(App *a, int px, int py)
             if (a->oauth_flow.active) {
                 vs_oauth_cancel(&a->oauth_flow);
                 strcpy(a->status, "OAuth login cancelled");
-            } else if (a->ctx.oauth.access_token[0]) {
-                vs_oauth_logout(&a->ctx);
+            } else if (app_oauth_cfg(a)->access_token[0]) {
+                vs_oauth_logout_for(&a->ctx, a->oauth_provider);
                 strcpy(a->status, "OAuth tokens cleared");
             }
         } else if (hit(px, py, x + w - 100, y + 286, 76, 36)) {
@@ -2422,14 +2451,14 @@ static void handle_modal_click(App *a, int px, int py)
             by = y + 88 + i * 54;
             if (hit(px, py, x + 24, by, w - 48, 44)) {
                 a->oauth_field = i;
-                open_modal(a, MODAL_OAUTH_EDIT, oauth_field_value(&a->ctx, i));
+                open_modal(a, MODAL_OAUTH_EDIT, oauth_field_value(app_oauth_cfg(a), i));
                 return;
             }
         }
         if (hit(px, py, x + 24, y + h - 50, 160, 32)) {
             a->modal = MODAL_ACCOUNT;
         } else if (hit(px, py, x + w - 105, y + h - 50, 81, 32)) {
-            if (vs_oauth_save_profile(&a->ctx) == 0) { (void)vs_persist_settings(&a->ctx); strcpy(a->status, "OAuth profile + encrypted config saved"); }
+            if (app_oauth_save(a) == 0) { (void)vs_persist_settings(&a->ctx); strcpy(a->status, "OAuth profile + encrypted config saved"); }
             else strcpy(a->status, "Could not save OAuth profile");
             a->modal = MODAL_ACCOUNT;
         }
@@ -2468,7 +2497,7 @@ static void handle_modal_click(App *a, int px, int py)
 
 static void handle_click(App *a, XButtonEvent *be)
 {
-    int x,y,cw,cx,panel_y,panel_h,idx,cache_y,is_openai,mi;size_t off;
+    int x,y,cw,cx,panel_y,panel_h,idx,cache_y,is_openai,is_claude,has_oauth,mi;size_t off;
     x=be->x;y=be->y;a->cursor_visible=1;
     if(be->button==Button4){a->scroll_y-=72;a->auto_scroll=0;return;}
     if(be->button==Button5){a->scroll_y+=72;a->auto_scroll=0;return;}
@@ -2480,6 +2509,8 @@ static void handle_click(App *a, XButtonEvent *be)
     if(a->worker_busy && x<sidebar_w(a)){snprintf(a->status,sizeof(a->status),"Connection/configuration controls are locked while the agent is working");return;}
 
     is_openai=a->ctx.provider.kind==VS_PROVIDER_OPENAI;
+    is_claude=a->ctx.provider.kind==VS_PROVIDER_CLAUDE;
+    has_oauth=is_openai||is_claude;
     if(x<sidebar_w(a)){
         int sbx = sidebar_compact(a) ? 10 : 14;
         int sbw = sidebar_w(a) - sbx * 2;
@@ -2495,11 +2526,11 @@ static void handle_click(App *a, XButtonEvent *be)
         }
         else if(hit(x,y,sbx,sidebar_y(a,220),sbw,sbh))open_modal(a,MODAL_BASE,a->ctx.provider.base_url);
         else if(hit(x,y,sbx,sidebar_y(a,262),sbw,sbh))open_modal(a,MODAL_PROXY,"");
-        else if(is_openai&&hit(x,y,sbx,sidebar_y(a,328),sbw,sbh))open_modal(a,MODAL_ACCOUNT,"");
-        else if(is_openai&&hit(x,y,sbx,sidebar_y(a,370),sbw,sbh))open_modal(a,MODAL_KEY,"");
-        else if(!is_openai&&hit(x,y,sbx,sidebar_y(a,328),sbw,sbh))open_modal(a,MODAL_KEY,"");
+        else if(has_oauth&&hit(x,y,sbx,sidebar_y(a,328),sbw,sbh)){a->oauth_provider=is_claude?VS_OAUTH_CLAUDE:VS_OAUTH_OPENAI;open_modal(a,MODAL_ACCOUNT,"");}
+        else if(has_oauth&&hit(x,y,sbx,sidebar_y(a,370),sbw,sbh))open_modal(a,MODAL_KEY,"");
+        else if(!has_oauth&&hit(x,y,sbx,sidebar_y(a,328),sbw,sbh))open_modal(a,MODAL_KEY,"");
         else{
-            cache_y=is_openai?436:394;
+            cache_y=has_oauth?436:394;
             if(hit(x,y,sbx,sidebar_y(a,cache_y),sbw,sbh)){
                 a->ctx.cache_enabled=!a->ctx.cache_enabled;(void)vs_persist_settings(&a->ctx);
                 strcpy(a->status,a->ctx.cache_enabled?"Prompt cache enabled":"Prompt cache disabled");
@@ -2774,7 +2805,7 @@ int main(int argc, char **argv)
         }
         if(a.worker_pipe[0]>=0){FD_SET(a.worker_pipe[0],&rfds);if(a.worker_pipe[0]>maxfd)maxfd=a.worker_pipe[0];}
         tv.tv_sec = 0;
-        tv.tv_usec = 500000;
+        tv.tv_usec = a.worker_busy ? 150000 : 500000;
         rc = select(maxfd + 1, &rfds, (fd_set *)0, (fd_set *)0, &tv);
         if(rc>0&&a.worker_pipe[0]>=0&&FD_ISSET(a.worker_pipe[0],&rfds)){process_worker_pipe(&a);redraw(&a);}
         if (a.oauth_flow.active) {
@@ -2786,7 +2817,9 @@ int main(int argc, char **argv)
             }
         }
         if (rc == 0) {
-            if (a.has_focus) {
+            if (a.worker_busy) {
+                redraw(&a);
+            } else if (a.has_focus) {
                 a.cursor_visible = !a.cursor_visible;
                 redraw(&a);
             }

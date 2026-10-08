@@ -5,6 +5,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <signal.h>
 #include <termios.h>
@@ -35,7 +36,7 @@ static const char *tui_completions[] = {
     "/help","/quit","/usage","/trace","/trace full","/output compact","/output normal","/output full","/output status",
     "/provider openai","/provider claude","/provider gemini","/provider glm","/provider glm-coding","/provider kimi","/provider qwen","/provider ernie","/provider deepseek","/provider custom",
     "/protocol openai","/protocol anthropic","/model ","/base ","/key ","/proxy status","/proxy on","/proxy off",
-    "/oauth status","/oauth login","/oauth logout","/oauth save","/login","/logout",
+    "/oauth status","/oauth login","/oauth logout","/oauth save","/login","/logout","/claude-oauth status","/claude-oauth login","/claude-oauth logout","/subagent ",
     "/attach ","/clearattach","/read ","/run ","/web ","/fetch ","/graph files","/graph fields","/graph dot files ","/graph dot fields ",
     "/cache status","/cache on","/cache off","/cache clear","/history status","/history clear",
     "/globalconfig status","/globalconfig load","/globalconfig save","/saveconfig ",
@@ -193,15 +194,78 @@ static const char *trace_colour(const char *kind)
     return T_DIM;
 }
 
+/* ---- live activity indicator ----
+   A status line (spinner, phase label, elapsed seconds) is redrawn by a helper
+   thread while a turn runs.  Trace lines erase and redraw it under the same
+   mutex so the two never interleave.  Disabled when stdout is not a terminal. */
+static pthread_mutex_t spin_mutex=PTHREAD_MUTEX_INITIALIZER;
+static pthread_t spin_thread;
+static int spin_thread_ok=0,spin_running=0,spin_drawn=0,spin_enabled=0,spin_frame=0;
+static char spin_label[128]="Thinking";
+static time_t spin_started=0;
+
+static void spin_erase_locked(void)
+{
+    if(spin_drawn){fputs("\r\033[2K",stdout);spin_drawn=0;fflush(stdout);}
+}
+
+static void spin_draw_locked(void)
+{
+    static const char frames[]="|/-\\";
+    long elapsed;
+    if(!spin_enabled||!spin_running)return;
+    elapsed=(long)(time(NULL)-spin_started);
+    printf("\r\033[2K%c %s... %lds  (Ctrl-C to stop)",frames[spin_frame&3],spin_label,elapsed);
+    spin_frame++;spin_drawn=1;fflush(stdout);
+}
+
+static void *spin_main(void *arg)
+{
+    (void)arg;
+    for(;;){
+        pthread_mutex_lock(&spin_mutex);
+        if(!spin_running){pthread_mutex_unlock(&spin_mutex);break;}
+        spin_draw_locked();
+        pthread_mutex_unlock(&spin_mutex);
+        usleep(120000);
+    }
+    return NULL;
+}
+
+static void spin_start(void)
+{
+    spin_enabled=isatty(STDOUT_FILENO)?1:0;
+    pthread_mutex_lock(&spin_mutex);
+    spin_running=1;spin_started=time(NULL);spin_frame=0;
+    strcpy(spin_label,"Thinking");
+    pthread_mutex_unlock(&spin_mutex);
+    spin_thread_ok=0;
+    if(spin_enabled&&pthread_create(&spin_thread,NULL,spin_main,NULL)==0)spin_thread_ok=1;
+}
+
+static void spin_stop(void)
+{
+    pthread_mutex_lock(&spin_mutex);
+    spin_running=0;spin_erase_locked();
+    pthread_mutex_unlock(&spin_mutex);
+    if(spin_thread_ok){pthread_join(spin_thread,NULL);spin_thread_ok=0;}
+}
+
 static void live_trace(void *userdata,int step,const char *kind,const char *detail)
 {
     const char *col=trace_colour(kind);
+    char label[160];
     (void)userdata;
+    pthread_mutex_lock(&spin_mutex);
+    spin_erase_locked();
     if(tui_colour)fputs(col,stdout);
     printf("%2d. [%-12s] ",step,kind?kind:"step");
     tui_print_detail(kind,detail);
     if(tui_colour)fputs(T_RESET,stdout);
     fflush(stdout);
+    if(vs_trace_phase(kind,detail,label,sizeof(label))){strcpy(spin_label,label);}
+    spin_draw_locked();
+    pthread_mutex_unlock(&spin_mutex);
 }
 
 static void usage_status(const VSContext *c)
@@ -252,6 +316,14 @@ static void help(void)
     cprintf(T_CYAN,"  /oauth redirect URL\n");
     cprintf(T_CYAN,"  /oauth login | /oauth logout | /oauth save\n");
     cprintf(T_DIM,"  /login is an alias for /oauth login. Use only OAuth values officially issued for this app.\n");
+    cprintf(T_BOLD T_BLUE,"\nClaude OAuth (Anthropic-issued client only)\n");
+    cprintf(T_CYAN,"  /claude-oauth status          ");printf("show Claude OAuth configuration and compliance status\n");
+    cprintf(T_CYAN,"  /claude-oauth client ID | authorize URL | token URL | scopes LIST | redirect URL\n");
+    cprintf(T_CYAN,"  /claude-oauth login | /claude-oauth logout\n");
+    cprintf(T_BOLD T_BLUE,"\nSubagents\n");
+    cprintf(T_CYAN,"  /subagent TASK               ");printf("delegate a focused task to an isolated subagent\n");
+    cprintf(T_DIM,"  The agent can also delegate on its own with [[VS_TOOL subagent task=\"...\"]].\n");
+    cprintf(T_DIM,"  Use only the client ID Anthropic issues to VibeSolaris. Claude.ai and Claude Code subscription logins are refused.\n");
     cprintf(T_BOLD T_BLUE,"\nFiles, tools, cache and history\n");
     cprintf(T_CYAN,"  /attach PATH                  ");printf("attach a file or image to the next request\n");
     cprintf(T_CYAN,"  /clearattach                  ");printf("clear pending attachments\n");
@@ -307,6 +379,36 @@ static void auth_status(const VSContext *c)
     printf("  Redirect URI: %s\n", c->oauth.redirect_uri[0] ? c->oauth.redirect_uri : "(not set)");
     if(c->oauth.expires_at>0){remain=c->oauth.expires_at-(long)time(NULL);if(remain<0)remain=0;printf("  Access-token lifetime remaining: %ld seconds\n",remain);}
     cprintf(T_DIM,"  VibeSolaris never asks for or stores your ChatGPT password.\n");
+}
+
+static void claude_oauth_status(const VSContext *c)
+{
+    char err[512];long remain;
+    printf("Claude OAuth (separate from OpenAI OAuth)\n");
+    err[0]=0;
+    printf("  Policy check: %s\n", vs_claude_oauth_policy_check(&c->claude_oauth,err,sizeof(err))==0 ? "ready" : "not ready");
+    if(err[0])printf("  Note: %s\n",err);
+    printf("  Client ID: %s\n", c->claude_oauth.client_id[0] ? c->claude_oauth.client_id : "(not set)");
+    printf("  Authorisation URL: %s\n", c->claude_oauth.authorize_url[0] ? c->claude_oauth.authorize_url : "(not set)");
+    printf("  Token URL: %s\n", c->claude_oauth.token_url[0] ? c->claude_oauth.token_url : "(not set)");
+    printf("  Scopes: %s\n", c->claude_oauth.scopes[0] ? c->claude_oauth.scopes : "(not set)");
+    printf("  Redirect URI: %s\n", c->claude_oauth.redirect_uri[0] ? c->claude_oauth.redirect_uri : "(not set)");
+    printf("  Session: %s\n", vs_oauth_is_signed_in_for(c,VS_OAUTH_CLAUDE) ? "signed in" : (c->claude_oauth.access_token[0] ? "expired / refresh required" : "not signed in"));
+    if(c->claude_oauth.expires_at>0){remain=c->claude_oauth.expires_at-(long)time(NULL);if(remain<0)remain=0;printf("  Access-token lifetime remaining: %ld seconds\n",remain);}
+    printf("  Bearer sent only to https://api.anthropic.com; storage: encrypted config only\n");
+}
+
+static void claude_oauth_set(VSContext *c,const char *which,const char *value)
+{
+    VSOAuthConfig *o=&c->claude_oauth;
+    if(!strcmp(which,"client"))copyv(o->client_id,sizeof(o->client_id),value);
+    else if(!strcmp(which,"authorize"))copyv(o->authorize_url,sizeof(o->authorize_url),value);
+    else if(!strcmp(which,"token"))copyv(o->token_url,sizeof(o->token_url),value);
+    else if(!strcmp(which,"scopes"))copyv(o->scopes,sizeof(o->scopes),value);
+    else if(!strcmp(which,"redirect"))copyv(o->redirect_uri,sizeof(o->redirect_uri),value);
+    else {errorf("Unknown Claude OAuth setting: %s\n",which);return;}
+    if(vs_persist_settings(c)==0)successf("Claude OAuth %s updated and saved to the encrypted config.\n",which);
+    else warnf("Claude OAuth %s updated, but the encrypted config could not be saved.\n",which);
 }
 
 static void oauth_set(VSContext *c,const char *which,const char *value)
@@ -392,6 +494,24 @@ int main(int argc, char **argv)
             vs_set_model(&c,line+7);if(vs_persist_settings(&c)==0)successf("model=%s (saved for %s)\n", c.provider.model,c.provider.name);else errorf("model=%s, but encrypted config could not be saved\n",c.provider.model);
         } else if (!strncmp(line, "/base ", 6)) {
             vs_set_base_url(&c,line+6);successf("base=%s\n", c.provider.base_url);
+        } else if (!strcmp(line, "/claude-oauth status")) {
+            claude_oauth_status(&c);
+        } else if (!strncmp(line, "/claude-oauth client ", 21)) {
+            claude_oauth_set(&c,"client",line+21);
+        } else if (!strncmp(line, "/claude-oauth authorize ", 24)) {
+            claude_oauth_set(&c,"authorize",line+24);
+        } else if (!strncmp(line, "/claude-oauth token ", 20)) {
+            claude_oauth_set(&c,"token",line+20);
+        } else if (!strncmp(line, "/claude-oauth scopes ", 21)) {
+            claude_oauth_set(&c,"scopes",line+21);
+        } else if (!strncmp(line, "/claude-oauth redirect ", 23)) {
+            claude_oauth_set(&c,"redirect",line+23);
+        } else if (!strcmp(line, "/claude-oauth login")) {
+            char msg[1024];
+            if(!vs_oauth_is_configured_for(&c,VS_OAUTH_CLAUDE))errorf("Claude OAuth is not configured. Set client, authorize, token, scopes and redirect first.\n");
+            else {warnf("Starting Claude OAuth (Authorisation Code + PKCE); your browser should open.\n");msg[0]=0;if(vs_oauth_login_blocking_for(&c,VS_OAUTH_CLAUDE,msg,sizeof(msg))>0)successf("%s\n",msg);else errorf("Claude OAuth login failed: %s\n",msg[0]?msg:"unknown error");}
+        } else if (!strcmp(line, "/claude-oauth logout")) {
+            vs_oauth_logout_for(&c,VS_OAUTH_CLAUDE);successf("Claude OAuth tokens cleared.\n");
         } else if (!strcmp(line, "/oauth status") || !strcmp(line, "/auth") || !strcmp(line, "/auth status")) {
             auth_status(&c);
         } else if (!strncmp(line, "/oauth client ", 14)) {
@@ -486,7 +606,7 @@ int main(int argc, char **argv)
             if(vs_mcp_remove(&c,line+12)==0)successf("MCP server removed: %s\n",line+12);else errorf("MCP server not found: %s\n",line+12);
         } else if (!strcmp(line, "/trace") || !strcmp(line,"/trace full")) {
             int old=tui_output_mode;if(!strcmp(line,"/trace full"))tui_output_mode=2;cprintf(T_BOLD T_MAGENTA,"Activity trace\n");print_trace(&c);tui_output_mode=old;
-        } else if (line[0] == '/') {
+        } else if (line[0] == '/' && strncmp(line, "/subagent ", 10)) {
             errorf("Unknown command: %s\n",line);cprintf(T_DIM,"Type /help to see available commands.\n");
         } else if(line[0]) {
             char *a;void (*oldint)(int);
@@ -494,7 +614,14 @@ int main(int argc, char **argv)
             vs_cancel_clear(&c);
             tui_active_ctx=&c;oldint=signal(SIGINT,tui_sigint);
             vs_set_trace_callback(&c,live_trace,NULL);
-            a=vs_agent_turn(&c,line);
+            {
+                char *delegated=NULL;const char *prompt=line;
+                if(!strncmp(line,"/subagent ",10)){delegated=vs_subagent_request_prompt(line+10);if(delegated)prompt=delegated;}
+                spin_start();
+                a=vs_agent_turn(&c,prompt);
+                spin_stop();
+                free(delegated);
+            }
             vs_set_trace_callback(&c,NULL,NULL);
             tui_active_ctx=NULL;if(oldint!=SIG_ERR)(void)signal(SIGINT,oldint);
             cprintf(T_BOLD T_GREEN,"\nVibeSolaris answer\n");

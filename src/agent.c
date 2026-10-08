@@ -149,6 +149,7 @@ static int find_attachment(const VSContext *c,const char *p){int i;if(!c||!p)ret
 
 static char *execute_tool(VSContext *c,const char *d,int *command_runner_confirmed){char *result=0;if(!d)return dupstr("ERROR: empty tool directive");
     if(!strncmp(d+10,"image ",6)){char *p=attr(d,"path");int rc=-1,idx=find_attachment(c,p),before=c->attachment_count;if(p)unesc(p);if(p&&vs_is_image_path(p))rc=vs_attach(c,p);if(rc==0){if(idx<0)idx=before;c->attachment_send_from=idx>=0?idx:c->attachment_count;{size_t z=strlen(p?p:"")+96;result=(char*)malloc(z);if(result)snprintf(result,z,"OK: image loaded for the next model round: %s",p?p:"");}}if(!result)result=dupstr((p&&!vs_is_image_path(p))?"ERROR: image tool requires PNG, JPEG, GIF, or WebP":"ERROR: unable to load image file");free(p);return result;}
+    if(!strncmp(d+10,"subagent ",9)){char *t=attr(d,"task"),*r;if(t)unesc(t);r=vs_subagent_run(c,t);free(t);return r;}
     if(!strncmp(d+10,"read ",5))return native_read(c,d);
     if(!strncmp(d+10,"list ",5))return native_list(c,d);
     if(!strncmp(d+10,"search ",7))return native_search(c,d);
@@ -175,7 +176,7 @@ char *vs_agent_turn(VSContext *c,const char *user){
     {const char *mr=getenv("VIBESOLARIS_MAX_AGENT_ROUNDS");if(mr&&*mr){char *ep=0;long v=strtol(mr,&ep,10);if(ep&&*ep==0&&v>=8&&v<=256)max_rounds=(int)v;}}
     if(!prompt||!original){free(prompt);free(original);return dupstr("out of memory");}
     task_anchor=build_task_anchor(c,original);if(!task_anchor)task_anchor=dupstr(original);if(!task_anchor){free(prompt);free(original);return dupstr("out of memory");}
-    agent_context_clear(c);c->attachment_send_from=0;execution_mode=execution_intent(original);vs_trace_clear(c);vs_trace(c,"agent","starting agent turn");
+    agent_context_clear(c);c->attachment_send_from=0;c->subagent_serial=0;execution_mode=execution_intent(original);vs_trace_clear(c);vs_trace(c,"agent","starting agent turn");
     if(vs_cancel_requested(c)){cancelled=1;vs_trace(c,"cancel","agent turn stopped by user before work began");}
     if(!cancelled&&c->mcp_server_count>0){int n=vs_mcp_refresh_all(c,0);if(vs_cancel_requested(c)){cancelled=1;vs_trace(c,"cancel","agent turn stopped while preparing MCP tools");}else{snprintf(step,sizeof(step),"MCP catalogue ready: %d tool(s)",n<0?0:n);vs_trace(c,"mcp",step);}}
     for(round=0;!cancelled&&round<max_rounds;round++){

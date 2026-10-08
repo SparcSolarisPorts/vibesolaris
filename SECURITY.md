@@ -23,6 +23,10 @@ This protects the configuration at rest from casual disclosure and from
 ciphertext modification.  It does not protect secrets from root or from an
 attacker who can read both the key and ciphertext.
 
+## Claude OAuth secrets
+
+Claude OAuth access and refresh tokens are stored only inside the encrypted configuration. They are not written to `~/.vibesolaris/oauth.conf`, and the plain-text `/saveconfig PATH` export omits them. Claude OAuth bearer tokens are sent only to `https://api.anthropic.com`. See `OAUTH.md` for the compliance rules.
+
 ## Commands
 
 TUI:

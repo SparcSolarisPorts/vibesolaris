@@ -136,9 +136,11 @@ char *vs_build_system_prompt(const VSContext *c){
     const char *solaris=
         "SOLARIS POLICY: This host is SunOS/Solaris. Treat command-line utilities as Solaris/POSIX unless GNU behavior has been explicitly verified. Do not assume GNU-only options such as grep -P, sed -i/-r, find -printf, stat -c, readlink -f, date -d, xargs -r, or Linux-only commands such as systemctl, ip, apt, dnf, free, or nproc. Prefer VibeSolaris read/list/search whenever they can replace those utilities. For shell work use POSIX syntax; /usr/xpg4/bin/sh is preferred when available, /usr/xpg4/bin/grep supports -E/-F, and /usr/xpg4/bin/awk or nawk is preferable to old /usr/bin/awk. Solaris administration commonly uses svcs/svcadm, ipadm/dladm/netstat, pkg, psrinfo/isainfo/prtconf, pfiles/pargs/pldd, truss, and elfdump. Use Solaris make unless the project truly requires GNU make; probe gmake or /usr/gnu/bin before relying on GNU extensions.\n";
     const char *platform=(!strcmp(c->os_name,"SunOS")||strstr(c->os_name,"Solaris"))?solaris:"";
-    char *mcp=vs_mcp_prompt_fragment(c);size_t n=strlen(base)+strlen(platform)+strlen(c->agent_md)+strlen(c->os_name)+strlen(c->os_release)+strlen(c->arch)+strlen(c->cwd)+strlen(vs_command_shell_name())+(mcp?strlen(mcp):0)+1024;char *o=(char*)malloc(n);
+    const char *subdoc=(c->subagent_depth<VS_MAX_SUBAGENT_DEPTH&&c->subagent_serial<VS_MAX_SUBAGENTS_PER_TURN)?
+        "SUBAGENTS: [[VS_TOOL subagent task=\"COMPLETE SELF-CONTAINED TASK\"]] starts an isolated agent with the same tools and returns its report as SUBAGENT_RESULT. Give it the full task text, because it cannot see this conversation. Use it to keep your own context small for self-contained investigations; do not use it for work you can finish in one step.\n\n":"";
+    char *mcp=vs_mcp_prompt_fragment(c);size_t n=strlen(base)+strlen(platform)+strlen(subdoc)+strlen(c->agent_md)+strlen(c->os_name)+strlen(c->os_release)+strlen(c->arch)+strlen(c->cwd)+strlen(vs_command_shell_name())+(mcp?strlen(mcp):0)+1024;char *o=(char*)malloc(n);
     if(!o){if(mcp)free(mcp);return NULL;}
-    snprintf(o,n,"%s%sHost OS: %s %s\nCPU architecture: %s\nCommand shell: %s\nWorking directory: %s\n\nAGENT.MD:\n%s\n\nMCP TOOLS:\n%s\n",base,platform,c->os_name,c->os_release,c->arch,vs_command_shell_name(),c->cwd,c->agent_md[0]?c->agent_md:"(none)",mcp?mcp:"(none)");if(mcp)free(mcp);return o;
+    snprintf(o,n,"%s%s%sHost OS: %s %s\nCPU architecture: %s\nCommand shell: %s\nWorking directory: %s\n\nAGENT.MD:\n%s\n\nMCP TOOLS:\n%s\n",base,platform,subdoc,c->os_name,c->os_release,c->arch,vs_command_shell_name(),c->cwd,c->agent_md[0]?c->agent_md:"(none)",mcp?mcp:"(none)");if(mcp)free(mcp);return o;
 }
 
 static int add_openai_msg(VSBuf *b,const char *role,const char *content,int *first){
@@ -211,7 +213,7 @@ char *vs_chat(VSContext *c,const char *user){
     char *sys=vs_build_system_prompt(c),*body,*resp,*out,*u,*endpoint;
     const char *h[5];
     char auth[VS_OAUTH_TOKEN_MAX+64],apiheader[VS_OAUTH_TOKEN_MAX+64],oauth_err[512];
-    const char *credential;long status=0;int nh=0;
+    const char *credential;long status=0;int nh=0;int use_claude_oauth=0;
     c->provider_cached_tokens=0;c->provider_cache_write_tokens=0;c->provider_input_tokens=0;c->provider_output_tokens=0;c->provider_total_tokens=0;vs_refresh_cache_key(c);
     { char tb[512]; snprintf(tb,sizeof(tb),"provider=%s protocol=%s model=%s",c->provider.name,vs_protocol_name(c->provider.protocol),c->provider.model); vs_trace(c,"model-request",tb); }
 
@@ -237,9 +239,19 @@ char *vs_chat(VSContext *c,const char *user){
         if(vs_oauth_ensure_access_token(c,oauth_err,sizeof(oauth_err))==0) credential=c->oauth.access_token;
         else if(!credential[0]){free(sys);return dupstr(oauth_err[0]?oauth_err:"OAuth access token is unavailable");}
     }
+    /* Claude OAuth: only for the native Anthropic protocol, and only towards the
+       official api.anthropic.com endpoint so a bearer token never leaves Anthropic. */
+    if(c->provider.kind==VS_PROVIDER_CLAUDE && c->provider.protocol==VS_PROTOCOL_ANTHROPIC && c->claude_oauth.access_token[0] && vs_claude_oauth_bearer_url_ok(c->provider.base_url)){
+        oauth_err[0]=0;
+        if(vs_oauth_ensure_access_token_for(c,VS_OAUTH_CLAUDE,oauth_err,sizeof(oauth_err))==0){credential=c->claude_oauth.access_token;use_claude_oauth=1;vs_trace(c,"auth","using Claude OAuth session");}
+        else if(!credential[0]){free(sys);return dupstr(oauth_err[0]?oauth_err:"Claude OAuth access token is unavailable");}
+    }
     if(!credential[0]){
         free(sys);
-        return dupstr(c->provider.kind==VS_PROVIDER_OPENAI?"No OpenAI credential configured. Enter an API key or complete OAuth login.":"No API key configured for the selected provider.");
+        if(c->provider.kind==VS_PROVIDER_OPENAI)return dupstr("No OpenAI credential configured. Enter an API key or complete OAuth login.");
+        if(c->provider.kind==VS_PROVIDER_CLAUDE && c->claude_oauth.access_token[0] && !vs_claude_oauth_bearer_url_ok(c->provider.base_url))return dupstr("Claude OAuth is only sent to https://api.anthropic.com. Use an Anthropic API key for this base URL.");
+        if(c->provider.kind==VS_PROVIDER_CLAUDE)return dupstr("No Claude API key or Claude OAuth session configured.");
+        return dupstr("No API key configured for the selected provider.");
     }
 
     endpoint=request_url(c->provider.base_url,c->provider.protocol);
@@ -249,7 +261,7 @@ char *vs_chat(VSContext *c,const char *user){
         body=build_claude_body(c,sys,user);
         if(!body){free(endpoint);free(sys);return dupstr(vs_cancel_requested(c)?"Stopped by user.":"Request is too large or memory is exhausted; reduce attachments/context and retry.");}
         h[nh++]="Content-Type: application/json";
-        if(c->provider.kind==VS_PROVIDER_CLAUDE || c->provider.kind==VS_PROVIDER_DEEPSEEK){
+        if((c->provider.kind==VS_PROVIDER_CLAUDE && !use_claude_oauth) || c->provider.kind==VS_PROVIDER_DEEPSEEK){
             snprintf(apiheader,sizeof(apiheader),"x-api-key: %s",credential);h[nh++]=apiheader;
         }else{
             snprintf(auth,sizeof(auth),"Authorization: Bearer %s",credential);h[nh++]=auth;

@@ -208,28 +208,115 @@ static char *form4(const char *k1,const char *v1,const char *k2,const char *v2,c
     free(a1);free(a2);free(a3);free(a4);free(a5);return o;
 }
 
-static int apply_token_response(VSContext *ctx,const char *json,int preserve_refresh,char *err,size_t errcap)
+/* ------------------------------------------------------------------------
+ * Provider-scoped OAuth.
+ *
+ * VS_OAUTH_OPENAI keeps the original behaviour (including the plain-text
+ * compatibility profile).  VS_OAUTH_CLAUDE is a separate credential slot with
+ * stricter rules, described in OAUTH.md ("Claude OAuth and compliance").
+ * ---------------------------------------------------------------------- */
+
+#define OAUTH_CLAUDE_DEFAULT_REDIRECT "http://127.0.0.1:14556/callback"
+
+/* Anthropic's first-party Claude Code client.  Its tokens are issued for
+   Claude Pro/Max subscription use in Claude Code and claude.ai, and Anthropic's
+   terms do not permit third-party products to use them.  Refusing this ID is a
+   guard rail, not the primary control: the primary control is that VibeSolaris
+   only uses a client ID that Anthropic issues to VibeSolaris. */
+static const char CLAUDE_CONSUMER_CLIENT_ID[]="9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+
+/* Claude OAuth endpoints may only live on Anthropic's API/Console hosts.  The
+   claude.ai consumer login host is deliberately absent. */
+static const char *CLAUDE_ALLOWED_HOSTS[]={"api.anthropic.com","console.anthropic.com",NULL};
+
+static int ascii_ieq(const char *a,const char *b)
 {
+    unsigned char x,y;
+    if(!a||!b)return 0;
+    for(;;){
+        x=(unsigned char)*a++;y=(unsigned char)*b++;
+        if(tolower(x)!=tolower(y))return 0;
+        if(!x)return 1;
+    }
+}
+
+static const VSOAuthConfig *cfg_of(const VSContext *ctx,VSOAuthProvider which)
+{
+    return which==VS_OAUTH_CLAUDE?&ctx->claude_oauth:&ctx->oauth;
+}
+
+VSOAuthConfig *vs_oauth_config(VSContext *ctx,VSOAuthProvider which)
+{
+    if(!ctx)return NULL;
+    return which==VS_OAUTH_CLAUDE?&ctx->claude_oauth:&ctx->oauth;
+}
+
+static int https_url_on_allowed_host(const char *url,const char *what,char *err,size_t errcap)
+{
+    const char *auth,*auth_end,*host_end;size_t hn;char host[128],b[256];int i;
+    if(!url||strncmp(url,"https://",8)!=0){snprintf(b,sizeof(b),"Claude OAuth %s must start with https://",what);setmsg(err,errcap,b);return -1;}
+    auth=url+8;auth_end=auth+strcspn(auth,"/?#");
+    if(auth_end==auth||memchr(auth,'@',(size_t)(auth_end-auth))){snprintf(b,sizeof(b),"Claude OAuth %s has an invalid host",what);setmsg(err,errcap,b);return -1;}
+    host_end=(const char*)memchr(auth,':',(size_t)(auth_end-auth));if(!host_end)host_end=auth_end;
+    hn=(size_t)(host_end-auth);if(hn>=sizeof(host)){snprintf(b,sizeof(b),"Claude OAuth %s has an invalid host",what);setmsg(err,errcap,b);return -1;}
+    memcpy(host,auth,hn);host[hn]=0;
+    for(i=0;CLAUDE_ALLOWED_HOSTS[i];i++)if(ascii_ieq(host,CLAUDE_ALLOWED_HOSTS[i]))return 0;
+    snprintf(b,sizeof(b),"Claude OAuth %s host '%.80s' is not an Anthropic API/Console host. Claude.ai consumer login cannot be used by third-party apps.",what,host);
+    setmsg(err,errcap,b);return -1;
+}
+
+/* Returns 0 when the configuration is allowed to run a Claude OAuth flow. */
+int vs_claude_oauth_policy_check(const VSOAuthConfig *cfg,char *err,size_t errcap)
+{
+    if(!cfg){setmsg(err,errcap,"Claude OAuth configuration is missing");return -1;}
+    if(!cfg->client_id[0]){setmsg(err,errcap,"Claude OAuth needs the Client ID that Anthropic issues to VibeSolaris");return -1;}
+    if(ascii_ieq(cfg->client_id,CLAUDE_CONSUMER_CLIENT_ID)){
+        setmsg(err,errcap,"That Client ID belongs to Anthropic's Claude Code subscription login, which VibeSolaris must not use. Enter the Client ID Anthropic issues to VibeSolaris, or use an Anthropic API key.");
+        return -1;
+    }
+    if(!cfg->scopes[0]){setmsg(err,errcap,"Claude OAuth needs the exact scopes Anthropic issued to VibeSolaris");return -1;}
+    if(https_url_on_allowed_host(cfg->authorize_url,"authorisation URL",err,errcap)!=0)return -1;
+    if(https_url_on_allowed_host(cfg->token_url,"token URL",err,errcap)!=0)return -1;
+    return 0;
+}
+
+/* Claude OAuth bearer tokens may only be sent to the official Messages API. */
+int vs_claude_oauth_bearer_url_ok(const char *url)
+{
+    static const char pfx[]="https://api.anthropic.com";
+    size_t n=sizeof(pfx)-1;
+    if(!url||strncmp(url,pfx,n)!=0)return 0;
+    return url[n]==0||url[n]=='/';
+}
+
+static int apply_token_response(VSContext *ctx,VSOAuthProvider which,const char *json,int preserve_refresh,char *err,size_t errcap)
+{
+    VSOAuthConfig *cfg=vs_oauth_config(ctx,which);
     char *access,*refresh,*type,*em;long expires;
     access=json_string_field(json,"access_token");if(!access){em=json_string_field(json,"error_description");if(!em)em=json_string_field(json,"error");if(em){setmsg(err,errcap,em);free(em);}else setmsg(err,errcap,"Token endpoint did not return access_token");return -1;}
     refresh=json_string_field(json,"refresh_token");type=json_string_field(json,"token_type");expires=json_long_field(json,"expires_in");
-    copyv(ctx->oauth.access_token,sizeof(ctx->oauth.access_token),access);
-    if(refresh)copyv(ctx->oauth.refresh_token,sizeof(ctx->oauth.refresh_token),refresh);else if(!preserve_refresh)ctx->oauth.refresh_token[0]=0;
-    copyv(ctx->oauth.token_type,sizeof(ctx->oauth.token_type),type?type:"Bearer");
-    ctx->oauth.expires_at=expires>0?(long)time(NULL)+expires:0;
-    free(access);free(refresh);free(type);(void)vs_oauth_save_profile(ctx);(void)vs_persist_settings(ctx);return 0;
+    copyv(cfg->access_token,sizeof(cfg->access_token),access);
+    if(refresh)copyv(cfg->refresh_token,sizeof(cfg->refresh_token),refresh);else if(!preserve_refresh)cfg->refresh_token[0]=0;
+    copyv(cfg->token_type,sizeof(cfg->token_type),type?type:"Bearer");
+    cfg->expires_at=expires>0?(long)time(NULL)+expires:0;
+    free(access);free(refresh);free(type);
+    /* Claude tokens are written only to the encrypted configuration store. */
+    if(which==VS_OAUTH_OPENAI)(void)vs_oauth_save_profile(ctx);
+    (void)vs_persist_settings(ctx);return 0;
 }
 
-static int exchange_code(VSContext *ctx,const char *code,const char *verifier,char *err,size_t errcap)
+static int exchange_code(VSContext *ctx,VSOAuthProvider which,const char *code,const char *verifier,char *err,size_t errcap)
 {
+    VSOAuthConfig *cfg=vs_oauth_config(ctx,which);
     char *form,*resp;const char *h[2];long status;
-    form=form4("grant_type","authorization_code","client_id",ctx->oauth.client_id,"code",code,"redirect_uri",ctx->oauth.redirect_uri,"code_verifier",verifier);
+    if(which==VS_OAUTH_CLAUDE&&vs_claude_oauth_policy_check(cfg,err,errcap)!=0)return -1;
+    form=form4("grant_type","authorization_code","client_id",cfg->client_id,"code",code,"redirect_uri",cfg->redirect_uri,"code_verifier",verifier);
     if(!form){setmsg(err,errcap,"Out of memory creating token request");return -1;}
     h[0]="Content-Type: application/x-www-form-urlencoded";h[1]="Accept: application/json";status=0;
-    resp=vs_http_post_ctx(ctx,ctx->oauth.token_url,h,2,form,&status);free(form);
+    resp=vs_http_post_ctx(ctx,cfg->token_url,h,2,form,&status);free(form);
     if(!resp){setmsg(err,errcap,"Token endpoint request failed");return -1;}
     if(status<200||status>=300){char b[512];snprintf(b,sizeof(b),"Token endpoint returned HTTP %ld: %.360s",status,resp);setmsg(err,errcap,b);free(resp);return -1;}
-    if(apply_token_response(ctx,resp,0,err,errcap)!=0){free(resp);return -1;}free(resp);return 0;
+    if(apply_token_response(ctx,which,resp,0,err,errcap)!=0){free(resp);return -1;}free(resp);return 0;
 }
 
 static void browser_reply(int fd,int ok,const char *detail)
@@ -247,17 +334,40 @@ void vs_oauth_defaults(VSContext *ctx)
     memset(&ctx->oauth,0,sizeof(ctx->oauth));
     copyv(ctx->oauth.redirect_uri,sizeof(ctx->oauth.redirect_uri),OAUTH_DEFAULT_REDIRECT);
     copyv(ctx->oauth.token_type,sizeof(ctx->oauth.token_type),"Bearer");
+    memset(&ctx->claude_oauth,0,sizeof(ctx->claude_oauth));
+    copyv(ctx->claude_oauth.redirect_uri,sizeof(ctx->claude_oauth.redirect_uri),OAUTH_CLAUDE_DEFAULT_REDIRECT);
+    copyv(ctx->claude_oauth.token_type,sizeof(ctx->claude_oauth.token_type),"Bearer");
+}
+
+int vs_oauth_is_configured_for(const VSContext *ctx,VSOAuthProvider which)
+{
+    const VSOAuthConfig *cfg;
+    if(!ctx)return 0;
+    cfg=cfg_of(ctx,which);
+    return cfg->client_id[0]&&cfg->authorize_url[0]&&cfg->token_url[0]&&cfg->redirect_uri[0];
+}
+
+int vs_oauth_is_signed_in_for(const VSContext *ctx,VSOAuthProvider which)
+{
+    const VSOAuthConfig *cfg;long now;
+    if(!ctx)return 0;
+    cfg=cfg_of(ctx,which);
+    if(!cfg->access_token[0])return 0;
+    if(cfg->expires_at==0)return 1;
+    now=(long)time(NULL);return cfg->expires_at>now;
 }
 
 int vs_oauth_is_configured(const VSContext *ctx)
 {
-    return ctx&&ctx->oauth.client_id[0]&&ctx->oauth.authorize_url[0]&&ctx->oauth.token_url[0]&&ctx->oauth.redirect_uri[0];
+    return vs_oauth_is_configured_for(ctx,VS_OAUTH_OPENAI);
 }
 
 int vs_oauth_is_signed_in(const VSContext *ctx)
 {
-    long now;if(!ctx||!ctx->oauth.access_token[0])return 0;if(ctx->oauth.expires_at==0)return 1;now=(long)time(NULL);return ctx->oauth.expires_at>now;
+    return vs_oauth_is_signed_in_for(ctx,VS_OAUTH_OPENAI);
 }
+
+/* ---- OpenAI compatibility profile (plain text, unchanged behaviour) ---- */
 
 const char *vs_oauth_profile_path(void)
 {
@@ -311,25 +421,35 @@ int vs_oauth_load_profile(VSContext *ctx)
     fclose(f);return 0;
 }
 
-int vs_oauth_begin(VSContext *ctx,VSOAuthFlow *flow,char *url_out,size_t url_cap,char *err,size_t errcap)
+/* ---- Authorisation Code + PKCE flow ---- */
+
+int vs_oauth_begin_for(VSContext *ctx,VSOAuthProvider which,VSOAuthFlow *flow,char *url_out,size_t url_cap,char *err,size_t errcap)
 {
-    RedirectParts r;unsigned char rv[48],st[24],digest[32];char *ver,*state,*challenge,*cid,*redir,*scope,*auth;size_t n;int fd;const char *sep;
+    VSOAuthConfig *cfg;RedirectParts r;unsigned char rv[48],st[24],digest[32];char *ver,*state,*challenge,*cid,*redir,*scope,*auth;size_t n;int fd;const char *sep;
     if(err&&errcap)err[0]=0;
     if(!ctx||!flow){setmsg(err,errcap,"Invalid OAuth state");return -1;}
-    if(!vs_oauth_is_configured(ctx)){setmsg(err,errcap,"OAuth is not configured: enter Client ID, authorisation URL, token URL, and redirect URI");return -1;}
-    if(parse_redirect(ctx->oauth.redirect_uri,&r,err,errcap)!=0)return -1;
+    if(!vs_oauth_is_configured_for(ctx,which)){setmsg(err,errcap,"OAuth is not configured: enter Client ID, authorisation URL, token URL, and redirect URI");return -1;}
+    cfg=vs_oauth_config(ctx,which);
+    if(which==VS_OAUTH_CLAUDE&&vs_claude_oauth_policy_check(cfg,err,errcap)!=0)return -1;
+    if(parse_redirect(cfg->redirect_uri,&r,err,errcap)!=0)return -1;
     if(random_bytes(rv,sizeof(rv))!=0||random_bytes(st,sizeof(st))!=0){setmsg(err,errcap,"Secure random source unavailable (/dev/urandom or /dev/random required)");return -1;}
     ver=base64url_bytes(rv,sizeof(rv));state=base64url_bytes(st,sizeof(st));if(!ver||!state){free(ver);free(state);setmsg(err,errcap,"Out of memory creating PKCE values");return -1;}
     vs_sha256((const unsigned char*)ver,strlen(ver),digest);challenge=base64url_bytes(digest,sizeof(digest));if(!challenge){free(ver);free(state);setmsg(err,errcap,"Out of memory creating PKCE challenge");return -1;}
-    cid=url_encode(ctx->oauth.client_id);redir=url_encode(ctx->oauth.redirect_uri);scope=url_encode(ctx->oauth.scopes);if(!cid||!redir||!scope){free(ver);free(state);free(challenge);free(cid);free(redir);free(scope);setmsg(err,errcap,"Out of memory creating authorisation URL");return -1;}
-    sep=strchr(ctx->oauth.authorize_url,'?')?"&":"?";n=strlen(ctx->oauth.authorize_url)+strlen(cid)+strlen(redir)+strlen(scope)+strlen(state)+strlen(challenge)+192;auth=(char*)malloc(n);
+    cid=url_encode(cfg->client_id);redir=url_encode(cfg->redirect_uri);scope=url_encode(cfg->scopes);if(!cid||!redir||!scope){free(ver);free(state);free(challenge);free(cid);free(redir);free(scope);setmsg(err,errcap,"Out of memory creating authorisation URL");return -1;}
+    sep=strchr(cfg->authorize_url,'?')?"&":"?";n=strlen(cfg->authorize_url)+strlen(cid)+strlen(redir)+strlen(scope)+strlen(state)+strlen(challenge)+192;auth=(char*)malloc(n);
     if(!auth){free(ver);free(state);free(challenge);free(cid);free(redir);free(scope);setmsg(err,errcap,"Out of memory creating authorisation URL");return -1;}
-    snprintf(auth,n,"%s%sresponse_type=code&client_id=%s&redirect_uri=%s&scope=%s&state=%s&code_challenge=%s&code_challenge_method=S256",ctx->oauth.authorize_url,sep,cid,redir,scope,state,challenge);
+    snprintf(auth,n,"%s%sresponse_type=code&client_id=%s&redirect_uri=%s&scope=%s&state=%s&code_challenge=%s&code_challenge_method=S256",cfg->authorize_url,sep,cid,redir,scope,state,challenge);
     fd=make_listener(&r,err,errcap);if(fd<0){free(ver);free(state);free(challenge);free(cid);free(redir);free(scope);free(auth);return -1;}
-    memset(flow,0,sizeof(*flow));flow->active=1;flow->listener_fd=fd;flow->port=r.port;flow->started_at=(long)time(NULL);copyv(flow->state,sizeof(flow->state),state);copyv(flow->verifier,sizeof(flow->verifier),ver);copyv(flow->redirect_uri,sizeof(flow->redirect_uri),ctx->oauth.redirect_uri);copyv(flow->callback_path,sizeof(flow->callback_path),r.path);
+    memset(flow,0,sizeof(*flow));flow->active=1;flow->listener_fd=fd;flow->port=r.port;flow->started_at=(long)time(NULL);flow->provider=which;
+    copyv(flow->state,sizeof(flow->state),state);copyv(flow->verifier,sizeof(flow->verifier),ver);copyv(flow->redirect_uri,sizeof(flow->redirect_uri),cfg->redirect_uri);copyv(flow->callback_path,sizeof(flow->callback_path),r.path);
     if(url_out&&url_cap)copyv(url_out,url_cap,auth);
     if(vs_open_url(auth)!=0)setmsg(err,errcap,"OAuth listener started, but no browser launcher was found; open the authorisation URL manually");
     free(ver);free(state);free(challenge);free(cid);free(redir);free(scope);free(auth);return 0;
+}
+
+int vs_oauth_begin(VSContext *ctx,VSOAuthFlow *flow,char *url_out,size_t url_cap,char *err,size_t errcap)
+{
+    return vs_oauth_begin_for(ctx,VS_OAUTH_OPENAI,flow,url_out,url_cap,err,errcap);
 }
 
 void vs_oauth_cancel(VSOAuthFlow *flow)
@@ -341,7 +461,7 @@ void vs_oauth_cancel(VSOAuthFlow *flow)
 
 int vs_oauth_poll(VSContext *ctx,VSOAuthFlow *flow,char *msg,size_t msgcap)
 {
-    int fd,n;char req[16384],method[16],target[8192],version[32];char *code,*state,*oautherr,*desc;long now;
+    int fd,n;char req[16384],method[16],target[8192],version[32];char *code,*state,*oautherr,*desc;long now;VSOAuthProvider which;
     if(msg&&msgcap)msg[0]=0;
     if(!ctx||!flow||!flow->active){setmsg(msg,msgcap,"No OAuth login is active");return -1;}
     now=(long)time(NULL);if(now-flow->started_at>OAUTH_TIMEOUT_SECONDS){vs_oauth_cancel(flow);setmsg(msg,msgcap,"OAuth login timed out after 5 minutes");return -1;}
@@ -349,41 +469,83 @@ int vs_oauth_poll(VSContext *ctx,VSOAuthFlow *flow,char *msg,size_t msgcap)
     n=(int)read(fd,req,sizeof(req)-1);if(n<=0){close(fd);return 0;}req[n]=0;method[0]=target[0]=version[0]=0;
     if(sscanf(req,"%15s %8191s %31s",method,target,version)!=3||strcmp(method,"GET")){browser_reply(fd,0,"Invalid callback request.");close(fd);vs_oauth_cancel(flow);setmsg(msg,msgcap,"Invalid OAuth callback request");return -1;}
     if(strncmp(target,flow->callback_path,strlen(flow->callback_path))){browser_reply(fd,0,"Unexpected callback path.");close(fd);return 0;}
+    which=flow->provider;
     oautherr=query_value(target,"error");desc=query_value(target,"error_description");if(oautherr){char b[512];snprintf(b,sizeof(b),"OAuth authorisation failed: %s%s%s",oautherr,desc?" - ":"",desc?desc:"");browser_reply(fd,0,b);close(fd);free(oautherr);free(desc);vs_oauth_cancel(flow);setmsg(msg,msgcap,b);return -1;}free(desc);
     code=query_value(target,"code");state=query_value(target,"state");if(!code||!state||strcmp(state,flow->state)){browser_reply(fd,0,"State validation failed.");close(fd);free(code);free(state);vs_oauth_cancel(flow);setmsg(msg,msgcap,"OAuth callback state validation failed");return -1;}
     browser_reply(fd,1,"The authorisation code was received securely.");close(fd);
-    if(exchange_code(ctx,code,flow->verifier,msg,msgcap)!=0){free(code);free(state);vs_oauth_cancel(flow);return -1;}
-    free(code);free(state);vs_oauth_cancel(flow);setmsg(msg,msgcap,"Signed in with OAuth; access token stored in ~/.vibesolaris/oauth.conf with mode 0600");return 1;
+    if(exchange_code(ctx,which,code,flow->verifier,msg,msgcap)!=0){free(code);free(state);vs_oauth_cancel(flow);return -1;}
+    free(code);free(state);vs_oauth_cancel(flow);
+    setmsg(msg,msgcap,which==VS_OAUTH_CLAUDE?"Signed in with Claude OAuth; tokens are stored only in the encrypted VibeSolaris configuration":"Signed in with OAuth; access token stored in ~/.vibesolaris/oauth.conf with mode 0600");
+    return 1;
 }
 
-int vs_oauth_login_blocking(VSContext *ctx,char *msg,size_t msgcap)
+int vs_oauth_login_blocking_for(VSContext *ctx,VSOAuthProvider which,char *msg,size_t msgcap)
 {
     VSOAuthFlow f;char url[4096],warn[512];fd_set r;struct timeval tv;int rc,maxfd;
-    memset(&f,0,sizeof(f));f.listener_fd=-1;warn[0]=0;if(vs_oauth_begin(ctx,&f,url,sizeof(url),warn,sizeof(warn))!=0){setmsg(msg,msgcap,warn);return -1;}
+    memset(&f,0,sizeof(f));f.listener_fd=-1;warn[0]=0;
+    if(vs_oauth_begin_for(ctx,which,&f,url,sizeof(url),warn,sizeof(warn))!=0){setmsg(msg,msgcap,warn);return -1;}
     if(warn[0])fprintf(stderr,"%s\nAuthorisation URL:\n%s\n",warn,url);
     while(f.active){FD_ZERO(&r);FD_SET(f.listener_fd,&r);maxfd=f.listener_fd;tv.tv_sec=1;tv.tv_usec=0;rc=select(maxfd+1,&r,NULL,NULL,&tv);if(rc<0&&errno!=EINTR){vs_oauth_cancel(&f);setmsg(msg,msgcap,"OAuth wait failed");return -1;}rc=vs_oauth_poll(ctx,&f,msg,msgcap);if(rc!=0)return rc;}
     setmsg(msg,msgcap,"OAuth login ended");return -1;
 }
 
+int vs_oauth_login_blocking(VSContext *ctx,char *msg,size_t msgcap)
+{
+    return vs_oauth_login_blocking_for(ctx,VS_OAUTH_OPENAI,msg,msgcap);
+}
+
+int vs_oauth_refresh_for(VSContext *ctx,VSOAuthProvider which,char *err,size_t errcap)
+{
+    VSOAuthConfig *cfg;char *form,*resp;const char *h[2];long status;
+    if(!ctx){setmsg(err,errcap,"Invalid OAuth state");return -1;}
+    cfg=vs_oauth_config(ctx,which);
+    if(!cfg->refresh_token[0]){setmsg(err,errcap,"No OAuth refresh token is available");return -1;}
+    if(!cfg->token_url[0]||!cfg->client_id[0]){setmsg(err,errcap,"OAuth token endpoint or client ID is missing");return -1;}
+    if(which==VS_OAUTH_CLAUDE&&vs_claude_oauth_policy_check(cfg,err,errcap)!=0)return -1;
+    form=form4("grant_type","refresh_token","client_id",cfg->client_id,"refresh_token",cfg->refresh_token,"scope",cfg->scopes,NULL,NULL);
+    if(!form){setmsg(err,errcap,"Out of memory creating refresh request");return -1;}
+    h[0]="Content-Type: application/x-www-form-urlencoded";h[1]="Accept: application/json";status=0;
+    resp=vs_http_post_ctx(ctx,cfg->token_url,h,2,form,&status);free(form);
+    if(!resp){setmsg(err,errcap,"OAuth refresh request failed");return -1;}
+    if(status<200||status>=300){char b[512];snprintf(b,sizeof(b),"OAuth refresh returned HTTP %ld: %.360s",status,resp);setmsg(err,errcap,b);free(resp);return -1;}
+    if(apply_token_response(ctx,which,resp,1,err,errcap)!=0){free(resp);return -1;}
+    free(resp);setmsg(err,errcap,"");return 0;
+}
+
 int vs_oauth_refresh(VSContext *ctx,char *err,size_t errcap)
 {
-    char *form,*resp;const char *h[2];long status;
-    if(!ctx||!ctx->oauth.refresh_token[0]){setmsg(err,errcap,"No OAuth refresh token is available");return -1;}if(!ctx->oauth.token_url[0]||!ctx->oauth.client_id[0]){setmsg(err,errcap,"OAuth token endpoint or client ID is missing");return -1;}
-    form=form4("grant_type","refresh_token","client_id",ctx->oauth.client_id,"refresh_token",ctx->oauth.refresh_token,"scope",ctx->oauth.scopes,NULL,NULL);if(!form){setmsg(err,errcap,"Out of memory creating refresh request");return -1;}
-    h[0]="Content-Type: application/x-www-form-urlencoded";h[1]="Accept: application/json";status=0;resp=vs_http_post_ctx(ctx,ctx->oauth.token_url,h,2,form,&status);free(form);
-    if(!resp){setmsg(err,errcap,"OAuth refresh request failed");return -1;}if(status<200||status>=300){char b[512];snprintf(b,sizeof(b),"OAuth refresh returned HTTP %ld: %.360s",status,resp);setmsg(err,errcap,b);free(resp);return -1;}
-    if(apply_token_response(ctx,resp,1,err,errcap)!=0){free(resp);return -1;}free(resp);setmsg(err,errcap,"");return 0;
+    return vs_oauth_refresh_for(ctx,VS_OAUTH_OPENAI,err,errcap);
+}
+
+int vs_oauth_ensure_access_token_for(VSContext *ctx,VSOAuthProvider which,char *err,size_t errcap)
+{
+    const VSOAuthConfig *cfg;long now;
+    if(!ctx){setmsg(err,errcap,"Invalid OAuth state");return -1;}
+    cfg=cfg_of(ctx,which);
+    if(!cfg->access_token[0]){setmsg(err,errcap,"No OAuth access token is available");return -1;}
+    now=(long)time(NULL);
+    if(cfg->expires_at==0||cfg->expires_at>now+60)return 0;
+    return vs_oauth_refresh_for(ctx,which,err,errcap);
 }
 
 int vs_oauth_ensure_access_token(VSContext *ctx,char *err,size_t errcap)
 {
-    long now;if(!ctx||!ctx->oauth.access_token[0]){setmsg(err,errcap,"No OAuth access token is available");return -1;}now=(long)time(NULL);if(ctx->oauth.expires_at==0||ctx->oauth.expires_at>now+60)return 0;return vs_oauth_refresh(ctx,err,errcap);
+    return vs_oauth_ensure_access_token_for(ctx,VS_OAUTH_OPENAI,err,errcap);
+}
+
+void vs_oauth_logout_for(VSContext *ctx,VSOAuthProvider which)
+{
+    VSOAuthConfig *cfg;
+    if(!ctx)return;
+    cfg=vs_oauth_config(ctx,which);
+    cfg->access_token[0]=0;cfg->refresh_token[0]=0;
+    copyv(cfg->token_type,sizeof(cfg->token_type),"Bearer");
+    cfg->expires_at=0;
+    if(which==VS_OAUTH_OPENAI)(void)vs_oauth_save_profile(ctx);
+    (void)vs_persist_settings(ctx);
 }
 
 void vs_oauth_logout(VSContext *ctx)
 {
-    if(!ctx)return;
-    ctx->oauth.access_token[0]=0;ctx->oauth.refresh_token[0]=0;
-    copyv(ctx->oauth.token_type,sizeof(ctx->oauth.token_type),"Bearer");
-    ctx->oauth.expires_at=0;(void)vs_oauth_save_profile(ctx);(void)vs_persist_settings(ctx);
+    vs_oauth_logout_for(ctx,VS_OAUTH_OPENAI);
 }

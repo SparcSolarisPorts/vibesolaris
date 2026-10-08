@@ -847,6 +847,10 @@ The optional `setup-system-config.sh` exists only for administrators who intenti
 
 See `SECURITY.md`.
 
+## Subagents
+
+The agent can delegate a focused task to an isolated subagent, and you can start one with `/subagent TASK` in the TUI or GUI. Subagent activity appears in the activity trace with a `[sub#N dK]` prefix. See `SUBAGENTS.md`.
+
 ## OAuth
 
 VibeSolaris contains a generic native-app OAuth 2.0 Authorisation Code + PKCE implementation with:
