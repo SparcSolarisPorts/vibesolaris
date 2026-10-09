@@ -95,7 +95,7 @@ static void capture_usage(VSContext *c,const char *json){
         vs_trace(c,"usage",b);
     }
 }
-static int gpt56plus(const char *m){double v;if(!m||strncmp(m,"gpt-",4))return 0;v=atof(m+4);return v>=5.6;}
+static int gpt5plus(const char *m){double v;if(!m||strncmp(m,"gpt-",4))return 0;v=atof(m+4);return v>=5.0;}
 static const char *mime_for(const char *path){const char *e=strrchr(path,'.');if(!e)return "image/png";e++;if(!strcmp(e,"jpg")||!strcmp(e,"jpeg")||!strcmp(e,"JPG")||!strcmp(e,"JPEG"))return "image/jpeg";if(!strcmp(e,"gif")||!strcmp(e,"GIF"))return "image/gif";if(!strcmp(e,"webp")||!strcmp(e,"WEBP"))return "image/webp";return "image/png";}
 
 static char *request_url(const char *base,VSProtocolKind protocol){
@@ -153,7 +153,7 @@ static char *build_openai_body(VSContext *c,const char *sys,const char *user){
     if(binit(&b,8192)!=0)return NULL;
     if(vs_cancel_requested(c)){free(b.p);return NULL;}
     badd(&b,"{\"model\":");bquoted(&b,c->provider.model);badd(&b,",\"messages\":[");
-    if(c->provider.kind==VS_PROVIDER_OPENAI && c->cache_enabled && gpt56plus(c->provider.model)){
+    if(c->cache_enabled && gpt5plus(c->provider.model)){
         first=0;badd(&b,"{\"role\":\"system\",\"content\":[{\"type\":\"text\",\"text\":");bquoted(&b,sys);badd(&b,",\"prompt_cache_breakpoint\":{\"mode\":\"explicit\"}}]}");
     } else add_openai_msg(&b,"system",sys,&first);
     for(i=0;i<c->history_count;i++){if(vs_cancel_requested(c)){free(b.p);return NULL;}add_openai_msg(&b,c->history[i].role,c->history[i].content,&first);}
@@ -167,7 +167,7 @@ static char *build_openai_body(VSContext *c,const char *sys,const char *user){
         else {t=vs_cached_read_file(c,c->attachments[i].path);if(t){t=bounded_attachment(c,t,c->attachments[i].path);if(!t)continue;e=vs_json_escape(t);badd(&b,",{\"type\":\"text\",\"text\":\"Attached file: ");x=vs_json_escape(c->attachments[i].path);badd(&b,x);free(x);badd(&b,"\\n");badd(&b,e);badd(&b,"\"}");free(e);free(t);}}
     }
     badd(&b,"]}]");
-    if(c->provider.kind==VS_PROVIDER_OPENAI && c->cache_enabled){badd(&b,",\"prompt_cache_key\":");bquoted(&b,c->cache_key);if(gpt56plus(c->provider.model))badd(&b,",\"prompt_cache_options\":{\"mode\":\"implicit\",\"ttl\":\"30m\"}");}
+    if(c->cache_enabled){badd(&b,",\"prompt_cache_key\":");bquoted(&b,c->cache_key);if(gpt5plus(c->provider.model))badd(&b,",\"prompt_cache_options\":{\"mode\":\"implicit\",\"ttl\":\"30m\"}");}
     badd(&b,",\"temperature\":0.2}");return bfinish(c,&b);
 }
 
@@ -176,10 +176,11 @@ static char *build_claude_body(VSContext *c,const char *sys,const char *user){
     if(binit(&b,8192)!=0)return NULL;
     if(vs_cancel_requested(c)){free(b.p);return NULL;}
     badd(&b,"{\"model\":");bquoted(&b,c->provider.model);badd(&b,",\"max_tokens\":8192");
-    if(c->cache_enabled)badd(&b,",\"cache_control\":{\"type\":\"ephemeral\"}");
     badd(&b,",\"system\":[{\"type\":\"text\",\"text\":");bquoted(&b,sys);if(c->cache_enabled)badd(&b,",\"cache_control\":{\"type\":\"ephemeral\"}");badd(&b,"}],\"messages\":[");
-    for(i=0;i<c->history_count;i++){if(vs_cancel_requested(c)){free(b.p);return NULL;}if(!first)badd(&b,",");first=0;badd(&b,"{\"role\":");bquoted(&b,!strcmp(c->history[i].role,"assistant")?"assistant":"user");badd(&b,",\"content\":");bquoted(&b,c->history[i].content);badd(&b,"}");}
-    for(i=0;i<c->agent_history_count;i++){if(vs_cancel_requested(c)){free(b.p);return NULL;}if(!first)badd(&b,",");first=0;badd(&b,"{\"role\":");bquoted(&b,!strcmp(c->agent_history[i].role,"assistant")?"assistant":"user");badd(&b,",\"content\":");bquoted(&b,c->agent_history[i].content);badd(&b,"}");}
+    {int total_hist=c->history_count+c->agent_history_count,hist_idx=0;
+    for(i=0;i<c->history_count;i++){if(vs_cancel_requested(c)){free(b.p);return NULL;}if(!first)badd(&b,",");first=0;hist_idx++;badd(&b,"{\"role\":");bquoted(&b,!strcmp(c->history[i].role,"assistant")?"assistant":"user");if(c->cache_enabled&&hist_idx==total_hist){badd(&b,",\"content\":[{\"type\":\"text\",\"text\":");bquoted(&b,c->history[i].content);badd(&b,",\"cache_control\":{\"type\":\"ephemeral\"}}]}");}else{badd(&b,",\"content\":");bquoted(&b,c->history[i].content);badd(&b,"}");}}
+    for(i=0;i<c->agent_history_count;i++){if(vs_cancel_requested(c)){free(b.p);return NULL;}if(!first)badd(&b,",");first=0;hist_idx++;badd(&b,"{\"role\":");bquoted(&b,!strcmp(c->agent_history[i].role,"assistant")?"assistant":"user");if(c->cache_enabled&&hist_idx==total_hist){badd(&b,",\"content\":[{\"type\":\"text\",\"text\":");bquoted(&b,c->agent_history[i].content);badd(&b,",\"cache_control\":{\"type\":\"ephemeral\"}}]}");}else{badd(&b,",\"content\":");bquoted(&b,c->agent_history[i].content);badd(&b,"}");}}
+    }
     if(!first)badd(&b,",");
     badd(&b,"{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");bquoted(&b,user);badd(&b,"}");
     astart=c->attachment_send_from;if(astart<0||astart>c->attachment_count)astart=0;
