@@ -148,12 +148,17 @@ static int add_openai_msg(VSBuf *b,const char *role,const char *content,int *fir
     *first=0;badd(b,"{\"role\":");bquoted(b,role);badd(b,",\"content\":");bquoted(b,content);badd(b,"}");return 0;
 }
 
+/* prompt_cache_breakpoint / prompt_cache_options are OpenAI-specific extensions.
+   Send them only to the official OpenAI provider; OpenAI-compatible gateways
+   (custom etc.) may reject them with bad_request. prompt_cache_key stays generic. */
+static int openai_ext_cache(const VSContext *c,const char *model){return c->cache_enabled && c->provider.kind==VS_PROVIDER_OPENAI && gpt5plus(model);}
+
 static char *build_openai_body(VSContext *c,const char *sys,const char *user){
     VSBuf b;int i,first=1,astart;char *x,*t,*e;const char *mime;
     if(binit(&b,8192)!=0)return NULL;
     if(vs_cancel_requested(c)){free(b.p);return NULL;}
     badd(&b,"{\"model\":");bquoted(&b,c->provider.model);badd(&b,",\"messages\":[");
-    if(c->cache_enabled && gpt5plus(c->provider.model)){
+    if(openai_ext_cache(c,c->provider.model)){
         first=0;badd(&b,"{\"role\":\"system\",\"content\":[{\"type\":\"text\",\"text\":");bquoted(&b,sys);badd(&b,",\"prompt_cache_breakpoint\":{\"mode\":\"explicit\"}}]}");
     } else add_openai_msg(&b,"system",sys,&first);
     for(i=0;i<c->history_count;i++){if(vs_cancel_requested(c)){free(b.p);return NULL;}add_openai_msg(&b,c->history[i].role,c->history[i].content,&first);}
@@ -167,7 +172,7 @@ static char *build_openai_body(VSContext *c,const char *sys,const char *user){
         else {t=vs_cached_read_file(c,c->attachments[i].path);if(t){t=bounded_attachment(c,t,c->attachments[i].path);if(!t)continue;e=vs_json_escape(t);badd(&b,",{\"type\":\"text\",\"text\":\"Attached file: ");x=vs_json_escape(c->attachments[i].path);badd(&b,x);free(x);badd(&b,"\\n");badd(&b,e);badd(&b,"\"}");free(e);free(t);}}
     }
     badd(&b,"]}]");
-    if(c->cache_enabled){badd(&b,",\"prompt_cache_key\":");bquoted(&b,c->cache_key);if(gpt5plus(c->provider.model))badd(&b,",\"prompt_cache_options\":{\"mode\":\"implicit\",\"ttl\":\"30m\"}");}
+    if(c->cache_enabled){badd(&b,",\"prompt_cache_key\":");bquoted(&b,c->cache_key);if(openai_ext_cache(c,c->provider.model))badd(&b,",\"prompt_cache_options\":{\"mode\":\"implicit\",\"ttl\":\"30m\"}");}
     badd(&b,",\"temperature\":0.2}");return bfinish(c,&b);
 }
 
