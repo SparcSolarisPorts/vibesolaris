@@ -50,7 +50,7 @@ typedef struct {
 } UIMessage;
 
 typedef struct {
-    int type; /* 1 trace, 2 done */
+    int type; /* 1 trace, 2 done, 3 response delta */
     int step;
     char *kind;
     char *detail;
@@ -185,8 +185,15 @@ typedef struct {
     pthread_mutex_t worker_lock;
     int worker_busy;
     int worker_started;
+    int pending_plan_choice;
+    int pending_question_choice;
+    int question_selected;
+    unsigned long question_revision;
+    int slash_selected;
+    int slash_dismissed;
     char *worker_reply;
     char *worker_user;
+    int live_response_message;
 
     /* Project relationship explorer.  Coordinates are normalized 0..1 and
        laid out with a small deterministic force simulation when opened. */
@@ -202,6 +209,7 @@ typedef struct {
 
 static void redraw(App *a);
 static int sidebar_w(const App *a);
+static void slash_reset(App *a);
 
 static const char *provider_names[] = {
     "openai", "claude", "gemini", "glm", "glm-coding",
@@ -214,7 +222,8 @@ static const char *provider_labels[] = {
 #define PROVIDER_COUNT 10
 
 static const char *gui_slash_commands[] = {
-    "/web ", "/graph files", "/graph fields", "/trace", "/usage", "/help", "/clear", NULL
+    "/web ", "/graph files", "/graph fields", "/trace", "/usage", "/help", "/clear",
+    "/mode auto", "/mode plan", "/mode manual", "/mode status", "/plan", "/plan accept", "/plan approve-action", "/plan reject", "/plan revise", "/subagent ", NULL
 };
 
 
@@ -337,7 +346,7 @@ static int delete_edit_selection(App *a, SelectionKind kind)
     if (lo > hi) lo = hi;
     memmove(buf + lo, buf + hi, len - hi + 1);
     len -= hi - lo;
-    if (kind == SEL_INPUT) a->input_len = len; else a->modal_len = len;
+    if (kind == SEL_INPUT) { a->input_len = len; slash_reset(a); } else a->modal_len = len;
     *cursor = lo;
     selection_clear(a);
     return 1;
@@ -649,11 +658,36 @@ static int handle_graph_click(App *a,int px,int py)
 
 static int slash_matches(const char *input,const char **out,int cap)
 {
-    int i,n=0;size_t z=input?strlen(input):0;if(!input||input[0]!='/')return 0;for(i=0;gui_slash_commands[i]&&n<cap;i++)if(!strncmp(gui_slash_commands[i],input,z))out[n++]=gui_slash_commands[i];return n;
+    int i,n=0;size_t z=input?strlen(input):0;
+    if(!input||input[0]!='/'||strchr(input,'\n')||strchr(input,' ')||strchr(input,'\t'))return 0;
+    for(i=0;gui_slash_commands[i]&&n<cap;i++)if(!strncmp(gui_slash_commands[i],input,z)){
+        if(out)out[n]=gui_slash_commands[i];
+        n++;
+    }
+    return n;
 }
-static void gui_complete_slash(App *a)
+static void slash_reset(App *a)
 {
-    const char *m[16];int n,i;size_t p=0,cur,add;if(!a)return;n=slash_matches(a->input,m,16);if(n<=0)return;cur=a->input_len;while(m[0][p]){for(i=1;i<n;i++)if(m[i][p]!=m[0][p])goto done;p++;}done:if(p<=cur&&n==1)p=strlen(m[0]);if(p<=cur)return;add=p-cur;if(cur+add>=sizeof(a->input))add=sizeof(a->input)-cur-1;memcpy(a->input+cur,m[0]+cur,add);a->input_len=cur+add;a->input[a->input_len]=0;a->input_cursor=a->input_len;selection_clear(a);
+    if(!a)return;
+    a->slash_selected=0;a->slash_dismissed=0;
+}
+static void gui_complete_slash(App *a, int select)
+{
+    const char *m[16];int n,i;size_t p=0,cur,add;
+    if(!a||a->input_cursor!=a->input_len)return;
+    n=slash_matches(a->input,m,16);if(n<=0)return;cur=a->input_len;
+    if(select){
+        size_t z=strlen(m[a->slash_selected<n?a->slash_selected:0]);
+        if(z>=sizeof(a->input))z=sizeof(a->input)-1;
+        memcpy(a->input,m[a->slash_selected<n?a->slash_selected:0],z);
+        a->input[z]=0;a->input_len=a->input_cursor=z;selection_clear(a);return;
+    }
+    while(m[0][p]){for(i=1;i<n;i++)if(m[i][p]!=m[0][p])goto done;p++;}
+ done:
+    if(p<=cur&&n==1){p=strlen(m[0]);if(p==cur&&m[0][p-1]!=' ')return;}
+    if(p<=cur)return;
+    add=p-cur;if(cur+add>=sizeof(a->input))add=sizeof(a->input)-cur-1;
+    memcpy(a->input+cur,m[0]+cur,add);a->input_len=cur+add;a->input[a->input_len]=0;a->input_cursor=a->input_len;selection_clear(a);
 }
 
 static VSOAuthConfig *app_oauth_cfg(App *a)
@@ -889,6 +923,16 @@ static int worker_write_event(App *a,const UIWorkerEvent *ev)
 
 /* Called on the worker thread.  Payload text is copied on the worker and the
    main X11 thread takes ownership after reading the small pipe event. */
+static int gui_live_stream(void *userdata,const char *data,size_t len)
+{
+    App *a=(App*)userdata;UIWorkerEvent ev;
+    if(!a||!data||!len)return 0;
+    if(len>VS_AGENT_TOOL_RESULT_MAX)return -1;
+    memset(&ev,0,sizeof(ev));ev.type=3;ev.detail=(char*)malloc(len+1);
+    if(!ev.detail)return -1;memcpy(ev.detail,data,len);ev.detail[len]=0;
+    if(worker_write_event(a,&ev)!=0){free(ev.detail);return -1;}return 0;
+}
+
 static void gui_live_trace(void *userdata,int step,const char *kind,const char *detail)
 {
     App *a=(App*)userdata;UIWorkerEvent ev;size_t limit=8192;if(!a)return;memset(&ev,0,sizeof(ev));ev.type=1;ev.step=step;ev.kind=ui_dup(kind?kind:"activity");
@@ -925,14 +969,17 @@ static void finish_worker(App *a)
     pthread_mutex_lock(&a->worker_lock);reply=a->worker_reply;a->worker_reply=NULL;pthread_mutex_unlock(&a->worker_lock);
     if(ti>=0&&ti<a->message_count)trace_summary(&a->ctx,a->messages[ti].summary,sizeof(a->messages[ti].summary));
     vs_set_trace_callback(&a->ctx,NULL,NULL);
-    a->live_trace_message=-1;add_message(a,UI_ROLE_ASSISTANT,reply?reply:"The provider did not return a response.");free(reply);free(a->worker_user);a->worker_user=NULL;
+    vs_set_stream_callback(&a->ctx,NULL,NULL);
+    a->live_trace_message=-1;
+    if(a->live_response_message>=0&&a->live_response_message<a->message_count){UIMessage *m=&a->messages[a->live_response_message];free(m->text);m->text=ui_dup(reply?reply:"The provider did not return a response.");m->text_len=m->text?strlen(m->text):0;m->text_cap=m->text_len+1;m->layout_valid=0;}else add_message(a,UI_ROLE_ASSISTANT,reply?reply:"The provider did not return a response.");
+    a->live_response_message=-1;a->pending_plan_choice=a->ctx.workflow.phase==VS_WORKFLOW_AWAITING_ACCEPT;a->pending_question_choice=a->ctx.pending_question&&a->ctx.question_option_count>0;a->question_selected=0;a->question_revision=a->ctx.pending_question_revision;free(reply);free(a->worker_user);a->worker_user=NULL;
     vs_clear_attachments(&a->ctx);a->worker_busy=0;vs_cancel_clear(&a->ctx);a->status[0]=0;a->auto_scroll=1;
 }
 
 static void process_worker_pipe(App *a)
 {
     UIWorkerEvent ev;ssize_t n;size_t got;
-    for(;;){got=0;memset(&ev,0,sizeof(ev));while(got<sizeof(ev)){n=read(a->worker_pipe[0],((char*)&ev)+got,sizeof(ev)-got);if(n<0){if(errno==EINTR)continue;if(errno==EAGAIN||errno==EWOULDBLOCK)return;return;}if(n==0)return;got+=(size_t)n;}if(ev.type==1){vs_trace_phase(ev.kind,ev.detail,a->busy_label,sizeof(a->busy_label));apply_worker_trace(a,&ev);free(ev.kind);free(ev.detail);}else if(ev.type==2){finish_worker(a);return;}if(a->worker_pipe[0]<0)return;}
+    for(;;){got=0;memset(&ev,0,sizeof(ev));while(got<sizeof(ev)){n=read(a->worker_pipe[0],((char*)&ev)+got,sizeof(ev)-got);if(n<0){if(errno==EINTR)continue;if(errno==EAGAIN||errno==EWOULDBLOCK)return;return;}if(n==0)return;got+=(size_t)n;}if(ev.type==1){vs_trace_phase(ev.kind,ev.detail,a->busy_label,sizeof(a->busy_label));apply_worker_trace(a,&ev);free(ev.kind);free(ev.detail);}else if(ev.type==3){if(a->live_response_message<0){add_message(a,UI_ROLE_ASSISTANT,"");a->live_response_message=a->message_count-1;}if(a->live_response_message>=0&&a->live_response_message<a->message_count){append_trace_text(&a->messages[a->live_response_message],ev.detail?ev.detail:"");a->auto_scroll=1;}free(ev.detail);}else if(ev.type==2){finish_worker(a);return;}if(a->worker_pipe[0]<0)return;}
 }
 
 static void remove_attachment(App *a, int idx)
@@ -1141,7 +1188,7 @@ static void draw_topbar(App *a)
     else snprintf(tb,sizeof(tb),"0 tokens");
     draw_text(a,a->small,a->c.muted,token_x,34,tb);
     token_right=token_x+text_w(a, a->small,tb)+18;
-    snprintf(b, sizeof(b), "%s  /  %s  /  %s", a->ctx.provider.name, vs_protocol_name(a->ctx.provider.protocol), a->ctx.provider.model);
+    snprintf(b, sizeof(b), "%s  /  %s  /  %s  /  %s", a->ctx.provider.name, vs_protocol_name(a->ctx.provider.protocol), a->ctx.provider.model, vs_workflow_mode_name(a->ctx.workflow.mode));
     right = cx + cw - text_w(a, a->small, b);
     if (right < token_right) right = token_right;
     draw_ellipsis(a, a->small, a->c.muted, right, 34, cx + cw - right, b);
@@ -1348,6 +1395,8 @@ static void draw_composer(App *a, int cx, int cw)
     char b[256];
     py = a->height - 114;
     ph = 82;
+    if(a->pending_plan_choice&&!a->worker_busy){int bw=(cw-54)/2,by=py-42;fill_round(a,cx+8,by,bw,32,8,a->c.accent);stroke_round(a,cx+8,by,bw,32,8,a->c.border);draw_text(a,a->small,a->c.panel,cx+24,by+21,"Yes — accept plan");fill_round(a,cx+30+bw,by,bw,32,8,a->c.soft);stroke_round(a,cx+30+bw,by,bw,32,8,a->c.border);draw_text(a,a->small,a->c.text,cx+46+bw,by+21,"No — reject plan");}
+    else if(a->pending_question_choice&&!a->worker_busy){int i,count=a->ctx.question_option_count;if(count>VS_NEED_USER_MAX_OPTIONS)count=VS_NEED_USER_MAX_OPTIONS;if(count>0){int bw=(cw-((count+1)*10))/count,by=py-42;for(i=0;i<count;i++){int bx=cx+10+i*(bw+10);fill_round(a,bx,by,bw,32,8,i==a->question_selected?a->c.accent:a->c.soft);stroke_round(a,bx,by,bw,32,8,a->c.border);draw_ellipsis(a,a->small,i==a->question_selected?a->c.panel:a->c.text,bx+4,by+21,bw-8,a->ctx.question_options[i]);}}}
     fill_round(a, cx, py, cw, ph, 16, a->c.panel);
     stroke_round(a, cx, py, cw, ph, 16, a->xdnd_hover ? a->c.accent : a->c.border);
 
@@ -1368,15 +1417,15 @@ static void draw_composer(App *a, int cx, int cw)
     if(a->worker_busy)draw_stop_icon(a, sendx, py + ph - 20, a->c.panel);
     else draw_send_icon(a, sendx, py + ph - 20, a->c.panel);
 
-    if(a->input[0]=='/' && !a->worker_busy){
-        const char *m[8];int mn=slash_matches(a->input,m,8),si;if(mn>0){int sh=22+mn*20,sy=py-sh-8;fill_round(a,cx+34,sy,cw-68,sh,10,a->c.panel);stroke_round(a,cx+34,sy,cw-68,sh,10,a->c.border);draw_text(a,a->small,a->c.muted,cx+46,sy+17,"Tab to complete");for(si=0;si<mn;si++)draw_ellipsis(a,a->small,a->c.text,cx+46,sy+38+si*20,cw-92,m[si]);}
+    if(a->input[0]=='/' && !a->worker_busy && !a->slash_dismissed && a->input_cursor==a->input_len){
+        const char *m[16];int mn=slash_matches(a->input,m,16),si,visible=mn>8?8:mn;if(mn>0){if(a->slash_selected>=mn)a->slash_selected=mn-1;int sh=36+visible*20,sy=py-sh-8;fill_round(a,cx+34,sy,cw-68,sh,10,a->c.panel);stroke_round(a,cx+34,sy,cw-68,sh,10,a->c.border);draw_text(a,a->small,a->c.muted,cx+46,sy+17,"Up/Down select  ·  Enter insert  ·  Esc close");for(si=0;si<visible;si++)draw_ellipsis(a,a->small,si==a->slash_selected?a->c.accent:a->c.text,cx+46,sy+38+si*20,cw-92,m[si]);if(mn>visible)draw_ellipsis(a,a->small,a->c.muted,cx+46,sy+38+visible*20,cw-92,"… more");}
     }
 
     if (a->status[0]) {
         draw_ellipsis(a, a->small, a->c.muted, cx, a->height - 13, cw, a->status);
     } else {
         if(a->worker_busy)snprintf(b,sizeof(b),"Agent running  -  click the square Stop button or press Esc to stop");
-        else snprintf(b, sizeof(b), "Enter send  -  Ctrl/Meta+V paste  -  Ctrl+C copy  -  Ctrl+O attach  -  drag files to attach");
+        else snprintf(b, sizeof(b), "Mode: %s  -  Shift+Tab cycle  -  Enter send  -  Ctrl/Meta+V paste  -  Ctrl+C copy  -  Ctrl+O attach  -  drag files to attach",vs_workflow_mode_name(a->ctx.workflow.mode));
         draw_text(a, a->small, a->c.muted, cx + (cw - text_w(a, a->small, b)) / 2,
                   a->height - 13, b);
     }
@@ -1791,6 +1840,7 @@ static int insert_edit_text(App *a, SelectionKind kind, const char *text, size_t
     else { buf=a->modal_text;lenp=&a->modal_len;curp=&a->modal_cursor;cap=sizeof(a->modal_text); }
     delete_edit_selection(a,kind);
     len=*lenp;cur=*curp;if(cur>len)cur=len;
+    if(kind==SEL_INPUT)slash_reset(a);
     if(len+n>=cap){size_t maxn=cap-len-1;n=utf8_floor(text,n,maxn);}
     if(!n)return 0;
     memmove(buf+cur+n,buf+cur,len-cur+1);memcpy(buf+cur,text,n);
@@ -2084,10 +2134,15 @@ static void handle_xdnd_selection(App *a, XSelectionEvent *se)
 
 static void new_chat(App *a)
 {
+    VSExecutionMode mode;
     if(a->worker_busy){snprintf(a->status,sizeof(a->status),"Wait for the current agent operation to finish before starting a new chat");return;}
+    mode=a->ctx.workflow.mode;
     free_messages(a);
     vs_history_clear(&a->ctx);
     vs_clear_attachments(&a->ctx);
+    vs_workflow_init(&a->ctx.workflow);a->ctx.workflow.mode=mode;vs_workflow_clear_pending_task(&a->ctx);
+    a->ctx.pending_question=0;a->ctx.pending_question_revision=0;a->ctx.question[0]=0;a->ctx.question_option_count=0;memset(a->ctx.question_options,0,sizeof(a->ctx.question_options));
+    a->pending_plan_choice=0;a->pending_question_choice=0;a->question_selected=0;a->question_revision=0;slash_reset(a);
     a->input[0] = 0;
     a->input_len = 0;
     a->input_cursor = 0;
@@ -2105,12 +2160,50 @@ static void request_stop(App *a)
     a->auto_scroll=1;
 }
 
+static int start_question_answer(App *a, int index)
+{
+    char *prompt,*shown;int flags,trace_index,count;char saved_options[VS_NEED_USER_MAX_OPTIONS][VS_NEED_USER_OPTION_MAX];
+    if(!a||a->worker_busy||!a->ctx.pending_question||a->question_revision!=a->ctx.pending_question_revision||index<0||index>=a->ctx.question_option_count)return -1;
+    count=a->ctx.question_option_count;memcpy(saved_options,a->ctx.question_options,sizeof(saved_options));
+    shown=ui_dup(a->ctx.question_options[index]);if(!shown)return -1;prompt=ui_dup(shown);if(!prompt){free(shown);return -1;}
+    add_message(a,UI_ROLE_USER,shown);free(shown);a->ctx.pending_question=0;a->ctx.question_option_count=0;a->pending_question_choice=0;
+    vs_cancel_clear(&a->ctx);trace_index=begin_trace_message(a);a->live_trace_message=trace_index;a->worker_user=prompt;a->worker_reply=NULL;a->live_response_message=-1;a->worker_busy=1;a->busy_since=(long)time(NULL);strcpy(a->busy_label,"Thinking");vs_set_trace_callback(&a->ctx,gui_live_trace,a);vs_set_stream_callback(&a->ctx,gui_live_stream,a);strcpy(a->status,"Working...");a->auto_scroll=1;redraw(a);XFlush(a->dpy);
+    if(pthread_create(&a->worker_thread,NULL,agent_worker_main,a)!=0){a->worker_busy=0;a->worker_user=NULL;free(prompt);vs_set_trace_callback(&a->ctx,NULL,NULL);vs_set_stream_callback(&a->ctx,NULL,NULL);a->ctx.pending_question=1;a->ctx.question_option_count=count;memcpy(a->ctx.question_options,saved_options,sizeof(saved_options));a->pending_question_choice=1;strcpy(a->status,"Could not start answer worker");return -1;}
+    a->worker_started=1;flags=fcntl(a->worker_pipe[0],F_GETFL,0);if(flags>=0)(void)fcntl(a->worker_pipe[0],F_SETFL,flags|O_NONBLOCK);return 0;
+}
+
+static int start_continuation_worker(App *a, const char *task)
+{
+    int flags,trace_index;char *prompt;
+    if(!a||!task||!*task||a->worker_busy||a->worker_pipe[0]<0||a->worker_pipe[1]<0)return -1;
+    prompt=ui_dup(task);if(!prompt)return -1;
+    vs_cancel_clear(&a->ctx);trace_index=begin_trace_message(a);a->live_trace_message=trace_index;
+    a->worker_user=prompt;a->worker_reply=NULL;a->live_response_message=-1;a->worker_busy=1;a->busy_since=(long)time(NULL);strcpy(a->busy_label,"Continuing");vs_set_trace_callback(&a->ctx,gui_live_trace,a);vs_set_stream_callback(&a->ctx,gui_live_stream,a);strcpy(a->status,"Continuing...");a->auto_scroll=1;redraw(a);XFlush(a->dpy);
+    if(pthread_create(&a->worker_thread,NULL,agent_worker_main,a)!=0){a->worker_busy=0;a->worker_user=NULL;free(prompt);vs_set_trace_callback(&a->ctx,NULL,NULL);vs_set_stream_callback(&a->ctx,NULL,NULL);strcpy(a->status,"Could not start continuation worker");return -1;}
+    a->worker_started=1;flags=fcntl(a->worker_pipe[0],F_GETFL,0);if(flags>=0)(void)fcntl(a->worker_pipe[0],F_SETFL,flags|O_NONBLOCK);return 0;
+}
+
+static void accept_plan_and_resume(App *a)
+{
+    char task[VS_ACTIVE_TASK_MAX];
+    if(!a||a->worker_busy)return;
+    if(vs_workflow_accept(&a->ctx.workflow)!=0){snprintf(a->status,sizeof(a->status),"No proposed plan is awaiting acceptance");return;}
+    a->pending_plan_choice=0;
+    if(vs_workflow_take_pending_task(&a->ctx,task,sizeof(task))!=0){snprintf(a->status,sizeof(a->status),"Plan accepted; no continuation is available");return;}
+    a->ctx.suppress_history_once=1;
+    if(start_continuation_worker(a,task)!=0){a->ctx.suppress_history_once=0;vs_workflow_clear_pending_task(&a->ctx);}
+}
+
 static void send_message(App *a)
 {
     char *usercopy,*worker_prompt=NULL;int trace_index,flags;char info[1024];
     if(a->worker_busy){snprintf(a->status,sizeof(a->status),"Agent is already working; the window remains responsive while it finishes");return;}
     if(!a->input_len)return;
 
+    /* Workflow commands use the shared host-side state machine, never model prose. */
+    if(!strcmp(a->input,"/mode auto")||!strcmp(a->input,"/mode plan")||!strcmp(a->input,"/mode manual")||!strcmp(a->input,"/mode status")){if(!strcmp(a->input,"/mode status")){snprintf(info,sizeof(info),"Execution mode: %s.",vs_workflow_mode_name(a->ctx.workflow.mode));add_message(a,UI_ROLE_ASSISTANT,info);}else{if(a->worker_busy){snprintf(a->status,sizeof(a->status),"Workflow mode cannot change during execution");return;}a->ctx.workflow.mode=!strcmp(a->input,"/mode manual")?VS_MODE_MANUAL:(!strcmp(a->input,"/mode plan")?VS_MODE_PLAN:VS_MODE_AUTO);a->ctx.workflow.action_approved=0;a->ctx.workflow.pending_request[0]=0;snprintf(info,sizeof(info),"Execution mode: %s; phase remains unchanged.",vs_workflow_mode_name(a->ctx.workflow.mode));add_message(a,UI_ROLE_ASSISTANT,info);}a->input[0]=0;a->input_len=a->input_cursor=0;selection_clear(a);slash_reset(a);return;}
+    if(!strcmp(a->input,"/plan")){int i;char plan[4096];size_t used=0;if(!a->ctx.workflow.task_count)snprintf(plan,sizeof(plan),"No plan is currently proposed; execution is not authorized.");else{used=(size_t)snprintf(plan,sizeof(plan),"%s — revision %lu [%s]\n",a->ctx.workflow.title,a->ctx.workflow.revision,a->ctx.workflow.phase==VS_WORKFLOW_AWAITING_ACCEPT?"awaiting acceptance":(a->ctx.workflow.phase==VS_WORKFLOW_AWAITING_ACTION?"awaiting action approval":(vs_workflow_authorized(&a->ctx.workflow)?"accepted":"not accepted")));for(i=0;i<a->ctx.workflow.task_count&&used<sizeof(plan)-128;i++){VSTaskRecord *t=&a->ctx.workflow.tasks[i];used+=(size_t)snprintf(plan+used,sizeof(plan)-used,"%s- %s [%s]%s\n",t->parent_id?"  ":"",t->title,t->status==VS_TASK_COMPLETED?"done":(t->status==VS_TASK_RUNNING?"running":(t->status==VS_TASK_FAILED?"failed":(t->status==VS_TASK_BLOCKED?"blocked":"planned"))),t->dependency_count?" (dependencies listed in TUI /plan view)":"");}snprintf(plan+strlen(plan),sizeof(plan)-strlen(plan),"Execution is serial; sibling tasks do not run in parallel.");}add_message(a,UI_ROLE_ASSISTANT,plan);a->input[0]=0;a->input_len=a->input_cursor=0;selection_clear(a);return;}
+    if(!strcmp(a->input,"/plan accept")||!strcmp(a->input,"/plan reject")||!strcmp(a->input,"/plan revise")||!strcmp(a->input,"/plan approve-action")){int rc=-1;if(a->worker_busy){snprintf(a->status,sizeof(a->status),"Workflow state cannot change while the agent is running");return;}if(!strcmp(a->input,"/plan accept")){accept_plan_and_resume(a);rc=0;}else if(!strcmp(a->input,"/plan approve-action"))rc=vs_workflow_approve_action(&a->ctx.workflow);else{vs_workflow_reject(&a->ctx.workflow);vs_workflow_clear_pending_task(&a->ctx);a->pending_plan_choice=0;rc=0;}if(rc<0)snprintf(info,sizeof(info),"No matching plan/action is awaiting this operation.");else if(!strcmp(a->input,"/plan approve-action"))snprintf(info,sizeof(info),"Next manual action approved; continuing when you send the next task.");else if(!strcmp(a->input,"/plan accept"))snprintf(info,sizeof(info),"Plan accepted; continuing...");else snprintf(info,sizeof(info),"Plan approval cleared; request or propose a revised plan.");if(rc>=0)add_message(a,UI_ROLE_ASSISTANT,info);a->input[0]=0;a->input_len=a->input_cursor=0;selection_clear(a);return;}
     /* Lightweight slash commands stay local to the GUI. They should feel like
        UI actions, not consume an LLM round just to open a panel or show stats. */
     if(!strcmp(a->input,"/graph files")){open_graph(a,VS_GRAPH_FILES);a->input[0]=0;a->input_len=a->input_cursor=0;selection_clear(a);return;}
@@ -2139,9 +2232,9 @@ static void send_message(App *a)
     if(!worker_prompt){free(usercopy);return;}
     vs_cancel_clear(&a->ctx);
     add_message(a,UI_ROLE_USER,usercopy);free(usercopy);trace_index=begin_trace_message(a);a->live_trace_message=trace_index;
-    a->worker_user=worker_prompt;a->worker_reply=NULL;a->worker_busy=1;a->busy_since=(long)time(NULL);strcpy(a->busy_label,"Thinking");vs_set_trace_callback(&a->ctx,gui_live_trace,a);strcpy(a->status,"Working...");
+    a->worker_user=worker_prompt;a->worker_reply=NULL;a->worker_busy=1;a->busy_since=(long)time(NULL);strcpy(a->busy_label,"Thinking");vs_set_trace_callback(&a->ctx,gui_live_trace,a);vs_set_stream_callback(&a->ctx,gui_live_stream,a);strcpy(a->status,"Working...");
     a->input[0]=0;a->input_len=0;a->input_cursor=0;selection_clear(a);a->auto_scroll=1;redraw(a);XFlush(a->dpy);
-    if(pthread_create(&a->worker_thread,NULL,agent_worker_main,a)!=0){a->worker_busy=0;a->worker_user=NULL;free(worker_prompt);vs_cancel_clear(&a->ctx);vs_set_trace_callback(&a->ctx,NULL,NULL);strcpy(a->status,"Could not start background agent worker");return;}
+    if(pthread_create(&a->worker_thread,NULL,agent_worker_main,a)!=0){a->worker_busy=0;a->worker_user=NULL;free(worker_prompt);vs_cancel_clear(&a->ctx);vs_set_trace_callback(&a->ctx,NULL,NULL);vs_set_stream_callback(&a->ctx,NULL,NULL);strcpy(a->status,"Could not start background agent worker");return;}
     a->worker_started=1;
     /* Non-blocking read side lets the event loop drain all available activity
        packets without ever stalling X11. */
@@ -2225,7 +2318,10 @@ static void handle_key(App *a, XKeyEvent *ke)
     if (a->modal != MODAL_NONE) { handle_modal_key(a, ke); return; }
     if(a->graph_open && k==XK_Escape){a->graph_open=0;return;}
     if(shortcut_mod(st) && (k==XK_g||k==XK_G)){open_graph(a,(st&ShiftMask)?VS_GRAPH_FIELDS:VS_GRAPH_FILES);return;}
-    if(k==XK_Tab && a->input[0]=='/'){gui_complete_slash(a);return;}
+    if((k==XK_Tab||k==XK_ISO_Left_Tab) && (st&ShiftMask)){if(!a->worker_busy){vs_workflow_cycle_mode(&a->ctx.workflow);snprintf(a->status,sizeof(a->status),"Mode: %s",vs_workflow_mode_name(a->ctx.workflow.mode));}return;}
+    if(a->pending_question_choice&&!a->worker_busy&&a->ctx.pending_question&&a->question_revision==a->ctx.pending_question_revision){int count=a->ctx.question_option_count;if(k==XK_Up||k==XK_Left){if(a->question_selected>0)a->question_selected--;return;}if(k==XK_Down||k==XK_Right){if(a->question_selected<count-1)a->question_selected++;return;}if(k==XK_Escape){a->pending_question_choice=0;return;}if(k==XK_Return||k==XK_KP_Enter){(void)start_question_answer(a,a->question_selected);return;}}
+    if(!a->worker_busy&&a->input_cursor==a->input_len&&!a->slash_dismissed&&a->input[0]=='/'&&a->input[0]&&slash_matches(a->input,NULL,16)>0){const char *m[16];int mn=slash_matches(a->input,m,16);if(k==XK_Up||k==XK_Left){if(a->slash_selected>0)a->slash_selected--;return;}if(k==XK_Down||k==XK_Right){if(a->slash_selected<mn-1)a->slash_selected++;return;}if(k==XK_Escape){a->slash_dismissed=1;return;}if(k==XK_Return||k==XK_KP_Enter){gui_complete_slash(a,1);a->slash_dismissed=1;return;}}
+    if(k==XK_Tab && a->input[0]=='/'){gui_complete_slash(a,0);return;}
     if(a->worker_busy && k==XK_Escape){request_stop(a);return;}
     if(a->worker_busy && shortcut_mod(st) && (k==XK_o||k==XK_O||k==XK_p||k==XK_P||k==XK_m||k==XK_M||k==XK_k||k==XK_K||k==XK_u||k==XK_U||k==XK_r||k==XK_R||k==XK_t||k==XK_T||k==XK_n||k==XK_N||k==XK_y||k==XK_Y)){snprintf(a->status,sizeof(a->status),"Connection/configuration changes are locked while the agent is working");return;}
     if (shortcut_mod(st) && (k==XK_a||k==XK_A)) { select_all_edit(a); return; }
@@ -2241,22 +2337,22 @@ static void handle_key(App *a, XKeyEvent *ke)
     if (shortcut_mod(st) && (k==XK_t||k==XK_T)) { a->ctx.cache_enabled=!a->ctx.cache_enabled;return; }
     if (shortcut_mod(st) && (k==XK_n||k==XK_N)) { new_chat(a);return; }
     if (shortcut_mod(st) && (k==XK_y||k==XK_Y)) { new_chat(a);return; }
-    if (shortcut_mod(st) && (k==XK_l||k==XK_L)) { a->input[0]=0;a->input_len=0;a->input_cursor=0;selection_clear(a);return; }
-    if (k == XK_Left) { size_t old=a->input_cursor,newp=utf8_prev(a->input,old);set_edit_cursor(a,SEL_INPUT,old,newp,extend);return; }
-    if (k == XK_Right) { size_t old=a->input_cursor,newp=utf8_next(a->input,a->input_len,old);set_edit_cursor(a,SEL_INPUT,old,newp,extend);return; }
-    if (k == XK_Home) { size_t old=a->input_cursor;set_edit_cursor(a,SEL_INPUT,old,0,extend);return; }
-    if (k == XK_End) { size_t old=a->input_cursor;set_edit_cursor(a,SEL_INPUT,old,a->input_len,extend);return; }
+    if (shortcut_mod(st) && (k==XK_l||k==XK_L)) { a->input[0]=0;a->input_len=0;a->input_cursor=0;slash_reset(a);selection_clear(a);return; }
+    if (k == XK_Left) { size_t old=a->input_cursor,newp=utf8_prev(a->input,old);slash_reset(a);set_edit_cursor(a,SEL_INPUT,old,newp,extend);return; }
+    if (k == XK_Right) { size_t old=a->input_cursor,newp=utf8_next(a->input,a->input_len,old);slash_reset(a);set_edit_cursor(a,SEL_INPUT,old,newp,extend);return; }
+    if (k == XK_Home) { size_t old=a->input_cursor;slash_reset(a);set_edit_cursor(a,SEL_INPUT,old,0,extend);return; }
+    if (k == XK_End) { size_t old=a->input_cursor;slash_reset(a);set_edit_cursor(a,SEL_INPUT,old,a->input_len,extend);return; }
     if (k == XK_BackSpace) {
         if (!delete_edit_selection(a,SEL_INPUT) && a->input_cursor>0) {
             size_t p=utf8_prev(a->input,a->input_cursor);size_t cut=a->input_cursor-p;memmove(a->input+p,a->input+a->input_cursor,a->input_len-a->input_cursor+1);
-            a->input_len-=cut;a->input_cursor=p;
+            a->input_len-=cut;a->input_cursor=p;slash_reset(a);
         }
         return;
     }
     if (k == XK_Delete) {
         if (!delete_edit_selection(a,SEL_INPUT) && a->input_cursor<a->input_len) {
             size_t np=utf8_next(a->input,a->input_len,a->input_cursor);size_t cut=np-a->input_cursor;memmove(a->input+a->input_cursor,a->input+np,a->input_len-np+1);
-            a->input_len-=cut;
+            a->input_len-=cut;slash_reset(a);
         }
         return;
     }
@@ -2264,7 +2360,7 @@ static void handle_key(App *a, XKeyEvent *ke)
     if (k == XK_Return || k == XK_KP_Enter) { send_message(a);return; }
     if (k == XK_Page_Up) { a->scroll_y-=260;return; }
     if (k == XK_Page_Down) { a->scroll_y+=260;return; }
-    if (n > 0) { if(a->selection.kind==SEL_MESSAGE)selection_clear(a);insert_edit_text(a,SEL_INPUT,b,(size_t)n); }
+    if (n > 0) { if(a->selection.kind==SEL_MESSAGE)selection_clear(a);insert_edit_text(a,SEL_INPUT,b,(size_t)n);slash_reset(a); }
 }
 
 static size_t line_offset_for_x(App *a, XFontStruct *f,const char *line,int relx)
@@ -2546,6 +2642,8 @@ static void handle_click(App *a, XButtonEvent *be)
     }
 
     cx=content_x(a,&cw);panel_y=a->height-114;panel_h=82;
+    if(a->pending_plan_choice&&!a->worker_busy&&y>=panel_y-42&&y<panel_y-10){int bw=(cw-54)/2;if(hit(x,y,cx+8,panel_y-42,bw,32)){accept_plan_and_resume(a);redraw(a);return;}if(hit(x,y,cx+30+bw,panel_y-42,bw,32)){vs_workflow_reject(&a->ctx.workflow);vs_workflow_clear_pending_task(&a->ctx);a->pending_plan_choice=0;snprintf(a->status,sizeof(a->status),"Plan rejected.");redraw(a);return;}}
+    if(a->pending_question_choice&&!a->worker_busy&&y>=panel_y-42&&y<panel_y-10){int count=a->ctx.question_option_count,i,bw;if(count>VS_NEED_USER_MAX_OPTIONS)count=VS_NEED_USER_MAX_OPTIONS;if(count>0){bw=(cw-((count+1)*10))/count;for(i=0;i<count;i++){int bx=cx+10+i*(bw+10);if(hit(x,y,bx,panel_y-42,bw,32)){a->question_selected=i;(void)start_question_answer(a,i);redraw(a);return;}}}}
     if (trace_header_at(a, x, y, &mi)) {
         a->messages[mi].collapsed = !a->messages[mi].collapsed;
         a->messages[mi].layout_valid = 0;
@@ -2596,6 +2694,7 @@ static void init_app(App *a, int argc, char **argv)
     a->worker_pipe[0]=a->worker_pipe[1]=-1;
     pthread_mutex_init(&a->worker_lock,NULL);
     if(pipe(a->worker_pipe)!=0){a->worker_pipe[0]=a->worker_pipe[1]=-1;}
+    signal(SIGPIPE,SIG_IGN);
     if (!setlocale(LC_CTYPE, "") || MB_CUR_MAX <= 1) {
         if (!setlocale(LC_CTYPE, "C.UTF-8")) (void)setlocale(LC_CTYPE, "en_US.UTF-8");
     }
@@ -2704,6 +2803,7 @@ static void destroy_app(App *a)
         while(a->worker_started){fd_set rf;struct timeval tv;int rc;FD_ZERO(&rf);FD_SET(a->worker_pipe[0],&rf);tv.tv_sec=0;tv.tv_usec=200000;rc=select(a->worker_pipe[0]+1,&rf,NULL,NULL,&tv);if(rc>0&&FD_ISSET(a->worker_pipe[0],&rf))process_worker_pipe(a);}
     }
     vs_set_trace_callback(&a->ctx,NULL,NULL);
+    vs_set_stream_callback(&a->ctx,NULL,NULL);
     free(a->worker_reply);free(a->worker_user);
     if(a->worker_pipe[0]>=0)close(a->worker_pipe[0]);
     if(a->worker_pipe[1]>=0)close(a->worker_pipe[1]);

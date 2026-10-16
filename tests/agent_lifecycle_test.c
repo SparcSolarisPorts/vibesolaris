@@ -8,9 +8,10 @@ static int chats=0,runs=0;
 static char *xdup(const char *s){size_t n=strlen(s);char *p=(char*)malloc(n+1);memcpy(p,s,n+1);return p;}
 
 char *vs_chat(VSContext *ctx,const char *p){(void)ctx;(void)p;chats++;
-    if(chats==1)return xdup("I'll inspect it now. [[VS_TOOL run cmd=\"printf inventory\"]]");
-    if(chats==2)return xdup("The command runner is operational; the previous command had a shell syntax error. I'll use simpler POSIX-compatible commands. I'm unable to continue because the tool bridge stopped returning results after the initial inventory command.");
-    if(chats==3)return xdup("Continuing now. [[VS_TOOL run cmd=\"printf recovered\"]]");
+    if(chats==1)return xdup("[[VS_PLAN title=\"Recover command\" tasks=\"1|0|-|Run command;2|0|-|Recover if needed\"]]");
+    if(chats==2)return xdup("I'll inspect it now. [[VS_TOOL run task_id=\"1\" cmd=\"printf inventory\"]]");
+    if(chats==3)return xdup("The command runner is operational; the previous command had a shell syntax error. I'll use simpler POSIX-compatible commands. I'm unable to continue because the tool bridge stopped returning results after the initial inventory command.");
+    if(chats==4)return xdup("Continuing now. [[VS_TOOL run task_id=\"2\" cmd=\"printf recovered\"]]");
     return xdup("[[VS_FINAL]]Done after recovery.");
 }
 void vs_trace(VSContext *c,const char *k,const char *d){(void)c;fprintf(stderr,"[%s] %s\n",k,d);}
@@ -41,6 +42,6 @@ char *vs_graph_summary(const VSGraph*g,int n){(void)g;(void)n;return optional_to
 /* Subagent isolation helpers used by agent.c; no state to release in this test. */
 void vs_history_clear(VSContext *c){(void)c;}
 void vs_cache_clear(VSContext *c){(void)c;}
-int main(void){VSContext c;char *out;memset(&c,0,sizeof(c));out=vs_agent_turn(&c,"ok that all sounds good, do all that");
+int main(void){VSContext c;char *out;memset(&c,0,sizeof(c));vs_workflow_init(&c.workflow);out=vs_agent_turn(&c,"ok that all sounds good, do all that");if(!out||c.workflow.phase!=VS_WORKFLOW_AWAITING_ACCEPT||runs!=0){free(out);return 1;}free(out);if(vs_workflow_accept(&c.workflow)!=0)return 1;out=vs_agent_turn(&c,"continue accepted task");
     printf("answer=%s\nchats=%d runs=%d\n",out?out:"(null)",chats,runs);
-    if(!out||strcmp(out,"Done after recovery.")||chats!=4||runs!=3){free(out);return 1;}free(out);return 0;}
+    if(!out||strcmp(out,"Done after recovery.")||chats!=5||runs!=3){free(out);return 1;}free(out);return 0;}

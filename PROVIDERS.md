@@ -1,6 +1,6 @@
 # Provider, protocol, URL, and authentication configuration
 
-VibeSolaris 0.9.5 makes connection/authentication controls depend on the selected provider and protocol. API keys, protocol choice, and API URLs are remembered separately per provider; providers that support both OpenAI-compatible and Anthropic Messages protocols also retain a different URL for each protocol.
+VibeSolaris 0.9.5 makes connection/authentication controls depend on the selected provider and protocol. API keys and protocol choices are remembered separately per provider. Providers that support both OpenAI-compatible and Anthropic Messages protocols normally retain a different URL for each protocol; the Custom provider intentionally shares one URL across both modes.
 
 ## OpenAI
 
@@ -82,7 +82,8 @@ API URL: editable
 
 Provider: `custom`  
 Protocols: OpenAI-compatible or Anthropic Messages-compatible  
-Authentication: API key  
+Authentication: one shared API key for both protocols
+URL: one shared custom base URL for both protocols
 
 Use the GUI's Protocol/API URL/Model/API Key controls, or:
 
@@ -94,7 +95,7 @@ Use the GUI's Protocol/API URL/Model/API Key controls, or:
 /key KEY
 ```
 
-For Anthropic-compatible non-Anthropic services, VibeSolaris sends a bearer credential plus the Anthropic protocol version header. Native Claude uses `x-api-key`.
+For Anthropic-compatible non-Anthropic services, VibeSolaris sends a bearer credential by default plus the Anthropic protocol version header. Select `/anthropic-auth x-api-key` to use the `x-api-key` header instead, or `/anthropic-auth bearer` to restore bearer auth. The choice is saved per provider in encrypted configuration. Native Claude API keys always use `x-api-key`; Claude OAuth remains restricted to `https://api.anthropic.com` and is never sent to custom gateways. Custom URL and key settings are shared across OpenAI-compatible and Anthropic-compatible modes; use a gateway base URL that supports both request formats.
 
 ## URL handling
 
@@ -102,9 +103,15 @@ The GUI accepts either a protocol **base URL** or a full request URL:
 
 - OpenAI-compatible base URLs have `/chat/completions` appended when it is not already present.
 - Anthropic-compatible base URLs have `/v1/messages` appended when it is not already present.
+- For Custom, a shared base ending in `/v1` maps to `/v1/chat/completions` for OpenAI-compatible requests and `/v1/messages` for Anthropic-compatible requests; this avoids a duplicated `/v1`.
+- For Custom full endpoints, switching protocols replaces a terminal `/chat/completions` with `/v1/messages` (or the reverse), so a shared full endpoint does not receive both suffixes.
 - Gemini uses its native model URL construction.
 
 This makes URLs copied from provider setup pages usable without manually adding the final request path.
+
+## Response streaming
+
+OpenAI-compatible and Anthropic Messages-compatible requests use `stream: true` and consume Server-Sent Events incrementally. The GUI renders text fragments as they arrive; the TUI captures provider fragments internally while the spinner is active and renders exactly one complete authoritative answer after the agent loop, so tool, plan, question, and final markers cannot leak or duplicate. Gemini remains buffered because its `streamGenerateContent` framing is different. A gateway that does not provide SSE is retried through the existing buffered JSON path.
 
 ## API-key persistence
 

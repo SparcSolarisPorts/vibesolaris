@@ -39,6 +39,14 @@
 #define VS_MAX_TRACE_BYTES (8U*1024U*1024U)
 #define VS_MAX_SUBAGENT_DEPTH 2
 #define VS_MAX_SUBAGENTS_PER_TURN 6
+#define VS_MAX_SUBAGENT_RECORDS 32
+#define VS_MAX_PLAN_TASKS 16
+#define VS_MAX_TASK_DEPS 4
+#define VS_PLAN_TITLE_MAX 128
+#define VS_TASK_TITLE_MAX 192
+#define VS_NEED_USER_MAX_OPTIONS 8
+#define VS_NEED_USER_TEXT_MAX 512
+#define VS_NEED_USER_OPTION_MAX 128
 #define VS_SUBAGENT_RESULT_MAX (48U*1024U)
 
 /* Resource guards for long-running/large agent operations.  These are deliberately
@@ -194,6 +202,69 @@ typedef struct {
 } VSTraceEvent;
 
 typedef void (*VSTraceCallback)(void *userdata, int step, const char *kind, const char *detail);
+typedef int (*VSHTTPChunkCallback)(void *userdata, const char *data, size_t len);
+
+typedef struct {
+    int id;
+    int parent_id;
+    int depth;
+    int status; /* 0 running, 1 completed, 2 stopped, 3 failed/limited */
+    long started_at;
+    long finished_at;
+    char task[256];
+    char summary[256];
+} VSSubagentRecord;
+
+typedef enum {
+    VS_MODE_AUTO = 0,
+    VS_MODE_PLAN = 1,
+    VS_MODE_MANUAL = 2
+} VSExecutionMode;
+
+typedef enum {
+    VS_WORKFLOW_IDLE = 0,
+    VS_WORKFLOW_PLANNING,
+    VS_WORKFLOW_AWAITING_ACCEPT,
+    VS_WORKFLOW_DOING,
+    VS_WORKFLOW_AWAITING_ACTION,
+    VS_WORKFLOW_PAUSED,
+    VS_WORKFLOW_COMPLETED,
+    VS_WORKFLOW_FAILED,
+    VS_WORKFLOW_CANCELLED
+} VSWorkflowPhase;
+
+typedef enum {
+    VS_TASK_PLANNED = 0,
+    VS_TASK_BLOCKED,
+    VS_TASK_READY,
+    VS_TASK_RUNNING,
+    VS_TASK_COMPLETED,
+    VS_TASK_FAILED,
+    VS_TASK_CANCELLED
+} VSTaskStatus;
+
+typedef struct {
+    int id;
+    int parent_id;
+    int dependency_count;
+    int dependencies[VS_MAX_TASK_DEPS];
+    VSTaskStatus status;
+    char title[VS_TASK_TITLE_MAX];
+    char summary[256];
+} VSTaskRecord;
+
+typedef struct {
+    VSExecutionMode mode;
+    VSWorkflowPhase phase;
+    unsigned long revision;
+    unsigned long accepted_revision;
+    int task_count;
+    int current_task_id;
+    int action_approved;
+    char title[VS_PLAN_TITLE_MAX];
+    char pending_request[4096];
+    VSTaskRecord tasks[VS_MAX_PLAN_TASKS];
+} VSWorkflow;
 
 typedef struct {
     char role[16];
@@ -227,6 +298,7 @@ typedef struct {
     char provider_openai_urls[VS_PROVIDER_SLOT_COUNT][512];
     char provider_anthropic_urls[VS_PROVIDER_SLOT_COUNT][512];
     int provider_protocols[VS_PROVIDER_SLOT_COUNT];
+    int provider_anthropic_auth[VS_PROVIDER_SLOT_COUNT]; /* 0 bearer, 1 x-api-key */
     VSOAuthConfig oauth;
     VSOAuthConfig claude_oauth;
 
@@ -244,6 +316,8 @@ typedef struct {
     size_t trace_bytes;
     VSTraceCallback trace_callback;
     void *trace_callback_data;
+    VSHTTPChunkCallback stream_callback;
+    void *stream_callback_data;
     volatile sig_atomic_t cancel_requested;
     int config_autosave;
     int config_loading;
@@ -289,9 +363,39 @@ typedef struct {
     void *subagent_parent;
     int subagent_depth;
     int subagent_id;
+    int subagent_record_id;
     int subagent_serial;
+    void *subagent_root; /* top-level context owns per-turn lifecycle records */
+    VSSubagentRecord subagents[VS_MAX_SUBAGENT_RECORDS];
+    int subagent_record_count;
+    VSWorkflow workflow;
+    /* Ephemeral continuation captured when a plan pauses. Never serialized. */
+    char pending_task[VS_ACTIVE_TASK_MAX];
+    unsigned long pending_task_revision;
+    int pending_task_valid;
+    int suppress_history_once;
+    /* Ephemeral user-choice prompt returned by the agent. Never serialized. */
+    int pending_question;
+    unsigned long pending_question_revision;
+    char question[VS_NEED_USER_TEXT_MAX];
+    int question_option_count;
+    char question_options[VS_NEED_USER_MAX_OPTIONS][VS_NEED_USER_OPTION_MAX];
 } VSContext;
 
+void vs_workflow_init(VSWorkflow *workflow);
+int  vs_workflow_set_plan(VSWorkflow *workflow, const char *title, const VSTaskRecord *tasks, int count);
+int  vs_workflow_accept(VSWorkflow *workflow);
+void vs_workflow_reject(VSWorkflow *workflow);
+int  vs_workflow_authorized(const VSWorkflow *workflow);
+int  vs_workflow_needs_action_approval(const VSWorkflow *workflow);
+int  vs_workflow_approve_action(VSWorkflow *workflow);
+int  vs_workflow_task_ready(const VSWorkflow *workflow, int task_id);
+int  vs_workflow_set_task_status(VSWorkflow *workflow, int task_id, VSTaskStatus status, const char *summary);
+int  vs_workflow_consume_action_approval(VSWorkflow *workflow);
+const char *vs_workflow_mode_name(VSExecutionMode mode);
+int  vs_workflow_cycle_mode(VSWorkflow *workflow);
+void vs_workflow_clear_pending_task(VSContext *ctx);
+int  vs_workflow_take_pending_task(VSContext *ctx, char *out, size_t cap);
 void vs_init(VSContext *ctx);
 void vs_shutdown(VSContext *ctx);
 void vs_detect_platform(VSContext *ctx);
@@ -344,6 +448,7 @@ char *vs_graph_summary(const VSGraph *graph, int max_lines);
 int  vs_graph_export_dot(const VSGraph *graph, const char *path);
 char *vs_http_post_capture(const char *url, const char *headers[], int nheaders, const char *body, long *status, char *session_id, size_t session_cap);
 char *vs_http_post_ctx(VSContext *ctx, const char *url, const char *headers[], int nheaders, const char *body, long *status);
+int vs_http_post_stream_ctx(VSContext *ctx, const char *url, const char *headers[], int nheaders, const char *body, long *status, VSHTTPChunkCallback callback, void *userdata);
 char *vs_http_post_capture_ctx(VSContext *ctx, const char *url, const char *headers[], int nheaders, const char *body, long *status, char *session_id, size_t session_cap);
 char *vs_json_escape(const char *s);
 char *vs_base64_file(const char *path, size_t *out_len);
@@ -357,6 +462,7 @@ void vs_refresh_cache_key(VSContext *ctx);
 void vs_trace(VSContext *ctx, const char *kind, const char *detail);
 void vs_trace_clear(VSContext *ctx);
 void vs_set_trace_callback(VSContext *ctx, VSTraceCallback callback, void *userdata);
+void vs_set_stream_callback(VSContext *ctx, VSHTTPChunkCallback callback, void *userdata);
 void vs_cancel_request(VSContext *ctx);
 void vs_cancel_clear(VSContext *ctx);
 int  vs_cancel_requested(const VSContext *ctx);

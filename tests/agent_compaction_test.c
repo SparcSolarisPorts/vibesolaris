@@ -10,7 +10,7 @@ static char *d(const char *s){size_t n=strlen(s);char *p=(char*)malloc(n+1);if(p
 char *vs_chat(VSContext *c,const char *p){char b[128];(void)c;
     if(strstr(p,"INTERNAL_CONTEXT_COMPACTION")){compact_chats++;return d("CHECKPOINT_OK: inspected four steps; continue with remaining work.");}
     normal_chats++;if(strstr(p,"CHECKPOINT_OK"))saw_checkpoint=1;
-    if(normal_chats<=5){snprintf(b,sizeof(b),"[[VS_TOOL run cmd=\"printf step%d\"]]",normal_chats);return d(b);}
+    if(normal_chats<=5){snprintf(b,sizeof(b),"[[VS_TOOL run task_id=\"1\" cmd=\"printf step%d\"]]",normal_chats);return d(b);}
     return d("[[VS_FINAL]]complete");
 }
 void vs_trace(VSContext*c,const char*k,const char*x){(void)c;(void)k;(void)x;}void vs_trace_clear(VSContext*c){(void)c;}
@@ -32,4 +32,4 @@ char *vs_graph_summary(const VSGraph*g,int n){(void)g;(void)n;return optional_to
 /* Subagent isolation helpers used by agent.c; no state to release in this test. */
 void vs_history_clear(VSContext *c){(void)c;}
 void vs_cache_clear(VSContext *c){(void)c;}
-int main(void){VSContext c;char *out;memset(&c,0,sizeof(c));putenv("VIBESOLARIS_AGENT_COMPACT_ROUNDS=4");out=vs_agent_turn(&c,"please implement and test all of it");printf("out=%s normal=%d compact=%d runs=%d persisted=%d checkpoint=%d\n",out?out:"(null)",normal_chats,compact_chats,runs,persisted,saw_checkpoint);if(!out||strcmp(out,"complete")||normal_chats!=6||compact_chats<1||runs!=5||persisted!=2||!saw_checkpoint){free(out);return 1;}free(out);return 0;}
+int main(void){VSContext c;char *out;VSTaskRecord task;memset(&c,0,sizeof(c));vs_workflow_init(&c.workflow);memset(&task,0,sizeof(task));task.id=1;strcpy(task.title,"Compaction actions");if(vs_workflow_set_plan(&c.workflow,"Compaction test",&task,1)!=0||vs_workflow_accept(&c.workflow)!=0)return 1;putenv("VIBESOLARIS_AGENT_COMPACT_ROUNDS=4");out=vs_agent_turn(&c,"please implement and test all of it");printf("out=%s normal=%d compact=%d runs=%d persisted=%d checkpoint=%d\n",out?out:"(null)",normal_chats,compact_chats,runs,persisted,saw_checkpoint);if(!out||strcmp(out,"complete")||normal_chats!=6||compact_chats<1||runs!=5||persisted!=2||!saw_checkpoint){free(out);return 1;}free(out);return 0;}

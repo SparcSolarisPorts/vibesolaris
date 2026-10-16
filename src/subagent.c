@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static char *dupstr(const char *s)
 {
@@ -64,8 +65,12 @@ static void isolate_child(VSContext *child)
     /* The child must not rewrite the encrypted config; the parent owns persistence. */
     child->config_autosave=0;child->config_loading=0;
     child->cancel_requested=0;   /* cancellation is inherited through subagent_parent */
+    memset(child->subagents,0,sizeof(child->subagents));child->subagent_record_count=0;
+    child->subagent_root=NULL;child->subagent_record_id=0;
     child->trace_callback=forward_child_trace;
     child->trace_callback_data=child;
+    child->stream_callback=NULL;
+    child->stream_callback_data=NULL;
 }
 
 char *vs_subagent_request_prompt(const char *task)
@@ -83,13 +88,14 @@ char *vs_subagent_request_prompt(const char *task)
 
 char *vs_subagent_run(VSContext *parent,const char *task)
 {
-    VSContext *child;char *prompt,*ans,*out,detail[512];size_t n;int id;
+    VSContext *child,*root;char *prompt,*ans,*out,detail[512];size_t n;int id,record_index=-1;VSSubagentRecord *record=NULL;
     if(!parent)return dupstr("ERROR: subagent has no parent agent");
     if(!task||!*task)return dupstr("ERROR: subagent requires task=\"...\"");
     if(vs_cancel_requested(parent))return dupstr("Stopped by user.");
     if(parent->subagent_depth>=VS_MAX_SUBAGENT_DEPTH)
         return dupstr("ERROR: subagent nesting limit reached; complete this part directly.");
-    if(parent->subagent_serial>=VS_MAX_SUBAGENTS_PER_TURN)
+    root=parent->subagent_root?(VSContext*)parent->subagent_root:parent;
+    if(root->subagent_serial>=VS_MAX_SUBAGENTS_PER_TURN)
         return dupstr("ERROR: subagent limit for this turn reached; continue the remaining work directly.");
 
     child=(VSContext*)calloc(1,sizeof(VSContext));
@@ -97,16 +103,27 @@ char *vs_subagent_run(VSContext *parent,const char *task)
     memcpy(child,parent,sizeof(VSContext));
     isolate_child(child);
 
-    parent->subagent_serial++;
-    id=parent->subagent_serial;
+    if(parent!=root)parent->subagent_serial++;
+    id=++root->subagent_serial;
+    if(root->subagent_record_count<VS_MAX_SUBAGENT_RECORDS){
+        record_index=root->subagent_record_count++;
+        record=&root->subagents[record_index];
+        memset(record,0,sizeof(*record));record->id=id;record->parent_id=parent->subagent_id;
+        record->depth=parent->subagent_depth+1;record->status=0;record->started_at=(long)time(NULL);
+        child->subagent_record_id=id;
+        snprintf(record->task,sizeof(record->task),"%.255s",task);
+        snprintf(record->summary,sizeof(record->summary),"running");
+    }
     child->subagent_parent=parent;
+    child->subagent_root=parent->subagent_root?parent->subagent_root:parent;
     child->subagent_depth=parent->subagent_depth+1;
     child->subagent_id=id;
     child->subagent_serial=0;
+    child->subagent_root=root;
 
     n=strlen(task)+640;
     prompt=(char*)malloc(n);
-    if(!prompt){free(child);return dupstr("ERROR: out of memory preparing subagent");}
+    if(!prompt){if(record){record->status=3;record->finished_at=(long)time(NULL);snprintf(record->summary,sizeof(record->summary),"unable to prepare task");}free(child);return dupstr("ERROR: out of memory preparing subagent");}
     snprintf(prompt,n,
         "SUBAGENT TASK. You are a focused subagent delegated by the parent agent. Complete only this task "
         "using the available tools, then finish with a concise report of findings and changes. Do not ask the "
@@ -118,6 +135,13 @@ char *vs_subagent_run(VSContext *parent,const char *task)
     ans=vs_agent_turn(child,prompt);
     free(prompt);
 
+    if(record_index>=0&&root->subagent_record_count>record_index)record=&root->subagents[record_index];
+    if(record){
+        record->finished_at=(long)time(NULL);
+        if(vs_cancel_requested(parent)|| (ans&&strstr(ans,"Stopped by user"))){record->status=2;snprintf(record->summary,sizeof(record->summary),"stopped");}
+        else if(!ans||!strncmp(ans,"ERROR:",6)||strstr(ans,"limit reached")){record->status=3;snprintf(record->summary,sizeof(record->summary),"%.255s",ans?ans:"subagent returned no result");}
+        else {record->status=1;snprintf(record->summary,sizeof(record->summary),"completed");}
+    }
     snprintf(detail,sizeof(detail),"subagent %d finished",id);
     vs_trace(parent,"subagent-done",detail);
 

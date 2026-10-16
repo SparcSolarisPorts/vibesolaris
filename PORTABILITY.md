@@ -14,7 +14,7 @@ The source intentionally uses a conservative Unix/POSIX subset and plain C front
 
 ## Why Xlib and stdio
 
-The GUI uses Xlib directly instead of GTK or Qt. The TUI is plain terminal stdio instead of ncurses. This avoids pulling a modern desktop or terminal-widget stack onto old Solaris installations.
+The GUI uses Xlib directly instead of GTK or Qt. The TUI is plain terminal stdio instead of ncurses. Its interactive composer uses POSIX termios/read/select and conservative ANSI/VT100 redraws, while redirected and non-TTY sessions retain a plain stdio path. This avoids pulling a modern desktop or terminal-widget stack onto old Solaris installations.
 
 ## Compiler
 

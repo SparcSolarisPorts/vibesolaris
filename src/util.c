@@ -45,6 +45,7 @@ void vs_refresh_cache_key(VSContext *ctx) {
 
 void vs_init(VSContext *ctx) {
     memset(ctx,0,sizeof(*ctx));
+    vs_workflow_init(&ctx->workflow);
     if (!getcwd(ctx->cwd,sizeof(ctx->cwd))) strcpy(ctx->cwd,".");
     vs_detect_platform(ctx);
     vs_set_provider(ctx,"openai");

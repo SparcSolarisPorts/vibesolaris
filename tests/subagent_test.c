@@ -17,16 +17,16 @@ char *vs_chat(VSContext *c,const char *prompt){
     (void)prompt;
     if(c->subagent_depth==0){
         calls_d0++;
-        if(calls_d0==1)return strdup("I will look into it.\n[[VS_TOOL subagent task=\"Summarise README\"]]");
+        if(calls_d0==1)return strdup("I will look into it.\n[[VS_TOOL subagent task_id=\"1\" task=\"Summarise README\"]]");
         return strdup("Subagent reported back. [[VS_FINAL]]");
     }
     if(c->subagent_depth==1){
         calls_d1++;
-        if(d1_delegates_again&&calls_d1==1)return strdup("[[VS_TOOL subagent task=\"nested work\"]]");
+        if(d1_delegates_again&&calls_d1==1)return strdup("[[VS_TOOL subagent task_id=\"1\" task=\"nested work\"]]");
         return strdup("README summary: project builds. [[VS_FINAL]]");
     }
     calls_d2++;
-    if(calls_d2==1)return strdup("[[VS_TOOL subagent task=\"too deep\"]]");
+    if(calls_d2==1)return strdup("[[VS_TOOL subagent task_id=\"1\" task=\"too deep\"]]");
     return strdup("deep report [[VS_FINAL]]");
 }
 
@@ -72,11 +72,13 @@ int vs_write_file_dummy(void){return 0;}
 static int has_trace(const char *kind){int i;for(i=0;i<tn;i++)if(!strcmp(tk[i],kind))return 1;return 0;}
 static int has_detail_prefix(const char *p){int i;for(i=0;i<tn;i++)if(!strncmp(td[i],p,strlen(p)))return 1;return 0;}
 static int has_detail_text(const char *x){int i;for(i=0;i<tn;i++)if(strstr(td[i],x))return 1;return 0;}
+static int accept_test_plan(VSContext *c){VSTaskRecord task;memset(&task,0,sizeof(task));task.id=1;strcpy(task.title,"Subagent lifecycle test");vs_workflow_init(&c->workflow);return vs_workflow_set_plan(&c->workflow,"Subagent test",&task,1)||vs_workflow_accept(&c->workflow);}
 
 int main(void){
     static VSContext parent;
     char *out;char label[96];
     memset(&parent,0,sizeof(parent));
+    if(accept_test_plan(&parent))return 1;
 
     /* 1. delegation round trip */
     out=vs_agent_turn(&parent,"review the project");
@@ -84,15 +86,19 @@ int main(void){
     CHECK(calls_d1>=1,"subagent actually called the provider at depth 1");
     CHECK(has_trace("subagent-start"),"trace records subagent-start");
     CHECK(has_trace("subagent-done"),"trace records subagent-done");
+    CHECK(parent.subagent_record_count==1&&parent.subagents[0].id==1,"parent retains a structured subagent task record");
+    CHECK(parent.subagents[0].status==1&&parent.subagents[0].finished_at>=parent.subagents[0].started_at,"successful task records completion outcome and timestamps");
+    CHECK(strstr(parent.subagents[0].task,"Summarise README")!=NULL,"task record keeps a bounded task summary");
+    CHECK(parent.subagents[0].depth==1&&parent.subagents[0].parent_id==0,"record captures top-level task identity");
     CHECK(has_detail_prefix("[sub#1 d1]"),"child trace events are forwarded with [sub#1 d1] prefix");
     CHECK(parent.subagent_depth==0,"parent depth unchanged after subagent run");
     free(out);
 
     /* 2. nested delegation stops at the depth limit */
-    memset(&parent,0,sizeof(parent));calls_d0=calls_d1=calls_d2=0;tn=0;d1_delegates_again=1;
+    memset(&parent,0,sizeof(parent));if(accept_test_plan(&parent))return 1;calls_d0=calls_d1=calls_d2=0;tn=0;d1_delegates_again=1;
     out=vs_agent_turn(&parent,"review the project");
     CHECK(calls_d2>=1,"grandchild (depth 2) runs its own loop");
-    CHECK(has_detail_text("[sub#1 d1] [sub#1 d2]"),"depth-2 events nest under the depth-1 prefix when forwarded");
+    CHECK(has_detail_text("[sub#1 d1] [sub#2 d2]"),"depth-2 events keep distinct task IDs under the depth-1 prefix");
     CHECK(has_detail_text("nesting limit"),"depth-2 agent's delegation is refused at the limit");
     CHECK(!has_detail_text("d3]"),"no depth-3 agent was ever started");
     d1_delegates_again=0;free(out);
@@ -109,6 +115,7 @@ int main(void){
     parent.cancel_requested=1;
     out=vs_subagent_run(&parent,"anything");
     CHECK(out&&strstr(out,"Stopped by user"),"cancelled parent stops subagent before any work");
+    CHECK(parent.subagent_record_count==0,"pre-cancelled request does not create a running task record");
     free(out);
     {
         VSContext child;memset(&child,0,sizeof(child));child.subagent_parent=&parent;

@@ -66,6 +66,7 @@ void vs_trace(VSContext *c,const char *kind,const char *detail)
 }
 void vs_trace_clear(VSContext *c){int i;if(!c)return;for(i=0;i<c->trace_count;i++)free(c->trace[i].detail);memset(c->trace,0,sizeof(c->trace));c->trace_count=0;c->trace_dropped=0;c->trace_bytes=0;}
 void vs_set_trace_callback(VSContext *c,VSTraceCallback callback,void *userdata){if(!c)return;c->trace_callback=callback;c->trace_callback_data=userdata;}
+void vs_set_stream_callback(VSContext *c,VSHTTPChunkCallback callback,void *userdata){if(!c)return;c->stream_callback=callback;c->stream_callback_data=userdata;}
 
 static int server_index(VSContext *c,const char *name){int i;for(i=0;i<c->mcp_server_count;i++)if(!strcmp(c->mcp_servers[i].name,name))return i;return -1;}
 
@@ -203,7 +204,30 @@ int vs_mcp_refresh_server(VSContext *c,int index)
 }
 int vs_mcp_refresh_all(VSContext *c,int force)
 {
-    int i,total=0,need=force;if(!c)return -1;if(vs_cancel_requested(c))return -1;if(!force){for(i=0;i<c->mcp_server_count;i++)if(c->mcp_servers[i].enabled&&!c->mcp_servers[i].tools_loaded){need=1;break;}if(!need)return c->mcp_tool_count;}c->mcp_tool_count=0;for(i=0;i<c->mcp_server_count;i++){if(vs_cancel_requested(c))return -1;c->mcp_servers[i].tools_loaded=0;if(c->mcp_servers[i].enabled){int n=vs_mcp_refresh_server(c,i);if(n>0)total+=n;}}return total;
+    VSMcpTool *previous;int loaded[VS_MAX_MCP_SERVERS],old_count,i,total=0,need=force,failed=0;
+    if(!c)return -1;
+    if(vs_cancel_requested(c))return -1;
+    if(!force){for(i=0;i<c->mcp_server_count;i++)if(c->mcp_servers[i].enabled&&!c->mcp_servers[i].tools_loaded){need=1;break;}if(!need)return c->mcp_tool_count;}
+    previous=(VSMcpTool*)malloc(sizeof(c->mcp_tools));
+    if(!previous)return -1;
+    memcpy(previous,c->mcp_tools,sizeof(c->mcp_tools));old_count=c->mcp_tool_count;
+    for(i=0;i<c->mcp_server_count;i++)loaded[i]=c->mcp_servers[i].tools_loaded;
+    c->mcp_tool_count=0;
+    for(i=0;i<c->mcp_server_count;i++){
+        int n;
+        if(vs_cancel_requested(c)){failed=1;break;}
+        c->mcp_servers[i].tools_loaded=0;
+        if(!c->mcp_servers[i].enabled)continue;
+        n=vs_mcp_refresh_server(c,i);
+        if(n<0){failed=1;break;}
+        total+=n;
+    }
+    if(failed){
+        memcpy(c->mcp_tools,previous,sizeof(c->mcp_tools));c->mcp_tool_count=old_count;
+        for(i=0;i<c->mcp_server_count;i++)c->mcp_servers[i].tools_loaded=loaded[i];
+        free(previous);return -1;
+    }
+    free(previous);return total;
 }
 char *vs_mcp_call(VSContext *c,const char *server,const char *tool,const char *args)
 {

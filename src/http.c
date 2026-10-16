@@ -33,6 +33,15 @@ static size_t wr(void *ptr,size_t sz,size_t nm,void *ud){
     }
     memcpy(b->p+b->n,ptr,k);b->n+=k;b->p[b->n]=0;return k;
 }
+
+typedef struct { VSHTTPChunkCallback callback; void *userdata; } StreamCtx;
+static size_t stream_wr(void *ptr,size_t sz,size_t nm,void *ud){
+    StreamCtx *s=(StreamCtx*)ud;size_t n;
+    if(!s||!s->callback||sz==0||nm==0)return 0;
+    if(nm>((size_t)-1)/sz)return 0;
+    n=sz*nm;
+    return s->callback(s->userdata,(const char*)ptr,n)==0?n:0;
+}
 static int ci_prefix(const char *s,size_t n,const char *p){size_t i,m=strlen(p);if(n<m)return 0;for(i=0;i<m;i++)if(tolower((unsigned char)s[i])!=tolower((unsigned char)p[i]))return 0;return 1;}
 static size_t hdrwr(void *ptr,size_t sz,size_t nm,void *ud){
     HdrCtx *h=(HdrCtx*)ud;char *s=(char*)ptr;size_t n=sz*nm;const char *key="Mcp-Session-Id:";size_t k=strlen(key),a,b,c;
@@ -96,6 +105,27 @@ char *vs_http_post_capture_ctx(VSContext *ctx,const char *url,const char *header
         free(b.p);return NULL;
     }
     return b.p;
+}
+int vs_http_post_stream_ctx(VSContext *ctx,const char *url,const char *headers[],int nheaders,const char *body,long *status,VSHTTPChunkCallback callback,void *userdata){
+    CURL *c;struct curl_slist *h=0;StreamCtx s;int i;CURLcode rc;char phost[1024],pauth[1024],redacted[1024],tracebuf[1200];
+    if(!url||!callback)return -1;if(status)*status=0;s.callback=callback;s.userdata=userdata;
+    c=curl_easy_init();if(!c)return -1;
+    for(i=0;i<nheaders;i++){struct curl_slist *nh=curl_slist_append(h,headers[i]);if(!nh){curl_slist_free_all(h);curl_easy_cleanup(c);return -1;}h=nh;}
+    curl_easy_setopt(c,CURLOPT_URL,url);curl_easy_setopt(c,CURLOPT_HTTPHEADER,h);curl_easy_setopt(c,CURLOPT_POSTFIELDS,body?body:"");curl_easy_setopt(c,CURLOPT_WRITEFUNCTION,stream_wr);curl_easy_setopt(c,CURLOPT_WRITEDATA,&s);curl_easy_setopt(c,CURLOPT_USERAGENT,"vibesolaris/" VS_VERSION);curl_easy_setopt(c,CURLOPT_SSL_VERIFYPEER,1L);curl_easy_setopt(c,CURLOPT_SSL_VERIFYHOST,2L);curl_easy_setopt(c,CURLOPT_CONNECTTIMEOUT,30L);curl_easy_setopt(c,CURLOPT_TIMEOUT,600L);curl_easy_setopt(c,CURLOPT_NOSIGNAL,1L);
+    if(ctx){curl_easy_setopt(c,CURLOPT_NOPROGRESS,0L);
+#if LIBCURL_VERSION_NUM >= 0x072000
+        curl_easy_setopt(c,CURLOPT_XFERINFOFUNCTION,cancel_xfer);curl_easy_setopt(c,CURLOPT_XFERINFODATA,ctx);
+#else
+        curl_easy_setopt(c,CURLOPT_PROGRESSFUNCTION,cancel_progress);curl_easy_setopt(c,CURLOPT_PROGRESSDATA,ctx);
+#endif
+    }
+#ifdef CURLOPT_TCP_KEEPALIVE
+    curl_easy_setopt(c,CURLOPT_TCP_KEEPALIVE,1L);
+#endif
+    if(ctx&&ctx->proxy_enabled&&ctx->proxy[0]){proxy_parts(ctx->proxy,phost,sizeof(phost),pauth,sizeof(pauth));if(phost[0]){curl_easy_setopt(c,CURLOPT_PROXY,phost);curl_easy_setopt(c,CURLOPT_NOPROXY,"");}if(pauth[0]){curl_easy_setopt(c,CURLOPT_PROXYUSERPWD,pauth);curl_easy_setopt(c,CURLOPT_PROXYAUTH,(long)CURLAUTH_BASIC);}vs_proxy_redacted(ctx,redacted,sizeof(redacted));snprintf(tracebuf,sizeof(tracebuf),"routing streaming HTTP request via %s",redacted);vs_trace(ctx,"proxy",tracebuf);}
+    if(ctx&&vs_cancel_requested(ctx)){curl_slist_free_all(h);curl_easy_cleanup(c);return -2;}
+    rc=curl_easy_perform(c);if(status)curl_easy_getinfo(c,CURLINFO_RESPONSE_CODE,status);curl_slist_free_all(h);curl_easy_cleanup(c);
+    if(rc!=CURLE_OK){if(ctx){if(vs_cancel_requested(ctx)&&rc==CURLE_ABORTED_BY_CALLBACK)vs_trace(ctx,"cancel","streaming HTTP request cancelled by user");else{snprintf(tracebuf,sizeof(tracebuf),"streaming HTTP transport failed: %s",curl_easy_strerror(rc));vs_trace(ctx,"http-error",tracebuf);}}return -1;}return 0;
 }
 char *vs_http_post_ctx(VSContext *ctx,const char *url,const char *headers[],int nheaders,const char *body,long *status){return vs_http_post_capture_ctx(ctx,url,headers,nheaders,body,status,NULL,0);}
 char *vs_http_post_capture(const char *url,const char *headers[],int nheaders,const char *body,long *status,char *session_id,size_t session_cap){return vs_http_post_capture_ctx(NULL,url,headers,nheaders,body,status,session_id,session_cap);}

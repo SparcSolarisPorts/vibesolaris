@@ -22,6 +22,7 @@ int main(void){
     snprintf(src.claude_oauth.token_type,sizeof(src.claude_oauth.token_type),"Bearer");
     src.claude_oauth.expires_at=4102444800L;
     snprintf(src.oauth.client_id,sizeof(src.oauth.client_id),"openai-app");
+    src.provider_anthropic_auth[VS_PROVIDER_CUSTOM]=1;
 
     /* encrypted-store serialization includes Claude tokens */
     enc=vs_config_serialize(&src);
@@ -39,6 +40,8 @@ int main(void){
     CHECK(!saw_at_plain,"plain-text export contains no Claude tokens");
     CHECK(saw_claude_cfg_plain,"plain-text export keeps Claude non-secret settings");
 
+    CHECK(enc&&strstr(enc,"anthropic_auth_custom=x-api-key"),"encrypted serialization saves custom Anthropic auth style");
+
     /* round trip: encrypted text restores Claude slot exactly and leaves OpenAI slot alone */
     memset(&dst,0,sizeof(dst));
     CHECK(vs_config_apply_text(&dst,enc)==0,"config text applies");
@@ -47,7 +50,36 @@ int main(void){
     CHECK(strcmp(dst.claude_oauth.client_id,"11111111-2222-3333-4444-555555555555")==0,"Claude client ID round-trips");
     CHECK(dst.claude_oauth.expires_at==4102444800L,"Claude expiry round-trips");
     CHECK(strcmp(dst.oauth.client_id,"openai-app")==0,"OpenAI client ID round-trips alongside Claude");
+    CHECK(dst.provider_anthropic_auth[VS_PROVIDER_CUSTOM]==1,"custom Anthropic auth style round-trips");
+    /* A custom URL is shared across protocol switches and both serialized slots. */
+    memset(&src,0,sizeof(src));
+    src.provider.kind=VS_PROVIDER_CUSTOM;src.provider.protocol=VS_PROTOCOL_OPENAI;
+    snprintf(src.provider.name,sizeof(src.provider.name),"custom");
+    snprintf(src.provider.api_key,sizeof(src.provider.api_key),"shared-key");
+    snprintf(src.provider.base_url,sizeof(src.provider.base_url),"https://gateway.example/base");
+    vs_set_base_url(&src,src.provider.base_url);vs_set_api_key(&src,src.provider.api_key);
+    CHECK(strcmp(src.provider_openai_urls[VS_PROVIDER_CUSTOM],src.provider_anthropic_urls[VS_PROVIDER_CUSTOM])==0,"custom URL is mirrored across protocols");
+    CHECK(vs_set_protocol(&src,"anthropic")==0&&strcmp(src.provider.base_url,"https://gateway.example/base")==0,"custom URL survives protocol switch");
+    enc=vs_config_serialize(&src);memset(&dst,0,sizeof(dst));CHECK(vs_config_apply_text(&dst,enc)==0,"shared custom config applies");
+    CHECK(strcmp(dst.provider_openai_urls[VS_PROVIDER_CUSTOM],"https://gateway.example/base")==0&&strcmp(dst.provider_anthropic_urls[VS_PROVIDER_CUSTOM],"https://gateway.example/base")==0,"shared custom URL round-trips");
+    CHECK(strcmp(dst.provider_api_keys[VS_PROVIDER_CUSTOM],"shared-key")==0,"shared custom key round-trips");
     CHECK(dst.oauth.access_token[0]==0,"OpenAI slot does not inherit Claude tokens");
+
+    /* Legacy custom configs with protocol-specific URLs migrate to the active
+       protocol's URL and then use that value for both protocol slots. */
+    memset(&dst,0,sizeof(dst));
+    CHECK(vs_config_apply_text(&dst,
+        "provider=custom\nprotocol=anthropic\nprotocol_custom=anthropic\n"
+        "openai_url_custom=https://legacy.example/openai\n"
+        "anthropic_url_custom=https://legacy.example/anthropic\n"
+        "api_key_custom=legacy-key\n")==0,"legacy custom config applies");
+    CHECK(strcmp(dst.provider.base_url,"https://legacy.example/anthropic")==0,
+          "legacy custom config prefers active protocol URL");
+    CHECK(strcmp(dst.provider_openai_urls[VS_PROVIDER_CUSTOM],
+                 dst.provider_anthropic_urls[VS_PROVIDER_CUSTOM])==0,
+          "legacy custom URLs migrate to one shared value");
+    CHECK(strcmp(dst.provider_api_keys[VS_PROVIDER_CUSTOM],"legacy-key")==0,
+          "legacy custom key remains shared");
     free(enc);
     if(fails){fprintf(stderr,"%d failure(s)\n",fails);return 1;}
     printf("all config Claude tests passed\n");return 0;

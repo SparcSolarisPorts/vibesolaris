@@ -250,7 +250,7 @@ Changes are autosaved to the encrypted configuration store when possible.
 
 Every GUI prompt has its own **Activity** disclosure row between the prompt and the final answer. It is collapsed by default so normal chat stays compact. The row summarises the number of recorded steps, model calls, local tools, MCP calls, and errors. Click the row to expand the complete execution trace; click it again to collapse it. Expanded trace text can be selected and copied like other conversation text.
 
-The trace is an execution log (model requests, local tools, commands, file operations, MCP discovery/calls/results), not private model chain-of-thought. The TUI streams each observable activity event immediately while the agent is working and retains the completed trace for `/trace`.
+The trace is an execution log (model requests, local tools, commands, file operations, MCP discovery/calls/results), not private model chain-of-thought. The TUI streams each observable activity event immediately while the agent is working and retains the completed trace for `/trace`. OpenAI-compatible and Anthropic-compatible provider responses are also requested and rendered as SSE streams; tool and plan markers are acted on only after the complete response is assembled. Gemini remains buffered.
 
 ## TUI setup
 
@@ -373,7 +373,7 @@ Gemini uses its native adapter rather than pretending to be OpenAI-compatible.
 
 ### Custom endpoint
 
-Use this for an OpenAI-compatible or Anthropic-compatible server not represented by a preset:
+Use this for an OpenAI-compatible or Anthropic-compatible server not represented by a preset. Custom providers use one shared URL and API key across both protocols; use a gateway base URL that supports both request formats:
 
 ```text
 /provider custom
@@ -434,7 +434,7 @@ The agent also has native web tools:
 
 ### Slash completion and GUI shortcuts
 
-When the GUI composer begins with `/`, matching commands appear above the composer. Press `Tab` to complete. The lightweight local commands `/graph files`, `/graph fields`, `/usage`, `/trace`, `/help`, and `/clear` do not consume a model round.
+When either composer begins with `/`, a live dropdown filters matching commands as you type. Use `Up`/`Down` to highlight an entry, `Enter` to insert it without sending, `Tab` for common-prefix completion, and `Escape` to close the menu while keeping the draft. Press `Enter` again to submit. The lightweight local commands `/graph files`, `/graph fields`, `/usage`, `/trace`, `/help`, and `/clear` do not consume a model round.
 
 ### File and image attachments
 
@@ -607,7 +607,9 @@ Attachments, local tools, web and graphs:
 /graph dot files PATH OUTPUT.dot
 ```
 
-The TUI has lightweight line editing: `Tab` completes `/` commands, Up/Down recalls command history, `Ctrl+U` clears the current input, and `Ctrl+L` clears/redraws the screen. UTF-8 input is preserved.
+The TUI has a portable interactive composer: `Enter` submits, `Ctrl+J` inserts a newline, `Tab` completes `/` commands (when ambiguous, use Up/Down and Enter to insert a choice), and `Shift+Tab` cycles the visible `Auto`/`Plan` mode while idle. Up/Down recalls history while restoring the current draft after the newest entry. Left/Right move the cursor, `Ctrl+A`/`Ctrl+E` go to the start/end, Backspace/Delete edit at the cursor, `Ctrl+U` clears input, and `Ctrl+L` clears/redraws the screen. UTF-8 byte sequences are kept intact. The status line shows the working directory, provider/model, execution mode and pending attachment count. Use `/mode auto|plan|manual` or `/mode status` to inspect/change policy. Use `/attachments` to inspect pending file/image paths and sizes, `/attach-remove INDEX` to remove one, and `/clearattach` to remove all. Images are sent as native visual input to the selected provider; the dependency-free TUI does not render thumbnails.
+
+`/subagent TASK` delegates a focused task synchronously. `/subagents` shows the current turn's bounded task list, nesting and outcome; activity is still visible in `/trace`. This view does not imply parallel worker scheduling or independent pause/resume. The interface is Claude Code-inspired, not full feature parity; redirected/non-TTY sessions remain plain text.
 
 Long compiler output, huge file listings, model-input traces and other noisy activity are **not painted in full by default**. Compact mode shows a short bounded preview and byte/line counts while the useful bounded result remains available to the agent. Use `/output normal` for more detail or `/output full` when you explicitly need every stored line; `/trace full` does the same temporarily for the activity trace. This avoids making a terminal crawl merely because a compiler emitted thousands of warnings.
 
@@ -646,7 +648,7 @@ Exit:
 
 ## Autonomous continuation
 
-For execution requests such as fixing code, editing files, building, testing, debugging, or modifying a project, VibeSolaris does not treat a planning-only model response as completion. If a model says that it *will* inspect, edit, build, or test something without actually issuing a local/MCP tool directive, the host automatically sends a continuation instruction and the agent keeps working.
+For execution requests such as fixing code, editing files, building, testing, debugging, or modifying a project, VibeSolaris does not treat a planning-only model response as completion. If a model says that it *will* inspect, edit, build, or test something without actually issuing a local/MCP tool directive, the host automatically sends a continuation instruction and the agent keeps working. Read-only discovery (`read`, `list`, `search`, `graph`, `web_search`, and `web_fetch`) does not require plan approval. Side-effecting work uses a structured plan: `Plan` mode pauses for Yes/No review, while `Auto` accepts the valid plan and continues immediately. Accepting a paused plan also resumes the original task automatically; the task is not submitted a second time.
 
 The portable text-agent protocol also recognises two lifecycle markers:
 
@@ -657,8 +659,10 @@ The portable text-agent protocol also recognises two lifecycle markers:
 means the requested work is actually complete.
 
 ```text
-[[VS_NEED_USER question="The genuinely blocking question"]]
+[[VS_NEED_USER question="Which environment should I target?" option1="Development" option2="Production"]]
 ```
+
+Options are optional; existing question-only markers remain valid. A bounded set of up to eight `optionN` labels can be shown as selectable choices. Escape quotes and backslashes with a backslash. Selecting an option submits its label as the user's answer and does not grant plan or action approval. When no options are supplied, the user can reply freely.
 
 means execution cannot safely continue without user input. Models are instructed to use this only for real blockers such as missing credentials, destructive-action permission, missing information, or an unavoidable user decision—not merely to ask whether they should proceed.
 

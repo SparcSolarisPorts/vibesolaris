@@ -8,11 +8,11 @@
 #include <stdint.h>
 /* ---- stubs for provider.c collaborators ---- */
 static char *dupstr_test(const char *x){char *p=malloc(strlen(x)+1);strcpy(p,x);return p;}
-static char last_headers[4096];static char last_url[1024];static int calls=0;
+static char last_headers[4096];static char last_url[1024];static char last_body[16384];static const char *test_response="{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}";static int calls=0;
 char *vs_http_post_ctx(VSContext *c,const char *u,const char *h[],int n,const char *b,long *s){
-    int i;(void)c;(void)b;calls++;*s=200;snprintf(last_url,sizeof(last_url),"%s",u);last_headers[0]=0;
+    int i;(void)c;calls++;*s=200;snprintf(last_url,sizeof(last_url),"%s",u);snprintf(last_body,sizeof(last_body),"%s",b?b:"");last_headers[0]=0;
     for(i=0;i<n;i++){strcat(last_headers,h[i]);strcat(last_headers,"\n");}
-    return dupstr_test("{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}");
+    return dupstr_test(test_response);
 }
 const char *vs_command_shell_name(void){return "sh";}
 char *vs_mcp_prompt_fragment(const VSContext *c){(void)c;return NULL;}
@@ -21,19 +21,20 @@ void vs_trace(VSContext *c,const char *k,const char *d){(void)c;(void)k;(void)d;
 char *vs_cached_read_file(VSContext *c,const char *p){(void)c;(void)p;return NULL;}
 char *vs_cached_base64_file(VSContext *c,const char *p,size_t *n){(void)c;(void)p;(void)n;return NULL;}
 char *vs_compact_text_limit(const char *s,size_t l,const char *r){(void)l;(void)r;return s?dupstr_test(s):NULL;}
-char *vs_json_escape(const char *s){size_t n=strlen(s),i,j=0;char *o=malloc(n*2+3);o[j++]='\0';o[0]=0;for(i=0;i<n;i++){if(s[i]=='"'||s[i]=='\\'){o[j++]='\\';}o[j++]=s[i];}o[j]=0;return o;}
+char *vs_json_escape(const char *s){size_t n=strlen(s),i,j=0;char *o=malloc(n*2+3);if(!o)return NULL;for(i=0;i<n;i++){if(s[i]=='"'||s[i]=='\\'){o[j++]='\\';}o[j++]=s[i];}o[j]=0;return o;}
 int vs_cancel_requested(const VSContext *c){(void)c;return 0;}
 int vs_persist_settings(VSContext *c){(void)c;return 0;}
 int vs_open_url(const char *u){(void)u;return 1;}
 const char *vs_protocol_name(VSProtocolKind p){return p==VS_PROTOCOL_ANTHROPIC?"anthropic":"openai";}
 /* vs_build_system_prompt and friends live in provider.c and need stubs only for the above */
 static int fails=0;
-#define CHECK(c,m) do{ if(!(c)){fprintf(stderr,"FAIL: %s\n  headers:\n%s  url: %s\n",m,last_headers,last_url);fails++;} else printf("ok: %s\n",m);}while(0)
+#define CHECK(c,m) do{ if(!(c)){fprintf(stderr,"FAIL: %s\n  headers:\n%s  url: %s\n  body: %s\n",m,last_headers,last_url,last_body);fails++;} else printf("ok: %s\n",m);}while(0)
 
 static VSContext ctx;
 static void setup(const char *base,const char *apikey,int with_oauth)
 {
     memset(&ctx,0,sizeof(ctx));
+    calls=0;last_headers[0]=last_url[0]=last_body[0]=0;test_response="{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}";
     ctx.provider.kind=VS_PROVIDER_CLAUDE;ctx.provider.protocol=VS_PROTOCOL_ANTHROPIC;
     snprintf(ctx.provider.name,sizeof(ctx.provider.name),"claude");
     snprintf(ctx.provider.base_url,sizeof(ctx.provider.base_url),"%s",base);
@@ -74,6 +75,50 @@ int main(void){
     /* 5. nothing configured */
     setup("https://api.anthropic.com/v1/messages","",0);
     out=vs_chat(&ctx,"hello");CHECK(out&&strstr(out,"No Claude API key or Claude OAuth session")!=NULL,"clear message when Claude has no credential");free(out);
+
+    /* Custom Anthropic protocol supports configurable auth and preserves mixed-case model IDs. */
+    setup("https://gateway.example.com/api/?tenant=x","custom-key",0);
+    ctx.provider.kind=VS_PROVIDER_CUSTOM;snprintf(ctx.provider.name,sizeof(ctx.provider.name),"custom");
+    ctx.provider.protocol=VS_PROTOCOL_ANTHROPIC;snprintf(ctx.provider.base_url,sizeof(ctx.provider.base_url),"https://gateway.example.com/api/?tenant=x");
+    snprintf(ctx.provider.api_key,sizeof(ctx.provider.api_key),"custom-key");snprintf(ctx.provider.model,sizeof(ctx.provider.model),"Claude-Sonnet-Custom");ctx.provider_anthropic_auth[VS_PROVIDER_CUSTOM]=0;
+    out=vs_chat(&ctx,"hello");CHECK(out&&strcmp(out,"hi")==0,"Anthropic text block parsed");free(out);
+    CHECK(strcmp(last_url,"https://gateway.example.com/api/v1/messages?tenant=x")==0,"Anthropic endpoint appended before query");
+    CHECK(strstr(last_headers,"Authorization: Bearer custom-key")!=NULL,"custom Anthropic defaults to bearer auth");
+    CHECK(strstr(last_body,"\"model\":\"Claude-Sonnet-Custom\"")!=NULL,"model ID is preserved exactly");
+    ctx.provider_anthropic_auth[VS_PROVIDER_CUSTOM]=1;out=vs_chat(&ctx,"hello");free(out);
+    CHECK(strstr(last_headers,"x-api-key: custom-key")!=NULL,"custom Anthropic can select x-api-key auth");
+    setup("https://gateway.example.com/v1/messages/","custom-key",0);ctx.provider.kind=VS_PROVIDER_CUSTOM;ctx.provider.protocol=VS_PROTOCOL_ANTHROPIC;snprintf(ctx.provider.name,sizeof(ctx.provider.name),"custom");snprintf(ctx.provider.base_url,sizeof(ctx.provider.base_url),"https://gateway.example.com/v1/messages/");snprintf(ctx.provider.api_key,sizeof(ctx.provider.api_key),"custom-key");snprintf(ctx.provider.model,sizeof(ctx.provider.model),"claude-sonnet-5");ctx.provider_anthropic_auth[VS_PROVIDER_CUSTOM]=0;
+    out=vs_chat(&ctx,"hello");free(out);CHECK(strcmp(last_url,"https://gateway.example.com/v1/messages/")==0,"full endpoint with trailing slash is retained");
+    test_response="{\"content\":[{\"type\":\"text\",\"text\":\"first\"},{\"type\":\"text\",\"text\":\"second\"}]}";
+    out=vs_chat(&ctx,"hello");CHECK(out&&strcmp(out,"first\nsecond")==0,"multiple Anthropic text blocks are joined in order");free(out);
+    /* A shared custom /v1 base maps to each protocol's route without a
+       duplicated /v1 segment. */
+    setup("https://gateway.example.com/v1","custom-key",0);
+    ctx.provider.kind=VS_PROVIDER_CUSTOM;snprintf(ctx.provider.name,sizeof(ctx.provider.name),"custom");
+    ctx.provider.protocol=VS_PROTOCOL_OPENAI;snprintf(ctx.provider.base_url,sizeof(ctx.provider.base_url),"https://gateway.example.com/v1");
+    out=vs_chat(&ctx,"hello");free(out);
+    CHECK(strcmp(last_url,"https://gateway.example.com/v1/chat/completions")==0,"custom /v1 base maps to OpenAI endpoint");
+    ctx.provider.protocol=VS_PROTOCOL_ANTHROPIC;
+    out=vs_chat(&ctx,"hello");free(out);
+    CHECK(strcmp(last_url,"https://gateway.example.com/v1/messages")==0,"custom /v1 base maps to Anthropic endpoint");
+    CHECK(strstr(last_headers,"Authorization: Bearer custom-key")!=NULL,"custom Anthropic keeps shared API key");
+
+    /* A shared custom full endpoint is normalized when switching protocols. */
+    setup("https://gateway.example.com/chat/completions/","custom-key",0);
+    ctx.provider.kind=VS_PROVIDER_CUSTOM;snprintf(ctx.provider.name,sizeof(ctx.provider.name),"custom");
+    ctx.provider.protocol=VS_PROTOCOL_ANTHROPIC;snprintf(ctx.provider.base_url,sizeof(ctx.provider.base_url),"https://gateway.example.com/chat/completions/");
+    out=vs_chat(&ctx,"hello");free(out);
+    CHECK(strcmp(last_url,"https://gateway.example.com/v1/messages/")==0,"custom OpenAI endpoint switches to Anthropic endpoint");
+    ctx.provider.protocol=VS_PROTOCOL_OPENAI;snprintf(ctx.provider.base_url,sizeof(ctx.provider.base_url),"https://gateway.example.com/v1/messages?tenant=x");
+    out=vs_chat(&ctx,"hello");free(out);
+    CHECK(strcmp(last_url,"https://gateway.example.com/chat/completions?tenant=x")==0,"custom Anthropic endpoint switches to OpenAI endpoint");
+    setup("https://gateway.example.com/v1/messages","custom-key",0);
+    ctx.provider.kind=VS_PROVIDER_CUSTOM;snprintf(ctx.provider.name,sizeof(ctx.provider.name),"custom");
+    ctx.provider.protocol=VS_PROTOCOL_ANTHROPIC;snprintf(ctx.provider.base_url,sizeof(ctx.provider.base_url),"https://gateway.example.com/v1/messages");
+    test_response="{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad request\"}}";
+    out=vs_chat(&ctx,"hello");CHECK(out&&strstr(out,"Anthropic API error: bad request")!=NULL,"Anthropic error payload has useful message");free(out);
+    test_response="{\"stop_reason\":\"refusal\",\"content\":[{\"type\":\"text\",\"text\":\"cannot help\"}]}";
+    out=vs_chat(&ctx,"hello");CHECK(out&&strstr(out,"cannot help")!=NULL,"Anthropic refusal text is returned");free(out);
 
     if(fails){fprintf(stderr,"%d failure(s)\n",fails);return 1;}
     printf("all provider Claude OAuth tests passed\n");return 0;

@@ -3,12 +3,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-static int chats=0,runs=0;
+static int chats=0,runs=0,scenario=0;
 static char *d(const char*s){size_t n=strlen(s);char*p=(char*)malloc(n+1);memcpy(p,s,n+1);return p;}
 char *vs_chat(VSContext*c,const char*p){(void)c;(void)p;chats++;
- if(chats==1)return d("[[VS_TOOL run cmd=\"printf first\"]]");
+ if(scenario==1){if(chats<=2)return d("[[VS_TOOL run task_id=\"1\" cmd=\"printf repeated\"]]");return d("[[VS_FINAL]]changed approach complete");}
+ if(scenario==2){if(chats==1)return d("[[VS_TOOL run task_id=\"1\" cmd=\"printf first\"]]");return d("Still thinking about the next step.");}
+ if(chats==1)return d("[[VS_TOOL run task_id=\"1\" cmd=\"printf first\"]]");
  if(chats==2)return d("I am still investigating this state and have not finished yet.");
- if(chats==3)return d("[[VS_TOOL run cmd=\"printf second\"]]");
+ if(chats==3)return d("[[VS_TOOL run task_id=\"1\" cmd=\"printf second\"]]");
  return d("[[VS_FINAL]]complete");}
 void vs_trace(VSContext*c,const char*k,const char*x){(void)c;fprintf(stderr,"[%s] %s\n",k,x);}void vs_trace_clear(VSContext*c){(void)c;}
 int vs_mcp_refresh_all(VSContext*c,int f){(void)c;(void)f;return 0;}char*vs_mcp_call(VSContext*c,const char*s,const char*t,const char*a){(void)c;(void)s;(void)t;(void)a;return d("mcp");}
@@ -28,4 +30,4 @@ char *vs_graph_summary(const VSGraph*g,int n){(void)g;(void)n;return optional_to
 /* Subagent isolation helpers used by agent.c; no state to release in this test. */
 void vs_history_clear(VSContext *c){(void)c;}
 void vs_cache_clear(VSContext *c){(void)c;}
-int main(void){VSContext c;char*out;memset(&c,0,sizeof(c));out=vs_agent_turn(&c,"ok sounds good, do all that");printf("%s chats=%d runs=%d\n",out,chats,runs);if(strcmp(out,"complete")||chats!=4||runs!=2)return 1;free(out);return 0;}
+int main(void){VSContext c;char*out;VSTaskRecord task;memset(&c,0,sizeof(c));vs_workflow_init(&c.workflow);memset(&task,0,sizeof(task));task.id=1;strcpy(task.title,"Authorized test actions");if(vs_workflow_set_plan(&c.workflow,"Strict execution test",&task,1)!=0||vs_workflow_accept(&c.workflow)!=0)return 1;out=vs_agent_turn(&c,"ok sounds good, do all that");printf("%s chats=%d runs=%d\n",out,chats,runs);if(strcmp(out,"complete")||chats!=4||runs!=2)return 1;free(out);memset(&c,0,sizeof(c));vs_workflow_init(&c.workflow);if(vs_workflow_set_plan(&c.workflow,"Repeated action test",&task,1)!=0||vs_workflow_accept(&c.workflow)!=0)return 1;chats=runs=0;scenario=1;out=vs_agent_turn(&c,"fix the repeated action");if(!out||strncmp(out,"Paused because",14)||chats!=2||runs!=1){free(out);return 2;}free(out);memset(&c,0,sizeof(c));vs_workflow_init(&c.workflow);if(vs_workflow_set_plan(&c.workflow,"No progress test",&task,1)!=0||vs_workflow_accept(&c.workflow)!=0)return 1;chats=runs=0;scenario=2;out=vs_agent_turn(&c,"implement the requested change");if(!out||!strstr(out,"Paused because the agent stopped making progress")||chats!=3||runs!=1){free(out);return 3;}free(out);return 0;}

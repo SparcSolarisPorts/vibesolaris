@@ -81,7 +81,7 @@ static char *fallback_checkpoint(VSContext *c,const char *task){size_t cap=VS_AG
 static int bad_checkpoint(const char *s){if(!s||!*s)return 1;if(strstr(s,"[[VS_TOOL")||strstr(s,"[[VS_MCP")||strstr(s,"[[VS_FINAL")||strstr(s,"[[VS_NEED_USER"))return 1;if(!strncmp(s,"HTTP request failed",19)||!strncmp(s,"provider error",14)||!strncmp(s,"No API",6))return 1;return 0;}
 
 static void agent_compact(VSContext *c,const char *task,int completed_rounds){
-    char *p,*summary,*bounded,*fallback;size_t n;int interval=compact_interval(),saved_attachment_from;char trace[256];
+    char *p,*summary,*bounded,*fallback;size_t n;int interval=compact_interval(),saved_attachment_from;VSHTTPChunkCallback saved_stream;void *saved_stream_data;char trace[256];
     if(!c||c->agent_history_count<=0||interval==0)return;
     if((completed_rounds%interval)!=0&&c->agent_history_bytes<(VS_AGENT_HISTORY_BUDGET*3)/4)return;
     n=strlen(task?task:"")+(c->agent_checkpoint?strlen(c->agent_checkpoint):0)+1200;p=(char*)malloc(n);if(!p)return;
@@ -89,6 +89,12 @@ static void agent_compact(VSContext *c,const char *task,int completed_rounds){
         "INTERNAL_CONTEXT_COMPACTION. Return ONLY a dense working-state summary for another coding-agent round. Do not call tools, do not answer the user, and do not emit VS_* markers. Preserve: objective/constraints; host OS/toolchain facts; files inspected or changed; exact important errors; commands/tests and outcomes; design decisions; what has already been tried; unresolved issues; and the next concrete steps. Drop repeated protocol instructions, filler, duplicate logs, superseded plans, and unimportant raw output.\n\nACTIVE_TASK:\n%s\n\nPREVIOUS_CHECKPOINT:\n%s\n",
         task?task:"",c->agent_checkpoint?c->agent_checkpoint:"(none)");
     vs_trace(c,"compact","compacting autonomous working context");
+    /* Compaction is an internal provider round; never expose its token stream
+       through the active UI callback. */
+    {
+        saved_stream=c->stream_callback;
+        saved_stream_data=c->stream_callback_data;
+        c->stream_callback=NULL;c->stream_callback_data=NULL;
     /* A newly loaded image is intended for the next normal agent round, not
        for this housekeeping request.  Suppress attachments while compacting
        and restore the pending one-shot attachment range afterwards. */
@@ -96,12 +102,14 @@ static void agent_compact(VSContext *c,const char *task,int completed_rounds){
     c->attachment_send_from=c->attachment_count;
     summary=vs_chat(c,p);
     c->attachment_send_from=saved_attachment_from;
+    c->stream_callback=saved_stream;c->stream_callback_data=saved_stream_data;
     free(p);
     if(bad_checkpoint(summary)){if(summary)free(summary);fallback=fallback_checkpoint(c,task);summary=fallback;vs_trace(c,"compact","provider compaction was unusable; kept a bounded mechanical checkpoint instead");}
     if(!summary)return;
     bounded=vs_compact_text_limit(summary,VS_AGENT_CHECKPOINT_MAX,"semantic working-state checkpoint compacted");free(summary);if(!bounded)return;
     agent_checkpoint_clear(c);c->agent_checkpoint=bounded;c->agent_checkpoint_bytes=strlen(bounded);agent_history_clear(c);
     snprintf(trace,sizeof(trace),"working context compacted after %d rounds to %lu bytes",completed_rounds,(unsigned long)c->agent_checkpoint_bytes);vs_trace(c,"compact",trace);
+    }
 }
 
 static char *continuation_prompt(const char *task,const char *result,int planning_only,const char *checkpoint){
@@ -163,7 +171,143 @@ static char *execute_tool(VSContext *c,const char *d,int *command_runner_confirm
 
 static const char *earliest_directive(const char *s,int *is_mcp){const char *t=strstr(s,"[[VS_TOOL "),*m=strstr(s,"[[VS_MCP ");if(!t&&!m)return 0;if(m&&(!t||m<t)){*is_mcp=1;return m;}*is_mcp=0;return t;}
 static int directive_count(const char *s){int n=0,m;const char *p=s,*d,*e;while((d=earliest_directive(p,&m))!=0){e=strstr(d,"]]" );if(!e)break;n++;p=e+2;}return n;}
+static char *directive_signature(const char *s){const char *p=s,*d,*e;int m;size_t n=0;char *out;while((d=earliest_directive(p,&m))!=0){e=strstr(d,"]]" );if(!e)break;n+=(size_t)(e+2-d)+1;p=e+2;}if(!n)return dupstr("");out=(char*)malloc(n+1);if(!out)return 0;out[0]=0;p=s;while((d=earliest_directive(p,&m))!=0){size_t z;e=strstr(d,"]]" );if(!e)break;z=(size_t)(e+2-d);strncat(out,d,z);strcat(out,"\n");p=e+2;}return out;}
 static char *next_directive(const char **cursor,int *is_mcp){const char *d,*e;char *o;size_t n;if(!cursor||!*cursor)return 0;d=earliest_directive(*cursor,is_mcp);if(!d)return 0;e=strstr(d,"]]" );if(!e){*cursor=d+strlen(d);return 0;}n=(size_t)(e+2-d);o=(char*)malloc(n+1);if(!o)return 0;memcpy(o,d,n);o[n]=0;*cursor=e+2;return o;}
+static int directive_known(const char *d,int is_mcp){
+    static const char *ops[]={"read ","list ","search ","graph ","web_search ","web_fetch ","run ","write ","image ","subagent ",NULL};
+    int i;if(is_mcp)return 1;if(strncmp(d,"[[VS_TOOL ",10))return 0;
+    for(i=0;ops[i];i++)if(!strncmp(d+10,ops[i],strlen(ops[i])))return 1;
+    return 0;
+}
+static char *next_directive(const char **cursor,int *is_mcp);
+static int directive_read_only(const char *d,int is_mcp){
+    if(is_mcp)return 0;
+    return !strncmp(d,"[[VS_TOOL read ",15)||!strncmp(d,"[[VS_TOOL list ",15)||
+           !strncmp(d,"[[VS_TOOL search ",17)||!strncmp(d,"[[VS_TOOL graph ",16)||
+           !strncmp(d,"[[VS_TOOL web_search ",21)||!strncmp(d,"[[VS_TOOL web_fetch ",20);
+}
+
+/* A plan marker only needs to pause the host when the response also describes
+   work that can change state.  This deliberately treats MCP as side-effecting
+   because the host cannot infer safety from an MCP tool's name. */
+static int plan_has_side_effects(const char *answer)
+{
+    const char *cur=answer;int is_mcp;char *d;int side_effect=0,count=0;
+    while((d=next_directive(&cur,&is_mcp))!=NULL){
+        count++;if(!directive_read_only(d,is_mcp))side_effect=1;
+        free(d);
+    }
+    /* A standalone plan is itself a side-effecting proposal. */
+    return count==0?1:side_effect;
+}
+static int name_in_list(const char *name,const char *const *list){int i;for(i=0;list[i];i++)if(!strcmp(name,list[i]))return 1;return 0;}
+static const char *json_ws(const char *p){while(*p==' '||*p=='\t'||*p=='\r'||*p=='\n')p++;return p;}
+static const char *json_value_end(const char *p,int depth);
+static const char *json_string_end(const char *p){if(*p++!='\"')return NULL;while(*p){if((unsigned char)*p<0x20)return NULL;if(*p=='\\'){if(!p[1])return NULL;p+=2;continue;}if(*p++=='\"')return p;}return NULL;}
+static const char *json_value_end(const char *p,int depth){const char *q;if(depth>32)return NULL;p=json_ws(p);if(*p=='\"')return json_string_end(p);if(*p=='{'||*p=='['){char close=*p=='{'?'}':']';int object=*p=='{';p=json_ws(p+1);if(*p==close)return p+1;for(;;){if(object){q=json_string_end(p);if(!q)return NULL;p=json_ws(q);if(*p++!=':')return NULL;p=json_ws(p);}q=json_value_end(p,depth+1);if(!q)return NULL;p=json_ws(q);if(*p==close)return p+1;if(*p++!=',')return NULL;p=json_ws(p);}}if(!strncmp(p,"true",4))return p+4;if(!strncmp(p,"false",5))return p+5;if(!strncmp(p,"null",4))return p+4;if(*p=='-'||isdigit((unsigned char)*p)){char *e;strtod(p,&e);return e==p?NULL:e;}return NULL;}
+static int valid_json_object(const char *s){const char *p,*e;if(!s)return 0;p=json_ws(s);if(*p!='{')return 0;e=json_value_end(p,0);return e&&!*json_ws(e);}
+
+static int has_attr(const char *d,const char *name){char *v=attr(d,name);int ok=v!=NULL;if(v)free(v);return ok;}
+static int directive_schema_valid(VSContext *c,const char *d,int is_mcp){
+    int mcp_found=-1;
+    static const char *common[] = {"task_id",NULL};
+    static const char *read_attrs[] = {"path","start_line","max_lines",NULL};
+    static const char *list_attrs[] = {"path","depth","limit",NULL};
+    static const char *search_attrs[] = {"path","query","case_insensitive","limit",NULL};
+    static const char *graph_attrs[] = {"path","mode",NULL};
+    static const char *web_search_attrs[] = {"query","count",NULL};
+    static const char *web_fetch_attrs[] = {"url",NULL};
+    static const char *run_attrs[] = {"cmd",NULL};
+    static const char *write_attrs[] = {"path","content",NULL};
+    static const char *image_attrs[] = {"path",NULL};
+    static const char *subagent_attrs[] = {"task",NULL};
+    static const char *mcp_attrs[] = {"server","tool","args","task_id",NULL};
+    const char *p,*end;char op[32],name[64],seen[16][64];int i,j,seen_count=0,seen_task=0;const char *const *allowed=0;char *value;
+    if(!d)return 0;end=strstr(d,"]]" );if(!end)return 0;p=d+2;
+    if(is_mcp){if(strncmp(p,"VS_MCP ",7))return 0;p+=7;strcpy(op,"MCP");allowed=mcp_attrs;}
+    else {if(strncmp(p,"VS_TOOL ",8))return 0;p+=8;for(i=0;i<(int)sizeof(op)-1&&p<end&&!isspace((unsigned char)*p);i++,p++)op[i]=*p;op[i]=0;
+        if(!strcmp(op,"read"))allowed=read_attrs;else if(!strcmp(op,"list"))allowed=list_attrs;else if(!strcmp(op,"search"))allowed=search_attrs;else if(!strcmp(op,"graph"))allowed=graph_attrs;else if(!strcmp(op,"web_search"))allowed=web_search_attrs;else if(!strcmp(op,"web_fetch"))allowed=web_fetch_attrs;else if(!strcmp(op,"run"))allowed=run_attrs;else if(!strcmp(op,"write"))allowed=write_attrs;else if(!strcmp(op,"image"))allowed=image_attrs;else if(!strcmp(op,"subagent"))allowed=subagent_attrs;else return 0;}
+    while(p<end){while(p<end&&isspace((unsigned char)*p))p++;if(p==end)break;j=0;while(p<end&&(isalnum((unsigned char)*p)||*p=='_')){if(j>=(int)sizeof(name)-1)return 0;name[j++]=*p++;}if(!j)return 0;name[j]=0;if(*p++!='=')return 0;if(p>=end||*p++!='\"')return 0;
+        {const char *v=p;while(p<end){if(*p=='\\'&&p+1<end){p+=2;continue;}if(*p=='\"')break;p++;}if(p>=end)return 0;value=(char*)malloc((size_t)(p-v)+1);if(!value)return 0;memcpy(value,v,(size_t)(p-v));value[p-v]=0;p++;}
+        if(!name_in_list(name,allowed)&&!name_in_list(name,common)){free(value);return 0;}
+        for(i=0;i<seen_count;i++)if(!strcmp(name,seen[i])){free(value);return 0;}
+        if(seen_count>=16){free(value);return 0;}strcpy(seen[seen_count++],name);
+        if(!strcmp(name,"task_id")){if(seen_task++){free(value);return 0;}}
+        free(value);
+    }
+    if(is_mcp){char *server=attr(d,"server"),*tool=attr(d,"tool"),*args=attr(d,"args");int found=0;size_t z;for(i=0;c&&i<c->mcp_tool_count;i++)if(server&&tool&&!strcmp(c->mcp_tools[i].server,server)&&!strcmp(c->mcp_tools[i].name,tool)){found=1;mcp_found=i;break;}if(args)unesc(args);z=args?strlen(args):0;while(z&&isspace((unsigned char)args[z-1]))args[--z]=0;while(args&&*args&&isspace((unsigned char)*args)){memmove(args,args+1,strlen(args));z--;}if(!args||!*args){free(server);free(tool);free(args);return 0;}if(!server||!tool||!found||z>VS_MCP_SCHEMA_MAX){free(server);free(tool);free(args);return 0;}free(server);free(tool);free(args);return mcp_found;}
+    if(!strcmp(op,"read")||!strcmp(op,"run")||!strcmp(op,"image"))return has_attr(d,!strcmp(op,"run")?"cmd":"path");
+    if(!strcmp(op,"search")||!strcmp(op,"web_search"))return has_attr(d,"query");
+    if(!strcmp(op,"web_fetch"))return has_attr(d,"url");
+    if(!strcmp(op,"write"))return has_attr(d,"path")&&has_attr(d,"content");
+    if(!strcmp(op,"subagent"))return has_attr(d,"task");
+    return 1;
+}
+static int preflight_batch(VSContext *c,const char *answer,int *count_out){
+    const char *cur=answer,*scan=answer;int n=0,is_mcp,authorized=c&&vs_workflow_authorized(&c->workflow),staged_task=c?c->workflow.current_task_id:0;char *d;
+    while((d=next_directive(&cur,&is_mcp))!=NULL){
+        n++;
+        if(n>VS_MAX_BATCH_TOOLS){free(d);return -1;}
+        {int schema=directive_schema_valid(c,d,is_mcp);if(!directive_known(d,is_mcp)||schema<0){free(d);return -1;}if(is_mcp){char *args=attr(d,"args");int call_ok=0;if(args)unesc(args);call_ok=valid_json_object(args)&&c&&schema<c->mcp_tool_count;free(args);if(!call_ok){free(d);return -1;}}}
+        if(!authorized&&!directive_read_only(d,is_mcp)){free(d);return -2;}
+        if(authorized){char *id_s=attr(d,"task_id"),*ep=NULL;long id=0;int valid=0,k;
+            if(!id_s){free(d);return -6;}
+            id=strtol(id_s,&ep,10);if(ep==id_s||*ep||id<=0||id>2147483647L){free(id_s);free(d);return -6;}
+            if(!vs_workflow_task_ready(&c->workflow,(int)id)){free(id_s);free(d);return -7;}
+            for(k=0;k<c->workflow.task_count;k++)if(c->workflow.tasks[k].id==(int)id){valid=1;break;}
+            if(valid)staged_task=(int)id;
+            free(id_s);
+        }
+        if(is_mcp){char *server=attr(d,"server"),*tool=attr(d,"tool");int found=0,i;
+            if(!server||!tool){free(server);free(tool);free(d);return -1;}
+            if(!authorized){free(server);free(tool);free(d);return -2;}
+            for(i=0;i<c->mcp_tool_count;i++)if(!strcmp(c->mcp_tools[i].server,server)&&!strcmp(c->mcp_tools[i].name,tool)){found=1;break;}
+            free(server);free(tool);if(!found){free(d);return -3;}
+        } else if(!directive_read_only(d,0)&&!authorized){free(d);return -2;}
+        free(d);
+    }
+    /* A marker without a closing delimiter is malformed; do not execute a valid prefix. */
+    while((scan=earliest_directive(scan,&is_mcp))!=NULL){const char *end=strstr(scan,"]]" );if(!end)return -1;scan=end+2;}
+    if(count_out)*count_out=n;
+    if(c&&c->workflow.mode==VS_MODE_MANUAL&&authorized&&n>1)return -4;
+    if(c&&c->workflow.mode==VS_MODE_MANUAL&&authorized&&c->workflow.action_approved){
+        char *sig=directive_signature(answer);
+        int same=sig&&c->workflow.pending_request[0]&&!strcmp(sig,c->workflow.pending_request);
+        free(sig);
+        if(!same)return -5;
+    }
+    if(c&&authorized&&n>0)c->workflow.current_task_id=staged_task;
+    return 0;
+}
+static int parse_plan_marker(VSContext *c,const char *answer)
+{
+    const char *mark=strstr(answer?answer:"","[[VS_PLAN ");
+    char *title=NULL,*raw=NULL,*item,*bar,*dep,*end;
+    VSTaskRecord tasks[VS_MAX_PLAN_TASKS];int count=0,rc=-1;
+    if(!mark)return 0;
+    title=attr(mark,"title");raw=attr(mark,"tasks");
+    if(!title||!raw||!*title||!*raw)goto done;
+    memset(tasks,0,sizeof(tasks));
+    item=raw;
+    while(item&&*item){
+        VSTaskRecord *t;long id,parent;char *ep;
+        if(count>=VS_MAX_PLAN_TASKS)goto done;
+        t=&tasks[count];
+        id=strtol(item,&ep,10);if(ep==item||*ep!='|')goto done;t->id=(int)id;item=ep+1;
+        parent=strtol(item,&ep,10);if(ep==item||*ep!='|')goto done;t->parent_id=(int)parent;item=ep+1;
+        bar=strchr(item,'|');if(!bar)goto done;*bar=0;dep=item;item=bar+1;
+        if(strcmp(dep,"-")){char *p=dep;while(*p){long d;if(t->dependency_count>=VS_MAX_TASK_DEPS)goto done;d=strtol(p,&ep,10);if(ep==p||d<=0)goto done;t->dependencies[t->dependency_count++]=(int)d;if(*ep==','){p=ep+1;if(!*p)goto done;}else if(!*ep)break;else goto done;}}
+        end=strchr(item,';');if(end)*end=0;
+        if(!*item||strlen(item)>=sizeof(t->title))goto done;
+        strcpy(t->title,item);t->status=VS_TASK_PLANNED;count++;
+        if(!end)item=NULL;else item=end+1;
+    }
+    if(item!=NULL||count<=0)goto done;
+    rc=vs_workflow_set_plan(&c->workflow,title,tasks,count)==0?1:-1;
+done:
+    free(title);free(raw);return rc;
+}
+
 static char *execute_batch(VSContext *c,const char *answer,int *command_runner_confirmed){int total=directive_count(answer),original_total=total,i=0,is_mcp;const char *cur=answer;char *d,*r,*server,*name,*args,*single=0;ABuffer b;if(total<=0)return 0;if(total>VS_MAX_BATCH_TOOLS)total=VS_MAX_BATCH_TOOLS;if(total==1){d=next_directive(&cur,&is_mcp);if(!d)return dupstr("ERROR: malformed directive");if(is_mcp){server=attr(d,"server");name=attr(d,"tool");args=attr(d,"args");if(args)unesc(args);single=(server&&name)?vs_mcp_call(c,server,name,args&&*args?args:"{}"):dupstr("ERROR: malformed VS_MCP directive");free(server);free(name);free(args);}else single=execute_tool(c,d,command_runner_confirmed);free(d);return single;}
     if(ab_init(&b,VS_AGENT_TOOL_RESULT_MAX)!=0)return 0;
     ab_addf(&b,"BATCH_TOOL_RESULT: %d directive(s) executed in order\n",total);
@@ -172,38 +316,111 @@ static char *execute_batch(VSContext *c,const char *answer,int *command_runner_c
     return ab_finish(&b);}
 
 char *vs_agent_turn(VSContext *c,const char *user){
-    char *prompt=dupstr(user),*ans=0,*original=dupstr(user),*task_anchor=0,*last_tool_result=0;int round,plan_continues=0,tool_recoveries=0,command_runner_confirmed=0,actual_tool_seen=0,execution_mode=0,cancelled=0,max_rounds=VS_MAX_TOOL_ROUNDS;char step[512];
+    char *prompt=dupstr(user),*ans=0,*original=dupstr(user),*task_anchor=0,*last_tool_result=0,*last_directives=0;int round,plan_continues=0,no_progress=0,tool_recoveries=0,command_runner_confirmed=0,actual_tool_seen=0,execution_mode=0,cancelled=0,stalled=0,max_rounds=VS_MAX_TOOL_ROUNDS;char step[512];
     {const char *mr=getenv("VIBESOLARIS_MAX_AGENT_ROUNDS");if(mr&&*mr){char *ep=0;long v=strtol(mr,&ep,10);if(ep&&*ep==0&&v>=8&&v<=256)max_rounds=(int)v;}}
     if(!prompt||!original){free(prompt);free(original);return dupstr("out of memory");}
     task_anchor=build_task_anchor(c,original);if(!task_anchor)task_anchor=dupstr(original);if(!task_anchor){free(prompt);free(original);return dupstr("out of memory");}
-    agent_context_clear(c);c->attachment_send_from=0;c->subagent_serial=0;execution_mode=execution_intent(original);vs_trace_clear(c);vs_trace(c,"agent","starting agent turn");
+    if(c->pending_question){c->pending_question=0;c->question_option_count=0;c->question[0]=0;memset(c->question_options,0,sizeof(c->question_options));}
+    agent_context_clear(c);c->attachment_send_from=0;c->subagent_serial=0;if(c->subagent_depth==0&&!c->subagent_parent){c->subagent_record_count=0;memset(c->subagents,0,sizeof(c->subagents));}execution_mode=execution_intent(original);vs_trace_clear(c);vs_trace(c,"agent","starting agent turn");
     if(vs_cancel_requested(c)){cancelled=1;vs_trace(c,"cancel","agent turn stopped by user before work began");}
-    if(!cancelled&&c->mcp_server_count>0){int n=vs_mcp_refresh_all(c,0);if(vs_cancel_requested(c)){cancelled=1;vs_trace(c,"cancel","agent turn stopped while preparing MCP tools");}else{snprintf(step,sizeof(step),"MCP catalogue ready: %d tool(s)",n<0?0:n);vs_trace(c,"mcp",step);}}
+    if(!cancelled&&vs_workflow_authorized(&c->workflow)&&c->mcp_server_count>0){int n=vs_mcp_refresh_all(c,0);if(vs_cancel_requested(c)){cancelled=1;vs_trace(c,"cancel","agent turn stopped while preparing MCP tools");}else{snprintf(step,sizeof(step),"MCP catalogue ready: %d tool(s)",n<0?0:n);vs_trace(c,"mcp",step);}}
     for(round=0;!cancelled&&round<max_rounds;round++){
         char *tool,*mcp,*result=0,*next;
         if(vs_cancel_requested(c)){cancelled=1;vs_trace(c,"cancel","agent turn stopped by user");break;}
         if(round>0&&(round%VS_LONG_TASK_CHECKPOINT)==0){snprintf(step,sizeof(step),"long-task checkpoint: %d rounds completed; working context=%lu bytes, checkpoint=%lu bytes",round,(unsigned long)c->agent_history_bytes,(unsigned long)c->agent_checkpoint_bytes);vs_trace(c,"checkpoint",step);}
         snprintf(step,sizeof(step),"model round %d",round+1);vs_trace(c,"model",step);vs_trace(c,"model-input",prompt);vs_trace(c,"model-wait","requesting provider response");
-        free(ans);ans=vs_chat(c,prompt);c->attachment_send_from=c->attachment_count;if(!ans){free(prompt);free(original);free(task_anchor);free(last_tool_result);agent_context_clear(c);return dupstr("provider error");}
+        free(ans);ans=vs_chat(c,prompt);c->attachment_send_from=c->attachment_count;if(!ans){
+            free(prompt);free(task_anchor);free(last_tool_result);free(last_directives);agent_context_clear(c);
+            free(original);return dupstr("provider error");
+        }
         if(vs_cancel_requested(c)){cancelled=1;free(ans);ans=dupstr("Stopped by user.");vs_trace(c,"cancel","agent turn stopped while waiting for the provider");break;}vs_trace(c,"model-output",ans);vs_trace(c,"model-result","model response received");
+        {
+            int plan_rc,plan_side_effects=plan_has_side_effects(ans);
+            const char *marker_end=strstr(ans,"[[VS_PLAN ");char *clean=0;
+            if(marker_end){const char *e=strstr(marker_end,"]]" );if(e){size_t a=(size_t)(marker_end-ans),b=strlen(e+2);clean=(char*)malloc(a+b+1);if(clean){memcpy(clean,ans,a);memcpy(clean+a,e+2,b+1);}}}
+            /* Read-only discovery is allowed to run without promoting the
+               response into an approval gate.  The marker is presentation,
+               not authorization, so remove it and continue normally. */
+            if(marker_end&&!plan_side_effects){
+                if(clean){free(ans);ans=clean;clean=NULL;}
+                vs_trace(c,"plan-suppressed","read-only response did not require plan approval");
+            } else {
+                plan_rc=parse_plan_marker(c,ans);
+                if(plan_rc!=0){
+                    if(plan_rc>0){
+                        if(c->workflow.mode==VS_MODE_AUTO){
+                            if(vs_workflow_accept(&c->workflow)==0){
+                                vs_trace(c,"plan-auto-accepted","plan accepted automatically in Auto mode");
+                                agent_history_add(c,"user",prompt);agent_history_add(c,"assistant",ans);agent_compact(c,task_anchor,round+1);
+                                next=continuation_prompt(task_anchor,0,1,c->agent_checkpoint);
+                                if(clean){free(ans);ans=clean;clean=NULL;}
+                                free(prompt);prompt=next;
+                                if(!prompt){vs_trace(c,"memory-error","could not allocate plan continuation prompt");break;}
+                                continue;
+                            }
+                            vs_trace(c,"plan-invalid","automatic plan acceptance failed");
+                        } else {
+                            snprintf(c->pending_task,sizeof(c->pending_task),"%s",original);
+                            c->pending_task_revision=c->workflow.revision;
+                            c->pending_task_valid=1;
+                            vs_trace(c,"plan-awaiting-accept","plan proposed; no task actions executed");
+                        }
+                    } else vs_trace(c,"plan-invalid","malformed or invalid plan proposal rejected");
+                    if(clean){free(ans);ans=clean;clean=NULL;}
+                    if(plan_rc>0&&(!ans||!*ans))ans=dupstr("Plan is ready for review.");
+                    break;
+                }
+            }
+            if(clean)free(clean);
+        }
         tool=strstr(ans,"[[VS_TOOL ");mcp=strstr(ans,"[[VS_MCP ");
+        if(tool||mcp){int batch_count=0,gate=preflight_batch(c,ans,&batch_count);
+            if(gate<0&&gate!=-2){const char *why=gate==-4?"Manual mode approves one action at a time; request a single directive.":(gate==-3?"The requested MCP tool is not in the discovered tool catalogue.":(gate==-5?"This manual approval does not match the pending action; request approval again.":(gate==-7?"The requested task is blocked, complete, or not ready in the accepted plan.":(gate==-6?"Every action must name an accepted task_id from the reviewed plan.":"The directive batch was malformed and was rejected before any action ran."))));
+                if(c->workflow.mode==VS_MODE_MANUAL){c->workflow.action_approved=0;c->workflow.pending_request[0]=0;}
+                vs_trace(c,"directive-rejected",why);free(ans);ans=dupstr(why);break;}
+        }
+        if((tool||mcp)&&!vs_workflow_authorized(&c->workflow)){
+            int read_only=1,check_mcp;const char *check=ans;char *item;
+            while((item=next_directive(&check,&check_mcp))!=NULL){if(!directive_read_only(item,check_mcp))read_only=0;free(item);}
+            if(!read_only){
+                vs_trace(c,"approval-blocked","side-effecting directive withheld until the user accepts a proposed plan");
+                free(ans);ans=dupstr("Plan approval is required before side-effecting tools can run. Review the proposal with /plan, then use /plan accept.");
+                break;
+            }
+        }
+        if((tool||mcp)&&vs_workflow_needs_action_approval(&c->workflow)){
+            c->workflow.phase=VS_WORKFLOW_AWAITING_ACTION;
+            c->workflow.action_approved=0;
+            {char *sig=directive_signature(ans);if(sig){snprintf(c->workflow.pending_request,sizeof(c->workflow.pending_request),"%s",sig);free(sig);}}
+            vs_trace(c,"action-awaiting-approval","manual mode requires approval before the next action");
+            free(ans);ans=dupstr("Manual mode paused before an action. Use /plan approve-action, then ask the agent to continue.");
+            break;
+        }
         if((tool||mcp)&&strstr(ans,"[[VS_FINAL]]")){char *clean=strip_marker(ans,"[[VS_FINAL]]");vs_trace(c,"protocol","deferred premature VS_FINAL because executable directives are pending");if(clean){free(ans);ans=clean;tool=strstr(ans,"[[VS_TOOL ");mcp=strstr(ans,"[[VS_MCP ");}}
         if(!tool&&!mcp&&(execution_mode||actual_tool_seen)&&false_tool_unavailable_claim(ans)&&tool_recoveries<VS_MAX_TOOL_RECOVERIES){char *probe=0,*recover=0;int pst=-1;tool_recoveries++;snprintf(step,sizeof(step),"model claimed tool channel unavailable; probing command runner (%d/%d)",tool_recoveries,VS_MAX_TOOL_RECOVERIES);vs_trace(c,"tool-health",step);probe=vs_run_command_ctx(c,"printf 'VIBESOLARIS_COMMAND_RUNNER_OK\\n'",&pst);if(probe&&pst==0&&strstr(probe,"VIBESOLARIS_COMMAND_RUNNER_OK")){command_runner_confirmed=1;vs_trace(c,"tool-health","command runner health probe passed; false blocker suppressed");agent_history_add(c,"user",prompt);agent_history_add(c,"assistant",ans);agent_compact(c,task_anchor,round+1);recover=tool_channel_recovery_prompt(task_anchor,last_tool_result,ans,actual_tool_seen,c->agent_checkpoint);free(probe);free(prompt);prompt=recover;if(!prompt){vs_trace(c,"memory-error","could not allocate recovery prompt");break;}continue;}if(probe)free(probe);command_runner_confirmed=0;vs_trace(c,"tool-health","command runner health probe failed; treating availability as a host problem");}
-        if(!tool&&!mcp&&strstr(ans,"[[VS_NEED_USER")){char *q=attr(strstr(ans,"[[VS_NEED_USER"),"question");vs_trace(c,"agent","paused because model needs user input");if(q&&*q){free(ans);ans=q;}else free(q);break;}
-        if(!tool&&!mcp&&strstr(ans,"[[VS_FINAL]]")){char *clean=strip_marker(ans,"[[VS_FINAL]]");if(clean){free(ans);ans=clean;}vs_trace(c,"agent","completed with explicit final marker");break;}
+        if(!tool&&!mcp&&strstr(ans,"[[VS_NEED_USER")){char *marker=strstr(ans,"[[VS_NEED_USER"),*q=attr(marker,"question");int oi;c->pending_question=0;c->question_option_count=0;c->question[0]=0;memset(c->question_options,0,sizeof(c->question_options));if(q&&*q){unesc(q);strncpy(c->question,q,sizeof(c->question)-1);c->pending_question=1;c->pending_question_revision++;for(oi=0;oi<VS_NEED_USER_MAX_OPTIONS;oi++){char key[16];char *option;snprintf(key,sizeof(key),"option%d",oi+1);option=attr(marker,key);if(!option)break;unesc(option);if(!*option||strlen(option)>=VS_NEED_USER_OPTION_MAX){free(option);c->question_option_count=0;memset(c->question_options,0,sizeof(c->question_options));break;}strncpy(c->question_options[oi],option,sizeof(c->question_options[oi])-1);c->question_option_count++;free(option);}free(ans);ans=q;}else{free(q);free(ans);ans=dupstr("The agent needs clarification before it can continue.");}vs_trace(c,"agent","paused because model needs user input");break;}
+        if(!tool&&!mcp&&strstr(ans,"[[VS_FINAL]]")){char *clean=strip_marker(ans,"[[VS_FINAL]]");int i,all_complete=c->workflow.task_count>0;if(clean){free(ans);ans=clean;}for(i=0;i<c->workflow.task_count;i++)if(c->workflow.tasks[i].status!=VS_TASK_COMPLETED)all_complete=0;if(all_complete)c->workflow.phase=VS_WORKFLOW_COMPLETED;vs_trace(c,"agent",all_complete?"completed with explicit final marker":"turn ended with explicit final marker; remaining tasks retain host-observed status");break;}
         if(!tool&&!mcp){
-            if(execution_mode||actual_tool_seen){plan_continues++;snprintf(step,sizeof(step),"execution turn returned no directive/final marker; continuing (%d, ceiling %d)",plan_continues,max_rounds);vs_trace(c,"auto-continue",step);agent_history_add(c,"user",prompt);agent_history_add(c,"assistant",ans);agent_compact(c,task_anchor,round+1);next=continuation_prompt(task_anchor,last_tool_result,1,c->agent_checkpoint);free(prompt);prompt=next;if(!prompt){vs_trace(c,"memory-error","could not allocate continuation prompt");break;}continue;}
+            if(execution_mode||actual_tool_seen){plan_continues++;no_progress++;if(no_progress>=2){stalled=1;snprintf(step,sizeof(step),"stopped after %d consecutive execution responses without a tool action or completion marker",no_progress);vs_trace(c,"no-progress",step);break;}snprintf(step,sizeof(step),"execution response had no directive/final marker; one recovery continuation remains (%d/2)",no_progress);vs_trace(c,"auto-continue",step);agent_history_add(c,"user",prompt);agent_history_add(c,"assistant",ans);agent_compact(c,task_anchor,round+1);next=continuation_prompt(task_anchor,last_tool_result,1,c->agent_checkpoint);free(prompt);prompt=next;if(!prompt){vs_trace(c,"memory-error","could not allocate continuation prompt");break;}continue;}
             if(plan_continues<VS_MAX_PLAN_CONTINUES&&should_auto_continue(original,ans)){plan_continues++;snprintf(step,sizeof(step),"planning-only response detected; continuing (%d/%d)",plan_continues,VS_MAX_PLAN_CONTINUES);vs_trace(c,"auto-continue",step);agent_history_add(c,"user",prompt);agent_history_add(c,"assistant",ans);agent_compact(c,task_anchor,round+1);next=continuation_prompt(task_anchor,0,1,c->agent_checkpoint);free(prompt);prompt=next;if(!prompt){vs_trace(c,"memory-error","could not allocate continuation prompt");break;}continue;}
             vs_trace(c,"agent","completed informational turn without tool work");break;
         }
         plan_continues=0;actual_tool_seen=1;execution_mode=1;if(vs_cancel_requested(c)){cancelled=1;vs_trace(c,"cancel","agent turn stopped before tool action");break;}
-        {int dc=directive_count(ans);snprintf(step,sizeof(step),"executing %d directive(s)%s",dc>VS_MAX_BATCH_TOOLS?VS_MAX_BATCH_TOOLS:dc,dc>1?" as a batch":"");vs_trace(c,"tool-batch",step);result=execute_batch(c,ans,&command_runner_confirmed);}
+        {char *sig=directive_signature(ans);if(sig&&last_directives&&!strcmp(sig,last_directives)){free(sig);stalled=1;vs_trace(c,"no-progress","same tool directive repeated after its previous result; refusing to execute it again");break;}if(sig){free(last_directives);last_directives=sig;}}
+        {int dc=directive_count(ans),active=c->workflow.current_task_id;snprintf(step,sizeof(step),"executing %d directive(s)%s serially",dc,dc>1?" as a batch":"");vs_trace(c,"tool-batch",step);if(active)vs_workflow_set_task_status(&c->workflow,active,VS_TASK_RUNNING,"running serially");if(c->workflow.mode==VS_MODE_MANUAL)(void)vs_workflow_consume_action_approval(&c->workflow);result=execute_batch(c,ans,&command_runner_confirmed);if(active&&result&&strstr(result,"COMMAND_RUNNER_STATUS: host_error"))vs_workflow_set_task_status(&c->workflow,active,VS_TASK_FAILED,result);}no_progress=0;
         if(result){char *bounded=vs_compact_text_limit(result,VS_AGENT_TOOL_RESULT_MAX,"tool result compacted for model context");if(bounded){if(strlen(bounded)<strlen(result))vs_trace(c,"limit","tool result compacted to keep autonomous context bounded");free(result);result=bounded;}vs_trace(c,"tool-output",result);}
         if(vs_cancel_requested(c)){cancelled=1;free(result);result=0;vs_trace(c,"cancel","agent turn stopped after tool returned");break;}
         free(last_tool_result);last_tool_result=result?dupstr(result):0;agent_history_add(c,"user",prompt);agent_history_add(c,"assistant",ans);agent_compact(c,task_anchor,round+1);next=continuation_prompt(task_anchor,result,0,c->agent_checkpoint);if(!next){free(result);vs_trace(c,"memory-error","could not allocate next tool-round prompt");break;}free(result);free(prompt);prompt=next;
     }
+    if(stalled&&!cancelled){free(ans);ans=dupstr("Paused because the agent stopped making progress. The task was not marked complete; review the latest trace/result, then retry with a different approach or clarify the blocker.");}
+    else if(no_progress>=2&&!cancelled){free(ans);ans=dupstr("Paused after repeated responses without a tool action or completion marker. The task was not marked complete; retry with a concrete next step or clarify the blocker.");}
     if(!cancelled&&round>=max_rounds){snprintf(step,sizeof(step),"maximum autonomous agent rounds reached (%d); tools remain available next turn",max_rounds);vs_trace(c,"limit",step);if(execution_mode||(ans&&(strstr(ans,"[[VS_TOOL ")||strstr(ans,"[[VS_MCP ")))){free(ans);ans=dupstr("The single-turn autonomous ceiling was reached while work was still in progress. The task was not marked complete; continue from the existing files and conversation state, or raise VIBESOLARIS_MAX_AGENT_ROUNDS (up to 256).");}}
-    if(cancelled){free(ans);ans=dupstr("Stopped by user.");}
-    free(prompt);free(task_anchor);free(last_tool_result);agent_context_clear(c);
-    if(ans&&original){vs_history_add(c,"user",original);vs_history_add(c,"assistant",ans);}free(original);return ans;
+    if(cancelled){vs_workflow_clear_pending_task(c);free(ans);ans=dupstr("Stopped by user.");}
+    if(c&&c->workflow.mode==VS_MODE_MANUAL&&c->workflow.action_approved){c->workflow.action_approved=0;c->workflow.pending_request[0]=0;if(c->workflow.phase==VS_WORKFLOW_DOING)c->workflow.phase=VS_WORKFLOW_AWAITING_ACTION;}
+    free(prompt);free(task_anchor);free(last_tool_result);free(last_directives);agent_context_clear(c);
+    if(ans&&original){
+        if(!c->suppress_history_once){vs_history_add(c,"user",original);vs_history_add(c,"assistant",ans);}
+        else c->suppress_history_once=0;
+    }
+    free(original);return ans;
 }

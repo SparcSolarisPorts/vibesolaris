@@ -20,7 +20,7 @@ A subagent gets its own conversation history, working memory, file cache, attach
 
 ## Seeing what subagents are doing
 
-Subagent activity appears in the activity trace with a `[sub#N dK]` prefix, where `N` is the subagent number in this turn and `K` is its depth. The live indicator shows the current phase, for example `Subagent: Thinking` or `Subagent: Running tools`, with elapsed seconds.
+Subagent activity appears in the activity trace with a `[sub#N dK]` prefix, where `N` is the subagent number in this turn and `K` is its depth. The live indicator shows the current phase, for example `Subagent: Thinking` or `Subagent: Running tools`, with elapsed seconds. In the TUI, `/subagents` lists bounded task summaries, depth, and outcome for the current turn. Outcomes are recorded as running, completed, stopped, or failed/limited; records reset when the next top-level agent turn starts. Delegation remains synchronous and sequential.
 
 ## Testing
 
