@@ -293,6 +293,7 @@ typedef struct {
     VSAttachment attachments[VS_MAX_ATTACH];
     int attachment_count;
     VSProvider provider;
+    int effort; /* 0 provider default, 1 low, 2 medium, 3 high */
     char provider_api_keys[VS_PROVIDER_SLOT_COUNT][512];
     char provider_models[VS_PROVIDER_SLOT_COUNT][128];
     char provider_openai_urls[VS_PROVIDER_SLOT_COUNT][512];

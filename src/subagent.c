@@ -12,6 +12,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <pthread.h>
+
+/* Protect root lifecycle records and shared parent trace from concurrent workers. */
+static pthread_mutex_t subagent_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static char *dupstr(const char *s)
 {
@@ -32,9 +36,11 @@ static void forward_child_trace(void *userdata,int step,const char *kind,const c
     if(!parent)return;
     n=strlen(detail?detail:"")+64;
     d=(char*)malloc(n);
-    if(!d){vs_trace(parent,kind,detail);return;}
+    if(!d){if(!parent->subagent_parent)pthread_mutex_lock(&subagent_lock);vs_trace(parent,kind,detail);if(!parent->subagent_parent)pthread_mutex_unlock(&subagent_lock);return;}
     snprintf(d,n,"[sub#%d d%d] %s",child->subagent_id,child->subagent_depth,detail?detail:"");
+    if(!parent->subagent_parent)pthread_mutex_lock(&subagent_lock);
     vs_trace(parent,kind,d);
+    if(!parent->subagent_parent)pthread_mutex_unlock(&subagent_lock);
     free(d);
 }
 
@@ -95,14 +101,22 @@ char *vs_subagent_run(VSContext *parent,const char *task)
     if(parent->subagent_depth>=VS_MAX_SUBAGENT_DEPTH)
         return dupstr("ERROR: subagent nesting limit reached; complete this part directly.");
     root=parent->subagent_root?(VSContext*)parent->subagent_root:parent;
-    if(root->subagent_serial>=VS_MAX_SUBAGENTS_PER_TURN)
+    pthread_mutex_lock(&subagent_lock);
+    if(root->subagent_serial>=VS_MAX_SUBAGENTS_PER_TURN){
+        pthread_mutex_unlock(&subagent_lock);
         return dupstr("ERROR: subagent limit for this turn reached; continue the remaining work directly.");
+    }
+    pthread_mutex_unlock(&subagent_lock);
 
     child=(VSContext*)calloc(1,sizeof(VSContext));
     if(!child)return dupstr("ERROR: out of memory starting subagent");
+    if(!parent->subagent_parent)pthread_mutex_lock(&subagent_lock);
     memcpy(child,parent,sizeof(VSContext));
+    if(!parent->subagent_parent)pthread_mutex_unlock(&subagent_lock);
     isolate_child(child);
 
+    pthread_mutex_lock(&subagent_lock);
+    if(root->subagent_serial>=VS_MAX_SUBAGENTS_PER_TURN){pthread_mutex_unlock(&subagent_lock);free(child);return dupstr("ERROR: subagent limit for this turn reached");}
     if(parent!=root)parent->subagent_serial++;
     id=++root->subagent_serial;
     if(root->subagent_record_count<VS_MAX_SUBAGENT_RECORDS){
@@ -114,6 +128,7 @@ char *vs_subagent_run(VSContext *parent,const char *task)
         snprintf(record->task,sizeof(record->task),"%.255s",task);
         snprintf(record->summary,sizeof(record->summary),"running");
     }
+    pthread_mutex_unlock(&subagent_lock);
     child->subagent_parent=parent;
     child->subagent_root=parent->subagent_root?parent->subagent_root:parent;
     child->subagent_depth=parent->subagent_depth+1;
@@ -123,27 +138,37 @@ char *vs_subagent_run(VSContext *parent,const char *task)
 
     n=strlen(task)+640;
     prompt=(char*)malloc(n);
-    if(!prompt){if(record){record->status=3;record->finished_at=(long)time(NULL);snprintf(record->summary,sizeof(record->summary),"unable to prepare task");}free(child);return dupstr("ERROR: out of memory preparing subagent");}
+    if(!prompt){pthread_mutex_lock(&subagent_lock);if(record){record->status=3;record->finished_at=(long)time(NULL);snprintf(record->summary,sizeof(record->summary),"unable to prepare task");}pthread_mutex_unlock(&subagent_lock);free(child);return dupstr("ERROR: out of memory preparing subagent");}
     snprintf(prompt,n,
         "SUBAGENT TASK. You are a focused subagent delegated by the parent agent. Complete only this task "
-        "using the available tools, then finish with a concise report of findings and changes. Do not ask the "
-        "user questions; if blocked, say what is blocked and stop.\n\nTASK:\n%s",task);
+        "using the available tools. Coordinate through explicit handoffs: first establish a bounded "
+        "scope, avoid changing files outside that scope, and inspect relevant files before editing. "
+        "After editing, run available compile/tests or explain why verification was impossible. "
+        "End with a structured handoff headed FILES CHANGED, CHECKS RUN, RESULTS, "
+        "REMAINING RISKS. Do not claim success without evidence. "
+        "Do not ask the user questions; if blocked, say what is blocked and stop.\n\nTASK:\n%s",task);
 
     snprintf(detail,sizeof(detail),"subagent %d started (depth %d): %.300s",id,child->subagent_depth,task);
+    if(!parent->subagent_parent)pthread_mutex_lock(&subagent_lock);
     vs_trace(parent,"subagent-start",detail);
+    if(!parent->subagent_parent)pthread_mutex_unlock(&subagent_lock);
 
     ans=vs_agent_turn(child,prompt);
     free(prompt);
 
+    pthread_mutex_lock(&subagent_lock);
     if(record_index>=0&&root->subagent_record_count>record_index)record=&root->subagents[record_index];
     if(record){
         record->finished_at=(long)time(NULL);
         if(vs_cancel_requested(parent)|| (ans&&strstr(ans,"Stopped by user"))){record->status=2;snprintf(record->summary,sizeof(record->summary),"stopped");}
         else if(!ans||!strncmp(ans,"ERROR:",6)||strstr(ans,"limit reached")){record->status=3;snprintf(record->summary,sizeof(record->summary),"%.255s",ans?ans:"subagent returned no result");}
-        else {record->status=1;snprintf(record->summary,sizeof(record->summary),"completed");}
+        else {record->status=1;snprintf(record->summary,sizeof(record->summary),"completed; see handoff");}
     }
+    pthread_mutex_unlock(&subagent_lock);
     snprintf(detail,sizeof(detail),"subagent %d finished",id);
+    if(!parent->subagent_parent)pthread_mutex_lock(&subagent_lock);
     vs_trace(parent,"subagent-done",detail);
+    if(!parent->subagent_parent)pthread_mutex_unlock(&subagent_lock);
 
     /* The child owns its own history, trace, and file cache; release them. */
     vs_history_clear(child);

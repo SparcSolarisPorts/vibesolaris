@@ -79,13 +79,13 @@ clean:
 	rm -f *.o src/*.o vibesolaris vibesolaris-gui
 
 test-agent:
-	$(CC) $(CPPFLAGS) $(CFLAGS) tests/agent_lifecycle_test.c src/agent.c src/subagent.c src/workflow.c -o /tmp/vibesolaris-agent-lifecycle-test
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/agent_lifecycle_test.c src/agent.c src/subagent.c src/workflow.c $(THREAD_LIBS) -o /tmp/vibesolaris-agent-lifecycle-test
 	/tmp/vibesolaris-agent-lifecycle-test
-	$(CC) $(CPPFLAGS) $(CFLAGS) tests/agent_strict_execution_test.c src/agent.c src/subagent.c src/workflow.c -o /tmp/vibesolaris-agent-strict-test
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/agent_strict_execution_test.c src/agent.c src/subagent.c src/workflow.c $(THREAD_LIBS) -o /tmp/vibesolaris-agent-strict-test
 	/tmp/vibesolaris-agent-strict-test
-	$(CC) $(CPPFLAGS) $(CFLAGS) tests/agent_compaction_test.c src/agent.c src/subagent.c src/workflow.c -o /tmp/vibesolaris-agent-compaction-test
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/agent_compaction_test.c src/agent.c src/subagent.c src/workflow.c $(THREAD_LIBS) -o /tmp/vibesolaris-agent-compaction-test
 	/tmp/vibesolaris-agent-compaction-test
-	$(CC) $(CPPFLAGS) $(CFLAGS) tests/agent_native_tools_test.c src/agent.c src/subagent.c src/workflow.c -o /tmp/vibesolaris-agent-native-tools-test
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/agent_native_tools_test.c src/agent.c src/subagent.c src/workflow.c $(THREAD_LIBS) -o /tmp/vibesolaris-agent-native-tools-test
 	/tmp/vibesolaris-agent-native-tools-test
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/graph_test.c src/graph.c -o /tmp/vibesolaris-graph-test
 	/tmp/vibesolaris-graph-test
@@ -93,13 +93,13 @@ test-agent:
 	/tmp/vibesolaris-web-test
 
 test-subagent:
-	$(CC) $(CPPFLAGS) $(CFLAGS) tests/subagent_test.c src/agent.c src/subagent.c src/workflow.c -o /tmp/vibesolaris-subagent-test
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/subagent_test.c src/agent.c src/subagent.c src/workflow.c $(THREAD_LIBS) -o /tmp/vibesolaris-subagent-test
 	/tmp/vibesolaris-subagent-test
 
 test-workflow:
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/workflow_test.c src/workflow.c -o /tmp/vibesolaris-workflow-test
 	/tmp/vibesolaris-workflow-test
-	$(CC) $(CPPFLAGS) $(CFLAGS) tests/agent_workflow_test.c src/agent.c src/subagent.c src/workflow.c -o /tmp/vibesolaris-agent-workflow-test
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/agent_workflow_test.c src/agent.c src/subagent.c src/workflow.c $(THREAD_LIBS) -o /tmp/vibesolaris-agent-workflow-test
 	/tmp/vibesolaris-agent-workflow-test
 
 test-claude-oauth:
@@ -109,7 +109,7 @@ test-claude-oauth:
 	/tmp/vibesolaris-claude-provider-test
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/claude_config_test.c src/config.c src/oauth.c src/sha256.c -o /tmp/vibesolaris-claude-config-test
 	/tmp/vibesolaris-claude-config-test
-	$(CC) $(CPPFLAGS) $(CFLAGS) tests/custom_anthropic_agent_test.c src/provider.c src/agent.c src/subagent.c src/workflow.c src/oauth.c src/sha256.c -o /tmp/vibesolaris-custom-anthropic-agent-test
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/custom_anthropic_agent_test.c src/provider.c src/agent.c src/subagent.c src/workflow.c src/oauth.c src/sha256.c $(THREAD_LIBS) -o /tmp/vibesolaris-custom-anthropic-agent-test
 	/tmp/vibesolaris-custom-anthropic-agent-test
 
 test-provider-stream:

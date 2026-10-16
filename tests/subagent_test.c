@@ -6,6 +6,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <time.h>
 
 static int fails=0;
 #define CHECK(c,m) do{ if(!(c)){fprintf(stderr,"FAIL: %s\n",m);fails++;} else printf("ok: %s\n",m);}while(0)
@@ -13,14 +15,18 @@ static int fails=0;
 /* ---- scripted provider: behaviour depends on subagent depth ---- */
 static int calls_d0=0,calls_d1=0,calls_d2=0;
 static int d1_delegates_again=0;
+static int parallel_case=0,active_workers=0,peak_workers=0;
+static pthread_mutex_t worker_lock=PTHREAD_MUTEX_INITIALIZER;
 char *vs_chat(VSContext *c,const char *prompt){
     (void)prompt;
     if(c->subagent_depth==0){
         calls_d0++;
+        if(parallel_case)return strdup(calls_d0==1?"[[VS_TOOL subagent task_id=\"1\" task=\"Review alpha\"]] [[VS_TOOL subagent task_id=\"1\" task=\"Review beta\"]]":"Parallel work finished. [[VS_FINAL]]");
         if(calls_d0==1)return strdup("I will look into it.\n[[VS_TOOL subagent task_id=\"1\" task=\"Summarise README\"]]");
         return strdup("Subagent reported back. [[VS_FINAL]]");
     }
     if(c->subagent_depth==1){
+        if(parallel_case){struct timespec delay={0,150000000};pthread_mutex_lock(&worker_lock);active_workers++;if(active_workers>peak_workers)peak_workers=active_workers;pthread_mutex_unlock(&worker_lock);nanosleep(&delay,NULL);pthread_mutex_lock(&worker_lock);active_workers--;pthread_mutex_unlock(&worker_lock);return strdup("Independent review complete. [[VS_FINAL]]");}
         calls_d1++;
         if(d1_delegates_again&&calls_d1==1)return strdup("[[VS_TOOL subagent task_id=\"1\" task=\"nested work\"]]");
         return strdup("README summary: project builds. [[VS_FINAL]]");
@@ -103,7 +109,17 @@ int main(void){
     CHECK(!has_detail_text("d3]"),"no depth-3 agent was ever started");
     d1_delegates_again=0;free(out);
 
-    /* 3. per-turn subagent cap */
+    /* 3. Independently delegated siblings must genuinely overlap. */
+    memset(&parent,0,sizeof(parent));if(accept_test_plan(&parent))return 1;
+    parallel_case=1;calls_d0=0;tn=0;active_workers=peak_workers=0;
+    out=vs_agent_turn(&parent,"review two independent components");
+    CHECK(out&&strstr(out,"Parallel work finished"),"parent receives both delegated results");
+    CHECK(peak_workers>=2,"sibling subagents overlap in execution");
+    CHECK(parent.subagent_record_count==2,"both workers have lifecycle records");
+    CHECK(parent.subagents[0].status==1&&parent.subagents[1].status==1,"both concurrent workers complete");
+    free(out);parallel_case=0;
+
+    /* 4. per-turn subagent cap */
     memset(&parent,0,sizeof(parent));
     parent.subagent_serial=VS_MAX_SUBAGENTS_PER_TURN;
     out=vs_subagent_run(&parent,"anything");

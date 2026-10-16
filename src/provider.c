@@ -173,7 +173,7 @@ static char *request_url(const char *base,VSProtocolKind protocol,VSProviderKind
 
 char *vs_build_system_prompt(const VSContext *c){
     const char *base=
-        "You are VibeSolaris, a local coding agent. Execute coding/debugging tasks directly and efficiently.\n"
+        "You are VibeSolaris, a local coding agent WITH DIRECT LOCAL FILESYSTEM TOOLS. Execute coding/debugging tasks directly and efficiently. If asked to inspect or review the working directory, ALWAYS use VS_TOOL list/read/search first, including while in Plan mode. You do not need a shell or plan approval to inspect files. Never tell the user to paste files or publish their repo without attempting the local tools.\n"
         "TOOLS (put directives on their own lines):\n"
         "  [[VS_TOOL read task_id=\"ID\" path=\"FILE\" start_line=\"1\" max_lines=\"240\"]]\n"
         "  [[VS_TOOL list task_id=\"ID\" path=\"DIR\" depth=\"2\" limit=\"300\"]]\n"
@@ -260,7 +260,9 @@ static char *build_claude_body(VSContext *c,const char *sys,const char *user,int
         if(c->attachments[i].is_image){x=vs_cached_base64_file(c,c->attachments[i].path,0);if(x){char *label=(char*)malloc(strlen(c->attachments[i].path)+32);mime=mime_for(c->attachments[i].path);if(label){sprintf(label,"Attached image: %s",c->attachments[i].path);badd(&b,",{\"type\":\"text\",\"text\":");bquoted(&b,label);badd(&b,"}");free(label);}badd(&b,",{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":");bquoted(&b,mime);badd(&b,",\"data\":");bquoted(&b,x);badd(&b,"}}");free(x);}}
         else {t=vs_cached_read_file(c,c->attachments[i].path);if(t){t=bounded_attachment(c,t,c->attachments[i].path);if(!t)continue;badd(&b,",{\"type\":\"text\",\"text\":");x=(char*)malloc(strlen(c->attachments[i].path)+strlen(t)+32);if(x){sprintf(x,"Attached file: %s\n%s",c->attachments[i].path,t);bquoted(&b,x);free(x);}else bquoted(&b,t);badd(&b,"}");free(t);}}
     }
-    badd(&b,"]}]");if(streaming)badd(&b,",\"stream\":true");badd(&b,"}");return bfinish(c,&b);
+    badd(&b,"]}]");if(streaming)badd(&b,",\"stream\":true");
+    if(c->effort>0){badd(&b,",\"output_config\":{\"effort\":");bquoted(&b,c->effort==1?"low":c->effort==2?"medium":"high");badd(&b,"}");}
+    badd(&b,"}");return bfinish(c,&b);
 }
 
 typedef struct {
@@ -270,6 +272,7 @@ typedef struct {
     char *line;
     size_t line_len,line_cap;
     int saw_sse,done,error,callback_failed,usage_seen;
+    long stream_input,stream_output,stream_cache_read,stream_cache_write;
 } ProviderStream;
 
 static int stream_emit(ProviderStream *s,const char *text)
@@ -287,6 +290,20 @@ static void stream_event(ProviderStream *s,const char *data)
     if(!strcmp(data,"[DONE]")){s->done=1;return;}
     if(strstr(data,"\"type\":\"error\"")||strstr(data,"\"type\": \"error\"")){s->error=1;return;}
     if(s->protocol==VS_PROTOCOL_ANTHROPIC){
+        /* Anthropic SSE reports input in message_start and output in
+           message_delta. Do not treat each delta as a separate request. */
+        if(strstr(data,"\"message_start\"")){
+            if(strstr(data,"\"input_tokens\"")){
+                s->stream_input=extract_long(data,"\"input_tokens\"");s->usage_seen=1;
+            }
+            s->stream_cache_read=extract_long(data,"\"cache_read_input_tokens\"");
+            s->stream_cache_write=extract_long(data,"\"cache_creation_input_tokens\"");
+        }
+        if(strstr(data,"\"message_delta\"")){
+            if(strstr(data,"\"output_tokens\"")){
+                s->stream_output=extract_long(data,"\"output_tokens\"");s->usage_seen=1;
+            }
+        }
         if(strstr(data,"content_block_delta")&&strstr(data,"text_delta")){
             part=extract_string_field(data,"\"text\"");if(part){stream_emit(s,part);free(part);}
         }
@@ -317,6 +334,13 @@ static int provider_stream_chunk(void *userdata,const char *data,size_t len)
 static void provider_stream_finish(ProviderStream *s)
 {if(s&&s->line_len&&stream_line(s,s->line,s->line_len)!=0)s->error=1;}
 
+static void stream_capture_usage(ProviderStream *s){
+    char usage[256];
+    if(!s||!s->usage_seen||!s->ctx)return;
+    snprintf(usage,sizeof(usage),"{\"input_tokens\":%ld,\"output_tokens\":%ld,\"cache_read_input_tokens\":%ld,\"cache_creation_input_tokens\":%ld}",
+             s->stream_input,s->stream_output,s->stream_cache_read,s->stream_cache_write);
+    capture_usage(s->ctx,usage);
+}
 static int provider_stream_success(const ProviderStream *s)
 {return s&&s->saw_sse&&!s->error;}
 
@@ -403,7 +427,7 @@ char *vs_chat(VSContext *c,const char *user){
         vs_trace(c,"http-wait","request sent; waiting for provider response");
         {
             ProviderStream ps;memset(&ps,0,sizeof(ps));ps.ctx=c;ps.protocol=VS_PROTOCOL_ANTHROPIC;
-            if(binit(&ps.answer,256)==0){int src=vs_http_post_stream_ctx(c,endpoint,h,nh,body,&status,provider_stream_chunk,&ps);provider_stream_finish(&ps);if(src==0&&provider_stream_success(&ps)){free(body);free(endpoint);free(sys);out=ps.error?dupstr(vs_cancel_requested(c)?"Stopped by user.":"Streaming provider response failed."):ps.answer.p;free(ps.line);if(out&&*out)vs_trace(c,"http-result","streaming provider response received");return out?out:dupstr("HTTP request failed");}if(ps.error&&ps.answer.len>0&&!ps.callback_failed){free(body);free(endpoint);free(sys);out=dupstr(vs_cancel_requested(c)?"Stopped by user.":"Streaming provider response failed.");free(ps.answer.p);free(ps.line);return out;}free(ps.answer.p);free(ps.line);}
+            if(binit(&ps.answer,256)==0){int src=vs_http_post_stream_ctx(c,endpoint,h,nh,body,&status,provider_stream_chunk,&ps);provider_stream_finish(&ps);if(src==0&&provider_stream_success(&ps)){stream_capture_usage(&ps);free(body);free(endpoint);free(sys);out=ps.error?dupstr(vs_cancel_requested(c)?"Stopped by user.":"Streaming provider response failed."):ps.answer.p;free(ps.line);if(out&&*out)vs_trace(c,"http-result","streaming provider response received");return out?out:dupstr("HTTP request failed");}if(ps.error&&ps.answer.len>0&&!ps.callback_failed){free(body);free(endpoint);free(sys);out=dupstr(vs_cancel_requested(c)?"Stopped by user.":"Streaming provider response failed.");free(ps.answer.p);free(ps.line);return out;}free(ps.answer.p);free(ps.line);}
         }
         free(body);body=build_claude_body(c,sys,user,0);if(!body){free(endpoint);free(sys);return dupstr("Request is too large or memory is exhausted");}
         h[0]="Content-Type: application/json";
@@ -421,7 +445,7 @@ char *vs_chat(VSContext *c,const char *user){
         vs_trace(c,"http-wait","request sent; waiting for provider response");
         {
             ProviderStream ps;memset(&ps,0,sizeof(ps));ps.ctx=c;ps.protocol=VS_PROTOCOL_OPENAI;
-            if(binit(&ps.answer,256)==0){int src=vs_http_post_stream_ctx(c,endpoint,h,3,body,&status,provider_stream_chunk,&ps);provider_stream_finish(&ps);if(src==0&&provider_stream_success(&ps)){free(body);free(endpoint);free(sys);out=ps.error?dupstr(vs_cancel_requested(c)?"Stopped by user.":"Streaming provider response failed"):ps.answer.p;free(ps.line);if(out&&*out)vs_trace(c,"http-result","streaming provider response received");return out?out:dupstr("HTTP request failed");}if(ps.error&&ps.answer.len>0&&!ps.callback_failed){free(body);free(endpoint);free(sys);out=dupstr(vs_cancel_requested(c)?"Stopped by user.":"Streaming provider response failed");free(ps.answer.p);free(ps.line);return out;}free(ps.answer.p);free(ps.line);}
+            if(binit(&ps.answer,256)==0){int src=vs_http_post_stream_ctx(c,endpoint,h,3,body,&status,provider_stream_chunk,&ps);provider_stream_finish(&ps);if(src==0&&provider_stream_success(&ps)){stream_capture_usage(&ps);free(body);free(endpoint);free(sys);out=ps.error?dupstr(vs_cancel_requested(c)?"Stopped by user.":"Streaming provider response failed"):ps.answer.p;free(ps.line);if(out&&*out)vs_trace(c,"http-result","streaming provider response received");return out?out:dupstr("HTTP request failed");}if(ps.error&&ps.answer.len>0&&!ps.callback_failed){free(body);free(endpoint);free(sys);out=dupstr(vs_cancel_requested(c)?"Stopped by user.":"Streaming provider response failed");free(ps.answer.p);free(ps.line);return out;}free(ps.answer.p);free(ps.line);}
         }
         free(body);body=build_openai_body(c,sys,user,0);if(!body){free(endpoint);free(sys);return dupstr("Request is too large or memory is exhausted");}
         h[0]="Content-Type: application/json";h[1]=auth;

@@ -1,3 +1,4 @@
+#include <pthread.h>
 /* SPDX-License-Identifier: Unlicense */
 #include "vibesolaris.h"
 #include <stdio.h>
@@ -55,6 +56,10 @@ static int false_tool_unavailable_claim(const char *s){
     toolish=ascii_contains_ci(s,"tool")||ascii_contains_ci(s,"command")||ascii_contains_ci(s,"vs_tool")||ascii_contains_ci(s,"tool_result")||ascii_contains_ci(s,"workspace bridge");
     blocked=ascii_contains_ci(s,"not returning")||ascii_contains_ci(s,"stopped returning")||ascii_contains_ci(s,"no result")||ascii_contains_ci(s,"no results")||ascii_contains_ci(s,"unavailable")||ascii_contains_ci(s,"cannot continue")||ascii_contains_ci(s,"can't continue")||ascii_contains_ci(s,"unable to continue")||ascii_contains_ci(s,"restore")||ascii_contains_ci(s,"re-enable")||ascii_contains_ci(s,"reenable")||ascii_contains_ci(s,"broken");
     return toolish&&blocked;
+}
+static int inspection_request(const char *s){
+    static const char *k[]={"look at this project","look at the project","look into this project","inspect this project","inspect the project","look at the files","look into the files","read the project","review the project","review this repo","inspect the repo","look at this repo","explore the codebase",0};int i;
+    if(!s)return 0;for(i=0;k[i];i++)if(ascii_contains_ci(s,k[i]))return 1;return 0;
 }
 static int should_auto_continue(const char *original,const char *answer){if(!execution_intent(original)||!prospective_language(answer))return 0;if(ascii_contains_ci(answer,"if you want")||ascii_contains_ci(answer,"if you'd like"))return 0;return 1;}
 static char *strip_marker(const char *s,const char *marker){const char *p;char *o;size_t a,b;if(!s)return dupstr("");p=strstr(s,marker);if(!p)return dupstr(s);a=(size_t)(p-s);b=strlen(p+strlen(marker));o=(char*)malloc(a+b+1);if(!o)return 0;memcpy(o,s,a);memcpy(o+a,p+strlen(marker),b+1);return o;}
@@ -165,7 +170,21 @@ static char *execute_tool(VSContext *c,const char *d,int *command_runner_confirm
     if(!strncmp(d+10,"web_search ",11)){char *q=attr(d,"query"),*cnt=attr(d,"count"),*r;int n=5;if(q)unesc(q);if(cnt){n=atoi(cnt);if(n<1)n=1;if(n>12)n=12;}r=q&&*q?vs_web_search(c,q,n):dupstr("ERROR: web_search requires query=\"...\"");free(q);free(cnt);return r;}
     if(!strncmp(d+10,"web_fetch ",10)){char *u=attr(d,"url"),*r;if(u)unesc(u);r=u&&*u?vs_web_fetch(c,u,96U*1024U):dupstr("ERROR: web_fetch requires url=\"https://...\"");free(u);return r;}
     if(!strncmp(d+10,"run ",4)){char *cmd=attr(d,"cmd"),*raw=0,*bounded=0;int st=0;if(cmd)unesc(cmd);raw=cmd?vs_run_command_ctx(c,cmd,&st):0;if(raw){size_t z;bounded=vs_compact_text_limit(raw,VS_AGENT_COMMAND_RESULT_MAX,"command output compacted; narrow the command or inspect a specific file/range");free(raw);raw=bounded;*command_runner_confirmed=1;z=strlen(raw?raw:"")+1024;result=(char*)malloc(z);if(result)snprintf(result,z,"COMMAND_RUNNER_STATUS: operational\nCOMMAND_SHELL: %s\nCOMMAND_EXIT_STATUS: %d\nOUTPUT:\n%s%s",vs_command_shell_name(),st,raw?raw:"",(solaris_host(c)&&st!=0&&solaris_command_mismatch(raw))?"\nSOLARIS_HINT: This looks like a GNU/Linux-vs-Solaris command mismatch. Use Solaris/POSIX syntax or VibeSolaris read/list/search; do not retry the same unsupported option unchanged.\n":"");free(raw);}else{*command_runner_confirmed=0;result=dupstr("COMMAND_RUNNER_STATUS: host_error\nCOMMAND_EXIT_STATUS: -1\nERROR: host could not start or communicate with the command process.");}free(cmd);return result?result:dupstr("ERROR: command result allocation failed");}
-    if(!strncmp(d+10,"write ",6)){char *p=attr(d,"path"),*ct=attr(d,"content");int rc=-1;if(p)unesc(p);if(ct)unesc(ct);if(p&&ct)rc=vs_write_file(p,ct);if(rc==0&&p)vs_cache_invalidate(c,p);result=dupstr(rc==0?"OK: file written":"ERROR: write failed");free(p);free(ct);return result;}
+    if(!strncmp(d+10,"write ",6)){char *p=attr(d,"path"),*ct=attr(d,"content");int rc=-1;if(p)unesc(p);if(ct)unesc(ct);if(p&&ct)rc=vs_write_file(p,ct);if(rc==0&&p)vs_cache_invalidate(c,p);if(rc==0&&p&&ct){
+        /* Read-after-write verification catches silent truncation/write races. */
+        FILE *check=fopen(p,"rb");int verified=0;
+        if(check){size_t expected=strlen(ct),got=0;char tmp[4096];int equal=1;size_t take;
+            while((take=fread(tmp,1,sizeof(tmp),check))>0){
+                if(got+take>expected||memcmp(tmp,ct+got,take)!=0){equal=0;break;}
+                got+=take;
+            }
+            if(ferror(check))equal=0;
+            verified=equal&&got==expected;
+            fclose(check);
+        }
+        result=dupstr(verified?"OK: file written; read-back verification passed":"ERROR: file write returned success but read-back verification failed");
+    }else result=dupstr("ERROR: write failed");
+    free(p);free(ct);return result;}
     return dupstr("ERROR: unknown VS_TOOL operation");
 }
 
@@ -308,7 +327,58 @@ done:
     free(title);free(raw);return rc;
 }
 
-static char *execute_batch(VSContext *c,const char *answer,int *command_runner_confirmed){int total=directive_count(answer),original_total=total,i=0,is_mcp;const char *cur=answer;char *d,*r,*server,*name,*args,*single=0;ABuffer b;if(total<=0)return 0;if(total>VS_MAX_BATCH_TOOLS)total=VS_MAX_BATCH_TOOLS;if(total==1){d=next_directive(&cur,&is_mcp);if(!d)return dupstr("ERROR: malformed directive");if(is_mcp){server=attr(d,"server");name=attr(d,"tool");args=attr(d,"args");if(args)unesc(args);single=(server&&name)?vs_mcp_call(c,server,name,args&&*args?args:"{}"):dupstr("ERROR: malformed VS_MCP directive");free(server);free(name);free(args);}else single=execute_tool(c,d,command_runner_confirmed);free(d);return single;}
+/* Run independent delegated tasks at once. Non-subagent batches retain
+   their original ordered execution semantics. */
+typedef struct { VSContext *parent; char *task; char *result; pthread_t thread; int started; } ParallelSubagent;
+static void *parallel_subagent_worker(void *v)
+{
+    ParallelSubagent *job=(ParallelSubagent*)v;
+    job->result=vs_subagent_run(job->parent,job->task);
+    return NULL;
+}
+static char *parallel_subagent_batch(VSContext *c,const char *answer,int total)
+{
+    ParallelSubagent jobs[VS_MAX_BATCH_TOOLS];
+    const char *cur=answer;ABuffer b;int i,mcp;char *d,*out=NULL;
+    memset(jobs,0,sizeof(jobs));
+    /* Parse every task before launching any worker. */
+    for(i=0;i<total;i++){
+        d=next_directive(&cur,&mcp);
+        if(!d||mcp){free(d);goto cleanup;}
+        jobs[i].task=attr(d,"task");
+        if(jobs[i].task)unesc(jobs[i].task);
+        jobs[i].parent=c;free(d);
+        if(!jobs[i].task)goto cleanup;
+    }
+    for(i=0;i<total;i++){
+        if(!pthread_create(&jobs[i].thread,NULL,parallel_subagent_worker,&jobs[i]))jobs[i].started=1;
+        else jobs[i].result=dupstr("ERROR: unable to start subagent thread");
+    }
+    for(i=0;i<total;i++)if(jobs[i].started)pthread_join(jobs[i].thread,NULL);
+    if(ab_init(&b,VS_AGENT_TOOL_RESULT_MAX)!=0)goto cleanup;
+    ab_addf(&b,"PARALLEL_SUBAGENT_RESULT: %d independent task(s), all joined\n",total);
+    for(i=0;i<total;i++){
+        char *q=vs_compact_text_limit(jobs[i].result?jobs[i].result:"ERROR: missing result",VS_AGENT_TOOL_RESULT_MAX/(size_t)total,"parallel subagent result compacted");
+        ab_addf(&b,"\n--- subagent task %d ---\n",i+1);
+        if(q){ab_add(&b,q);free(q);}
+    }
+    out=ab_finish(&b);
+cleanup:
+    for(i=0;i<total;i++){free(jobs[i].task);free(jobs[i].result);}
+    return out;
+}
+static int all_subagent_directives(const char *answer,int total)
+{
+    const char *cur=answer;int i,mcp;char *d;
+    for(i=0;i<total;i++){
+        d=next_directive(&cur,&mcp);
+        if(!d)return 0;
+        if(mcp||strncmp(d+10,"subagent ",9)){free(d);return 0;}
+        free(d);
+    }
+    return total>1;
+}
+static char *execute_batch(VSContext *c,const char *answer,int *command_runner_confirmed){int total=directive_count(answer),original_total=total,i=0,is_mcp;const char *cur=answer;char *d,*r,*server,*name,*args,*single=0;ABuffer b;if(total<=0)return 0;if(total>VS_MAX_BATCH_TOOLS)total=VS_MAX_BATCH_TOOLS;if(all_subagent_directives(answer,total)){char *parallel=parallel_subagent_batch(c,answer,total);if(parallel)return parallel;}if(total==1){d=next_directive(&cur,&is_mcp);if(!d)return dupstr("ERROR: malformed directive");if(is_mcp){server=attr(d,"server");name=attr(d,"tool");args=attr(d,"args");if(args)unesc(args);single=(server&&name)?vs_mcp_call(c,server,name,args&&*args?args:"{}"):dupstr("ERROR: malformed VS_MCP directive");free(server);free(name);free(args);}else single=execute_tool(c,d,command_runner_confirmed);free(d);return single;}
     if(ab_init(&b,VS_AGENT_TOOL_RESULT_MAX)!=0)return 0;
     ab_addf(&b,"BATCH_TOOL_RESULT: %d directive(s) executed in order\n",total);
     while(i<total&&(d=next_directive(&cur,&is_mcp))!=0){i++;ab_addf(&b,"\n--- directive %d: %.220s ---\n",i,d);if(is_mcp){server=attr(d,"server");name=attr(d,"tool");args=attr(d,"args");if(args)unesc(args);r=(server&&name)?vs_mcp_call(c,server,name,args&&*args?args:"{}"):dupstr("ERROR: malformed VS_MCP directive");free(server);free(name);free(args);}else r=execute_tool(c,d,command_runner_confirmed);if(r){char *q=vs_compact_text_limit(r,VS_AGENT_TOOL_RESULT_MAX/(size_t)(total?total:1),"batched tool result compacted");if(q){ab_add(&b,q);free(q);}free(r);}free(d);}
@@ -401,6 +471,20 @@ char *vs_agent_turn(VSContext *c,const char *user){
         if(!tool&&!mcp&&strstr(ans,"[[VS_NEED_USER")){char *marker=strstr(ans,"[[VS_NEED_USER"),*q=attr(marker,"question");int oi;c->pending_question=0;c->question_option_count=0;c->question[0]=0;memset(c->question_options,0,sizeof(c->question_options));if(q&&*q){unesc(q);strncpy(c->question,q,sizeof(c->question)-1);c->pending_question=1;c->pending_question_revision++;for(oi=0;oi<VS_NEED_USER_MAX_OPTIONS;oi++){char key[16];char *option;snprintf(key,sizeof(key),"option%d",oi+1);option=attr(marker,key);if(!option)break;unesc(option);if(!*option||strlen(option)>=VS_NEED_USER_OPTION_MAX){free(option);c->question_option_count=0;memset(c->question_options,0,sizeof(c->question_options));break;}strncpy(c->question_options[oi],option,sizeof(c->question_options[oi])-1);c->question_option_count++;free(option);}free(ans);ans=q;}else{free(q);free(ans);ans=dupstr("The agent needs clarification before it can continue.");}vs_trace(c,"agent","paused because model needs user input");break;}
         if(!tool&&!mcp&&strstr(ans,"[[VS_FINAL]]")){char *clean=strip_marker(ans,"[[VS_FINAL]]");int i,all_complete=c->workflow.task_count>0;if(clean){free(ans);ans=clean;}for(i=0;i<c->workflow.task_count;i++)if(c->workflow.tasks[i].status!=VS_TASK_COMPLETED)all_complete=0;if(all_complete)c->workflow.phase=VS_WORKFLOW_COMPLETED;vs_trace(c,"agent",all_complete?"completed with explicit final marker":"turn ended with explicit final marker; remaining tasks retain host-observed status");break;}
         if(!tool&&!mcp){
+            /* Read-only repository inspection is actionable even in Plan mode.
+               Haiku/small models sometimes mistake custom tool directives for
+               unavailable function calling; retry with an explicit read action. */
+            if(!actual_tool_seen&&inspection_request(original)&&tool_recoveries<2){
+                char *retry;size_t sz=strlen(original)+strlen(c->cwd)+512;
+                retry=(char*)malloc(sz);
+                if(retry){
+                    snprintf(retry,sz,"USER_REQUEST: %s\n\nLOCAL_FILESYSTEM_ACCESS_IS_AVAILABLE. Your current working directory is %s. This is an inspection request; issue [[VS_TOOL list path=\".\" depth=\"2\" limit=\"100\"]] on its own line NOW. Read-only inspection does not require plan approval or a task_id. Do not claim you cannot access the files; do not ask the user to paste anything.",original,c->cwd);
+                    tool_recoveries++;
+                    vs_trace(c,"tool-recovery","inspection answer omitted file tools; requesting explicit local directory listing");
+                    agent_history_add(c,"user",prompt);agent_history_add(c,"assistant",ans);
+                    free(prompt);prompt=retry;continue;
+                }
+            }
             if(execution_mode||actual_tool_seen){plan_continues++;no_progress++;if(no_progress>=2){stalled=1;snprintf(step,sizeof(step),"stopped after %d consecutive execution responses without a tool action or completion marker",no_progress);vs_trace(c,"no-progress",step);break;}snprintf(step,sizeof(step),"execution response had no directive/final marker; one recovery continuation remains (%d/2)",no_progress);vs_trace(c,"auto-continue",step);agent_history_add(c,"user",prompt);agent_history_add(c,"assistant",ans);agent_compact(c,task_anchor,round+1);next=continuation_prompt(task_anchor,last_tool_result,1,c->agent_checkpoint);free(prompt);prompt=next;if(!prompt){vs_trace(c,"memory-error","could not allocate continuation prompt");break;}continue;}
             if(plan_continues<VS_MAX_PLAN_CONTINUES&&should_auto_continue(original,ans)){plan_continues++;snprintf(step,sizeof(step),"planning-only response detected; continuing (%d/%d)",plan_continues,VS_MAX_PLAN_CONTINUES);vs_trace(c,"auto-continue",step);agent_history_add(c,"user",prompt);agent_history_add(c,"assistant",ans);agent_compact(c,task_anchor,round+1);next=continuation_prompt(task_anchor,0,1,c->agent_checkpoint);free(prompt);prompt=next;if(!prompt){vs_trace(c,"memory-error","could not allocate continuation prompt");break;}continue;}
             vs_trace(c,"agent","completed informational turn without tool work");break;
