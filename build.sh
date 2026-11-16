@@ -381,6 +381,20 @@ fi
 [ -n "$CURL_LIBS" ] || CURL_LIBS='-lcurl'
 [ -n "$CRYPTO_LIBS" ] || CRYPTO_LIBS='-lcrypto'
 [ -n "$X11_LIBS" ] || X11_LIBS='-lX11'
+
+# The X11 Computer Use backend calls XTestFake* entry points, so libXtst must
+# be linked in addition to libX11.  Append it unless the caller already took
+# care of it through VS_X11_LIBS.
+case "$X11_LIBS" in
+    *Xtst*) ;;
+    *)
+        if [ -n "$PC" ] && $PC --exists xtst 2>/dev/null; then
+            X11_LIBS="$X11_LIBS `$PC --libs xtst`"
+        else
+            X11_LIBS="$X11_LIBS -lXtst"
+        fi
+        ;;
+esac
 CPPFLAGS="-Iinclude $CURL_CFLAGS $CRYPTO_CFLAGS $X11_CFLAGS ${VS_CPPFLAGS:-}"
 
 WANT_GUI=yes
@@ -406,6 +420,29 @@ if [ -z "$NATIVE_CC" ]; then
         Darwin) darwin_dep_help ;;
     esac
     exit 1
+fi
+
+# "./build.sh test" runs the headless test suite with the same dependency
+# flags detected above.  Plain "make test" only works when libcurl and
+# libcrypto live in the compiler's default search paths, which is not the
+# case for Homebrew/MacPorts OpenSSL on Darwin or pkgsrc on NetBSD.
+if [ "${1:-}" = test ]; then
+    test_warnflags=""
+    case "`basename "$NATIVE_CC"`" in
+        gcc|gcc-*|clang|clang-*) test_warnflags="-Wall" ;;
+    esac
+    echo "== running headless test suite on $HOST_OS with $NATIVE_CC =="
+    echo "   curl libs:   $CURL_LIBS"
+    echo "   crypto libs: $CRYPTO_LIBS"
+    (cd "$ROOT" && make \
+        CC="$NATIVE_CC" \
+        CPPFLAGS="$CPPFLAGS" \
+        CFLAGS="-O2 $test_warnflags ${VS_NATIVE_CFLAGS:-}" \
+        LDFLAGS="${VS_NATIVE_LDFLAGS:-}" \
+        CURL_LIBS="$CURL_LIBS" \
+        CRYPTO_LIBS="$CRYPTO_LIBS" \
+        X11_LIBS="$X11_LIBS" test-headless)
+    exit $?
 fi
 
 native=`uname -m 2>/dev/null || uname -p 2>/dev/null || echo unknown`

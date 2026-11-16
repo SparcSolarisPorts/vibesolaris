@@ -21,11 +21,14 @@ CORE = src/util.o src/http.o src/web.o src/graph.o src/config.o src/secure_confi
 
 all: vibesolaris vibesolaris-gui
 
-vibesolaris: $(CORE) src/computer_use_stub.o src/tui.o src/tui_stream.o src/tui_compositor.o
-	$(CC) $(LDFLAGS) -o vibesolaris $(CORE) src/computer_use_stub.o src/tui.o src/tui_stream.o src/tui_compositor.o $(CURL_LIBS) $(CRYPTO_LIBS) $(THREAD_LIBS)
+# The Wayland and Cocoa backends use only external commands, so they link
+# into both binaries without adding library dependencies.  The non-X11
+# computer_use build delegates to whichever backend the session offers.
+vibesolaris: $(CORE) src/computer_use_stub.o src/computer_use_wayland.o src/computer_use_cocoa.o src/tui.o src/tui_stream.o src/tui_compositor.o
+	$(CC) $(LDFLAGS) -o vibesolaris $(CORE) src/computer_use_stub.o src/computer_use_wayland.o src/computer_use_cocoa.o src/tui.o src/tui_stream.o src/tui_compositor.o $(CURL_LIBS) $(CRYPTO_LIBS) $(THREAD_LIBS)
 
-vibesolaris-gui: $(CORE) src/computer_use.o src/gui.o
-	$(CC) $(LDFLAGS) -o vibesolaris-gui $(CORE) src/computer_use.o src/gui.o $(CURL_LIBS) $(CRYPTO_LIBS) $(X11_LIBS) $(THREAD_LIBS)
+vibesolaris-gui: $(CORE) src/computer_use.o src/computer_use_wayland.o src/computer_use_cocoa.o src/gui.o
+	$(CC) $(LDFLAGS) -o vibesolaris-gui $(CORE) src/computer_use.o src/computer_use_wayland.o src/computer_use_cocoa.o src/gui.o $(CURL_LIBS) $(CRYPTO_LIBS) $(X11_LIBS) $(THREAD_LIBS)
 
 src/util.o: src/util.c include/vibesolaris.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c src/util.c -o src/util.o
@@ -133,7 +136,7 @@ src/computer_use.o: src/computer_use.c include/vibesolaris.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(CU_X11_DEFS) -c src/computer_use.c -o src/computer_use.o
 
 src/computer_use_stub.o: src/computer_use.c include/vibesolaris.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c src/computer_use.c -o src/computer_use_stub.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DHAVE_WAYLAND -DHAVE_COCOA -c src/computer_use.c -o src/computer_use_stub.o
 
 src/checkpoint.o: src/checkpoint.c include/vibesolaris.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c src/checkpoint.c -o src/checkpoint.o
@@ -211,6 +214,8 @@ test-agent:
 	/tmp/vibesolaris-agent-compaction-test
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/agent_native_tools_test.c $(AGENT_SRCS) $(AGENT_MCP_STUB) $(CURL_LIBS) $(CRYPTO_LIBS) $(THREAD_LIBS) -o /tmp/vibesolaris-agent-native-tools-test
 	/tmp/vibesolaris-agent-native-tools-test
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/agent_extended_test.c $(AGENT_SRCS) $(AGENT_MCP_STUB) $(CURL_LIBS) $(CRYPTO_LIBS) $(THREAD_LIBS) -o /tmp/vibesolaris-agent-extended-test
+	/tmp/vibesolaris-agent-extended-test
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/graph_test.c src/graph.c -o /tmp/vibesolaris-graph-test
 	/tmp/vibesolaris-graph-test
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/web_test.c src/web.c -o /tmp/vibesolaris-web-test
@@ -235,6 +240,10 @@ test-claude-oauth:
 	/tmp/vibesolaris-claude-config-test
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/custom_anthropic_agent_test.c src/provider.c $(AGENT_SRCS) $(AGENT_MCP_STUB) src/oauth.c src/sha256.c $(CURL_LIBS) $(CRYPTO_LIBS) $(THREAD_LIBS) -o /tmp/vibesolaris-custom-anthropic-agent-test
 	/tmp/vibesolaris-custom-anthropic-agent-test
+
+test-provider-cache:
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/provider_cache_test.c src/provider.c $(AGENT_SRCS) $(AGENT_MCP_STUB) src/oauth.c src/sha256.c $(CURL_LIBS) $(CRYPTO_LIBS) $(THREAD_LIBS) -o /tmp/vibesolaris-provider-cache-test
+	/tmp/vibesolaris-provider-cache-test
 
 test-provider-stream:
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/provider_stream_sse_test.c src/provider.c src/reasoning.c src/oauth.c src/sha256.c -o /tmp/vibesolaris-provider-stream-sse-test
@@ -336,8 +345,28 @@ test-computer-use:
 	$(CC) $(CPPFLAGS) $(CFLAGS) -DHAVE_WAYLAND -DHAVE_COCOA tests/computer_use_backend_test.c src/computer_use.c src/computer_use_wayland.c src/computer_use_cocoa.c $(AGENT_MCP_STUB) -o /tmp/vibesolaris-computer-use-test
 	/tmp/vibesolaris-computer-use-test
 
-test-goal: $(CORE) src/computer_use_stub.o
-	$(CC) $(CPPFLAGS) $(CFLAGS) tests/goal_test.c $(CORE) src/computer_use_stub.o $(CURL_LIBS) $(CRYPTO_LIBS) $(THREAD_LIBS) -o /tmp/vibesolaris-goal-test
+# Non-interactive Computer Use checks (detection, NULL-safety, headless
+# degradation).  Safe for CI and SSH sessions: no input injection, no
+# screen capture.
+test-computer-use-macos:
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DHAVE_WAYLAND -DHAVE_COCOA tests/computer_use_macos_test.c src/computer_use.c src/computer_use_wayland.c src/computer_use_cocoa.c $(AGENT_MCP_STUB) -o /tmp/vibesolaris-computer-use-macos-test
+	/tmp/vibesolaris-computer-use-macos-test
+
+# GUI smoke test: the full GUI binary must link and must refuse a headless
+# session cleanly instead of crashing.  Requires X11 development libraries
+# to build, so it is not part of "make test".
+test-gui: vibesolaris-gui
+	@d=$$(mktemp -d /tmp/vs-gui.XXXXXX) || exit 1; trap 'rm -rf "$$d"' 0 1 2 3 15; \
+	out=$$(unset DISPLAY WAYLAND_DISPLAY; HOME="$$d" ./vibesolaris-gui 2>&1); rc=$$?; \
+	echo "$$out"; \
+	if [ $$rc -eq 1 ] && echo "$$out" | grep -q "cannot open X display"; then \
+		echo "ok: GUI refuses a headless session cleanly"; \
+	else \
+		echo "FAIL: GUI did not refuse a headless session cleanly (rc=$$rc)"; exit 1; \
+	fi
+
+test-goal: $(CORE) src/computer_use_stub.o src/computer_use_wayland.o src/computer_use_cocoa.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/goal_test.c $(CORE) src/computer_use_stub.o src/computer_use_wayland.o src/computer_use_cocoa.o $(CURL_LIBS) $(CRYPTO_LIBS) $(THREAD_LIBS) -o /tmp/vibesolaris-goal-test
 	@d=$$(mktemp -d /tmp/vs-goal.XXXXXX) || exit 1; trap 'rm -rf "$$d"' 0 1 2 3 15; HOME="$$d" /tmp/vibesolaris-goal-test
 
 test-settings:
@@ -359,6 +388,10 @@ test-tui-theme:
 test-tui-suggestions:
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/tui_suggestions_test.c src/tui_suggestions.c -o /tmp/vibesolaris-tui-suggestions-test
 	/tmp/vibesolaris-tui-suggestions-test
+
+test-tui-slash:
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/tui_slash_test.c src/tui_suggestions.c -o /tmp/vibesolaris-tui-slash-test
+	/tmp/vibesolaris-tui-slash-test
 
 test-tui-editor:
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/tui_editor_test.c src/tui_editor.c -o /tmp/vibesolaris-tui-editor-test
@@ -393,10 +426,10 @@ test-phase9:
 	/tmp/vibesolaris-phase9-test
 
 # No X11, libcurl or libcrypto link dependencies.
-test-basic: test-keybindings test-provider-stream test-tui-stream test-todo test-edit test-memory test-skill test-coordinator test-tool-executor test-glob test-grep test-notebook test-monitor test-multi-edit test-lsp test-permission test-task test-checkpoint test-dream test-auto-mode test-agent-team test-plugin test-code-review test-init-cmd test-settings test-hooks-extended test-project-index test-tui-theme test-tui-suggestions test-tui-editor test-reasoning test-rewind test-security-review test-loop test-workflow-engine test-cross-session test-phase9
+test-basic: test-keybindings test-provider-stream test-tui-stream test-todo test-edit test-memory test-skill test-coordinator test-tool-executor test-glob test-grep test-notebook test-monitor test-multi-edit test-lsp test-permission test-task test-checkpoint test-dream test-auto-mode test-agent-team test-plugin test-code-review test-init-cmd test-settings test-hooks-extended test-project-index test-tui-theme test-tui-suggestions test-tui-slash test-tui-editor test-reasoning test-rewind test-security-review test-loop test-workflow-engine test-cross-session test-phase9 test-computer-use-macos
 
 # No X11, but these targets link libcurl and libcrypto.
-test-headless-deps: test-goal test-agent test-subagent test-workflow test-claude-oauth
+test-headless-deps: test-goal test-agent test-subagent test-workflow test-claude-oauth test-provider-cache
 
 test-headless: test-basic test-headless-deps
 

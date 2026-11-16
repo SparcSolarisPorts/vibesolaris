@@ -16,6 +16,7 @@ static int fails=0;
 static int calls_d0=0,calls_d1=0,calls_d2=0;
 static int d1_delegates_again=0;
 static int parallel_case=0,active_workers=0,peak_workers=0;
+static char last_d1_prompt[8192];
 static pthread_mutex_t worker_lock=PTHREAD_MUTEX_INITIALIZER;
 char *vs_chat(VSContext *c,const char *prompt){
     (void)prompt;
@@ -27,6 +28,7 @@ char *vs_chat(VSContext *c,const char *prompt){
         return strdup("Subagent reported back. [[VS_FINAL]]");
     }
     if(c->subagent_depth==1){
+        snprintf(last_d1_prompt,sizeof(last_d1_prompt),"%s",prompt?prompt:"");
         if(parallel_case){struct timespec delay={0,150000000};pthread_mutex_lock(&worker_lock);active_workers++;if(active_workers>peak_workers)peak_workers=active_workers;pthread_mutex_unlock(&worker_lock);nanosleep(&delay,NULL);pthread_mutex_lock(&worker_lock);active_workers--;pthread_mutex_unlock(&worker_lock);return strdup("Independent review complete. [[VS_FINAL]]");}
         calls_d1++;
         if(d1_delegates_again&&calls_d1==1)return strdup("[[VS_TOOL subagent task_id=\"1\" task=\"nested work\"]]");
@@ -160,6 +162,30 @@ int main(void){
 
     /* 7. request prompt used by /subagent */
     {char *p=vs_subagent_request_prompt("count files");CHECK(p&&strstr(p,"subagent task=")&&strstr(p,"count files"),"/subagent request prompt names the task");free(p);}
+
+    /* 8. delegated subagent receives the parent context digest */
+    memset(&parent,0,sizeof(parent));if(accept_test_plan(&parent))return 1;calls_d0=calls_d1=0;tn=0;last_d1_prompt[0]=0;
+    strcpy(parent.agent_history[0].role,"user");
+    parent.agent_history[0].content=strdup("we need to fix the flaky cache test before release");
+    parent.agent_history[0].bytes=strlen(parent.agent_history[0].content);
+    parent.agent_history_count=1;
+    strcpy(parent.todo.items[0].text,"fix flaky cache test");
+    parent.todo.items[0].status=VS_TODO_STATUS_IN_PROGRESS;
+    parent.todo.item_count=1;
+    out=vs_agent_turn(&parent,"review the project");
+    CHECK(out&&strstr(out,"Subagent reported back"),"parent finishes after digest-carrying delegation");
+    CHECK(strstr(last_d1_prompt,"PARENT CONTEXT")!=NULL,"subagent prompt carries the parent context digest");
+    CHECK(strstr(last_d1_prompt,"flaky cache test")!=NULL,"digest includes the recent parent conversation");
+    CHECK(strstr(last_d1_prompt,"OPEN TODOS")!=NULL,"digest includes open TODO state");
+    free(out);
+
+    /* 9. digest degrades gracefully with no conversation at all */
+    memset(&parent,0,sizeof(parent));last_d1_prompt[0]=0;
+    out=vs_subagent_run(&parent,"standalone task");
+    CHECK(out&&strstr(out,"SUBAGENT_RESULT"),"subagent still runs without any parent history");
+    CHECK(strstr(last_d1_prompt,"PARENT CONTEXT")!=NULL,"digest header present even when empty");
+    CHECK(strstr(last_d1_prompt,"no prior conversation")!=NULL,"empty parent history is reported honestly");
+    free(out);
 
     if(fails){fprintf(stderr,"%d failure(s)\n",fails);return 1;}
     printf("all subagent tests passed\n");return 0;

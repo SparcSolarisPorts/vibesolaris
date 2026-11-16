@@ -43,42 +43,6 @@ static int tui_output_mode = 0; /* 0 compact, 1 normal, 2 full */
 static char tui_history[TUI_HISTORY_MAX][4096];
 static int tui_history_count = 0;
 
-static const char *tui_completions[] = {
-    "/help","/quit","/effort","/effort default","/effort low","/effort medium","/effort high","/usage","/trace","/trace full","/output compact","/output normal","/output full","/output status",
-    "/provider openai","/provider claude","/provider gemini","/provider glm","/provider glm-coding","/provider kimi","/provider qwen","/provider ernie","/provider deepseek","/provider custom",
-    "/protocol openai","/protocol anthropic","/anthropic-auth bearer","/anthropic-auth x-api-key","/model ","/base ","/key ","/proxy status","/proxy on","/proxy off",
-    "/oauth status","/oauth login","/oauth logout","/oauth save","/login","/logout","/claude-oauth status","/claude-oauth login","/claude-oauth logout","/subagent ","/subagents",
-    "/attach ","/paste-image","/attachments","/attach-remove ","/clearattach","/read ","/run ","/web ","/fetch ","/graph files","/graph fields","/graph dot files ","/graph dot fields ",
-    "/cache status","/cache on","/cache off","/cache clear","/history status","/history clear",
-    "/globalconfig status","/globalconfig load","/globalconfig save","/saveconfig ",
-    "/mcp list","/mcp refresh","/mcp tools","/mcp add-stdio ","/mcp add-http ","/mcp remove ",
-    "/colour auto","/colour on","/colour off","/colour status","/mode auto","/mode plan","/mode manual","/mode status","/plan","/plan accept","/plan approve-action","/plan reject","/plan revise",
-     "/permission list","/permission allow ","/permission deny ","/tasks list","/tasks search ","/tasks create ","/skills list","/memory list","/memory search ","/memory save ","/context","/compact","/checkpoint create","/checkpoint rollback","/checkpoint list","/dream","/dream off","/tui fullscreen","/tui prompt",
-    "/auto-mode on","/auto-mode off","/auto-mode status","/auto-mode rules",
-    "/team create ","/team add ","/team list","/team shutdown ",
-    "/cost","/clear","/export","/export ","/doctor","/bashes","/hooks","/hooks list","/rename ",
-    "/plugin install ","/plugin list","/plugin uninstall ",
-    "/review ","/goal set ","/goal show","/goal clear","/init ","/pause",
-    "/style compact","/style verbose","/style default","/keybindings",
-    "/worktree ","/worktree-exit","/config","/config layer",
-    "/search ","/search-next","/search-prev","/search-exit",
-    "/reason ","/reason on","/reason off","/reason depth",
-    "/rewind","/rewind 1","/rewind 2","/rewind mark ","/rewind to ","/rewind list",
-    "/security-review ","/security-review . staged",
-    "/loop start ","/loop stop ","/loop list",
-    "/workflow run ","/workflow status",
-    "/sessions list","/sessions send ","/sessions inbox",
-    "/btw ","/btw list","/btw clear",
-    "/plan on","/plan off","/plan status",
-    "/model ","/model list",
-    "/branch ","/branch list",
-    "/diff","/diff staged",
-    "/commit","/commit generate",
-    "/pr ","/pr generate",
-    "/custom-commands list",
-    "/effort low","/effort medium","/effort high","/effort xhigh","/effort max","/effort ultracode",NULL
-};
-
 static unsigned long count_lines(const char *s)
 {
     unsigned long n=1;if(!s||!*s)return 0;for(;*s;s++)if(*s=='\n')n++;return n;
@@ -142,11 +106,6 @@ static void history_add_line(const char *s)
     {size_t n=strlen(s);if(n>=sizeof(tui_history[0]))n=sizeof(tui_history[0])-1;memcpy(tui_history[tui_history_count],s,n);tui_history[tui_history_count][n]=0;}tui_history_count++;
 }
 
-static size_t common_prefix_len(const char **m,int n)
-{
-    size_t p=0;int i;if(n<=0)return 0;while(m[0][p]){for(i=1;i<n;i++)if(m[i][p]!=m[0][p])return p;p++;}return p;
-}
-
 static int tui_read_escape(unsigned char *key);
 /* Repaint multiline input with terminal-width wrapping and cursor restoration.
    Erasing starts from the editor origin, which is preserved by the redraw
@@ -172,12 +131,14 @@ static void tui_editor_position(const char *buf,size_t end,size_t *row,size_t *c
 static void tui_redraw_cursor(const char *buf,size_t cursor);
 static void complete_slash(char *buf,size_t cap,size_t *len)
 {
-    const char *m[64];int i,n=0;size_t pre,cur=*len;
+    const char *m[64];int n,i;size_t pre,cur;
     if(!buf||!len||buf[0]!='/'||strchr(buf,'\n')||strchr(buf,' ')||strchr(buf,'\t'))return;
-    for(i=0;tui_completions[i]&&n<(int)(sizeof(m)/sizeof(m[0]));i++)
-        if(!strncmp(tui_completions[i],buf,cur))m[n++]=tui_completions[i];
+    cur=*len;
+    n=vs_tui_slash_match(buf,m,NULL,64);
     if(n==0){fputc('\a',stdout);return;}
-    pre=common_prefix_len(m,n);
+    /* common prefix across the visible candidates */
+    pre=strlen(m[0]);
+    for(i=1;i<n&&pre>cur;i++){size_t j=0;while(j<pre&&m[0][j]&&m[i][j]&&m[0][j]==m[i][j])j++;pre=j;}
     if(pre<=cur)return;
     if(pre>=cap)pre=cap-1;
     memcpy(buf+cur,m[0]+cur,pre-cur);buf[pre]=0;*len=pre;
@@ -185,13 +146,8 @@ static void complete_slash(char *buf,size_t cap,size_t *len)
 
 static int tui_slash_matches(const char *buf,const char **out,int cap)
 {
-    int i,n=0;size_t len=buf?strlen(buf):0;
     if(!buf||buf[0]!='/'||strchr(buf,'\n')||strchr(buf,' ')||strchr(buf,'\t'))return 0;
-    for(i=0;tui_completions[i]&&n<cap;i++)if(!strncmp(tui_completions[i],buf,len)){
-        if(out)out[n]=tui_completions[i];
-        n++;
-    }
-    return n;
+    return vs_tui_slash_match(buf,out,NULL,cap);
 }
 
 static void tui_clear_popup(int rows)
@@ -277,13 +233,68 @@ static void tui_redraw_cursor(const char *buf,size_t cursor)
     tui_composer_cursor_row=(int)(cr-top);
     fflush(stdout);
 }
+/* Dropdown completion popup for slash commands, painted directly below the
+   reserved composer viewport.  Pure 7-bit ANSI CSI sequences (\r\n, \033[2K,
+   \033[nA, SGR colours through cprintf): safe over SSH, tmux, and old
+   terminals, and never writes into the auto-wrap last column.  Rows beyond
+   the window are reachable with Up/Down via a sliding offset. */
+#define TUI_POPUP_MAX_ROWS 6
+static void tui_popup_text(const char *s,int limit)
+{
+    int col=0;const unsigned char *p=(const unsigned char *)(s?s:"");
+    while(*p&&col<limit){
+        if(*p=='\n'||*p=='\r')break;
+        if((*p&0xc0)!=0x80||col+1<limit){fputc(*p,stdout);col+=((*p&0xc0)!=0x80)?1:0;}
+        p++;
+    }
+}
+static int tui_popup_row(const char *name,const char *desc,int selected,int namew,int limit)
+{
+    int col=0;
+    cprintf(selected?T_BOLD T_CYAN:T_CYAN,selected?"> ":"  ");col+=2;
+    tui_popup_text(name,limit-col);col+=(int)strlen(name?name:"");
+    while(col<namew+2&&col<limit){fputc(' ',stdout);col++;}
+    if(tui_colour)fputs(T_DIM,stdout);
+    if(desc&&*desc&&col<limit){tui_popup_text(desc,limit-col);col+=(int)strlen(desc);}
+    if(tui_colour)fputs(T_RESET,stdout);
+    fputc('\n',stdout);
+    return col;
+}
 static void tui_redraw_editor(const char *buf,size_t cursor,int selected,int dismissed,int *old_rows)
 {
-    /* Suggestions are available through Tab; keep the bounded composer stable
-       instead of appending a popup beyond the reserved SSH viewport. */
-    (void)selected;(void)dismissed;
+    const char *names[64],*descs[64];
+    int n,show,offset,rows,i,namew=0,limit,width=tui_editor_width();
+    size_t len=buf?strlen(buf):0;
+    if(old_rows&&*old_rows>0)tui_clear_popup(*old_rows);
     if(old_rows)*old_rows=0;
     tui_redraw_cursor(buf,cursor);
+    if(dismissed||cursor!=len||len==0||buf[0]!='/')return;
+    n=vs_tui_slash_match(buf,names,descs,64);
+    if(n<=0)return;
+    if(selected<0)selected=0;if(selected>=n)selected=n-1;
+    show=n<TUI_POPUP_MAX_ROWS?n:TUI_POPUP_MAX_ROWS;
+    offset=selected>=show?selected-show+1:0;
+    if(offset>n-show)offset=n-show;
+    if(offset<0)offset=0;
+    for(i=0;i<show;i++){int w=(int)strlen(names[offset+i]);if(w>namew)namew=w;}
+    limit=width>1?width-1:1;
+    /* Each popup row starts on a fresh line below the composer; the screen may
+       scroll at the bottom edge, which is harmless scrollback. */
+    rows=0;
+    for(i=0;i<show;i++){
+        fputs("\r\n\033[2K",stdout);
+        tui_popup_row(names[offset+i],descs[offset+i],offset+i==selected,namew,limit);
+        rows++;
+    }
+    fputs("\r\n\033[2K",stdout);
+    if(tui_colour)fputs(T_DIM,stdout);
+    if(n>show)printf("  %d more - ",n-show);
+    fputs("Up/Down choose - Enter run - Tab complete - Esc close",stdout);
+    if(tui_colour)fputs(T_RESET,stdout);
+    rows++;
+    if(rows)printf("\033[%dA",rows);
+    if(old_rows)*old_rows=rows;
+    fflush(stdout);
 }
 static int tui_read_escape(unsigned char *key)
 {
@@ -395,12 +406,12 @@ static int tui_read_line(char *buf,size_t cap)
         if(ch==4){if(len==0){tui_clear_popup(popup_rows);fputs("\033[?2004l",stdout);tcsetattr(STDIN_FILENO,TCSAFLUSH,&oldt);return 0;}continue;}
         if(ch=='\n'){if(len+1<cap){memmove(buf+cursor+1,buf+cursor,len-cursor+1);buf[cursor++]='\n';len++;slash_dismissed=1;tui_redraw_cursor(buf,cursor);}else fputc('\a',stdout);continue;}
         if(ch==127||ch==8){if(cursor){size_t prev=tui_prev_char(buf,cursor);memmove(buf+prev,buf+cursor,len-cursor+1);len-=cursor-prev;cursor=prev;slash_selected=0;slash_dismissed=0;tui_redraw_editor(buf,cursor,slash_selected,slash_dismissed,&popup_rows);}continue;}
-        if(ch==20){/* Ctrl+T: show tasks list */if(tui_active_ctx){char *r=vs_task_list(&tui_active_ctx->tasks,64);if(r){cprintf(T_BOLD T_BLUE,"\nTasks\n");printf("%s\n",r);free(r);}else warnf("No tasks.\n");}else warnf("No active context.\n");continue;}
-        if(ch==18){/* Ctrl+R: checkpoint rollback */if(tui_active_ctx){int rc=vs_checkpoint_rollback(&tui_active_ctx->checkpoints,NULL);if(rc==0)successf("Rolled back to previous checkpoint\n");else errorf("No checkpoint to rollback\n");}else errorf("No active context.\n");continue;}
+        if(ch==20){/* Ctrl+T: show tasks list */tui_clear_popup(popup_rows);popup_rows=0;if(tui_active_ctx){char *r=vs_task_list(&tui_active_ctx->tasks,64);if(r){cprintf(T_BOLD T_BLUE,"\nTasks\n");printf("%s\n",r);free(r);}else warnf("No tasks.\n");}else warnf("No active context.\n");{int k;for(k=1;k<tui_composer_rows;k++)fputc('\n',stdout);if(tui_composer_rows>1)printf("\033[%dA",tui_composer_rows-1);fputc('\r',stdout);}tui_composer_cursor_row=0;tui_composer_top=0;tui_redraw_editor(buf,cursor,slash_selected,slash_dismissed,&popup_rows);continue;}
+        if(ch==18){/* Ctrl+R: checkpoint rollback */tui_clear_popup(popup_rows);popup_rows=0;if(tui_active_ctx){int rc=vs_checkpoint_rollback(&tui_active_ctx->checkpoints,NULL);if(rc==0)successf("Rolled back to previous checkpoint\n");else errorf("No checkpoint to rollback\n");}else errorf("No active context.\n");{int k;for(k=1;k<tui_composer_rows;k++)fputc('\n',stdout);if(tui_composer_rows>1)printf("\033[%dA",tui_composer_rows-1);fputc('\r',stdout);}tui_composer_cursor_row=0;tui_composer_top=0;tui_redraw_editor(buf,cursor,slash_selected,slash_dismissed,&popup_rows);continue;}
         if(ch==21){buf[0]=0;len=cursor=0;browsing=0;slash_selected=0;slash_dismissed=0;tui_redraw_editor(buf,cursor,slash_selected,slash_dismissed,&popup_rows);continue;}
         if(ch==23){size_t start=cursor;while(start>0&&buf[start-1]==' ')start--;while(start>0&&buf[start-1]!=' ')start=tui_prev_char(buf,start);memmove(buf+start,buf+cursor,len-cursor+1);len-=cursor-start;cursor=start;slash_selected=0;slash_dismissed=0;tui_redraw_editor(buf,cursor,slash_selected,slash_dismissed,&popup_rows);continue;}
         if(ch==1){cursor=0;slash_dismissed=1;tui_redraw_cursor(buf,cursor);continue;}if(ch==5){cursor=len;slash_dismissed=0;tui_redraw_editor(buf,cursor,slash_selected,slash_dismissed,&popup_rows);continue;}
-        if(ch==12){fputs("\033[2J\033[H",stdout);popup_rows=0;tui_redraw_editor(buf,cursor,slash_selected,slash_dismissed,&popup_rows);continue;}
+        if(ch==12){fputs("\033[2J\033[H",stdout);popup_rows=0;tui_composer_cursor_row=0;tui_composer_top=0;tui_redraw_editor(buf,cursor,slash_selected,slash_dismissed,&popup_rows);continue;}
         if(ch=='\t'){if(cursor==len&&!strchr(buf,'\n')){if(buf[0]=='/'&&strchr(buf,' ')==NULL){complete_slash(buf,cap,&len);cursor=len;}else tui_complete_path(buf,cap,&len,&cursor);slash_selected=0;slash_dismissed=0;tui_redraw_editor(buf,cursor,slash_selected,slash_dismissed,&popup_rows);}continue;}
         if(ch==27){
             if(!tui_read_escape(&key)){if(tui_slash_matches(buf,NULL,64)>0){slash_dismissed=1;tui_redraw_editor(buf,cursor,slash_selected,slash_dismissed,&popup_rows);}continue;}
@@ -836,7 +847,7 @@ static void help(void)
     cprintf(T_BOLD T_BLUE,"\nDisplay\n");
     cprintf(T_CYAN,"  /colour auto|on|off|status    ");printf("ANSI colour control; /color remains a compatibility alias; NO_COLOR is respected in auto mode\n");
     cprintf(T_CYAN,"  /output compact|normal|full   ");printf("control how much command/trace output is painted to the terminal\n");
-    cprintf(T_DIM,"  Tab completes slash commands and relative paths; Up/Down recalls history (draft restored). Ctrl+J inserts a newline; Enter submits.\n");
+    cprintf(T_DIM,"  Typing / opens a command dropdown (descriptions, Up/Down choose, Enter run, Tab complete, Esc close); Tab also completes relative paths; Up/Down recalls history (draft restored). Ctrl+J inserts a newline; Enter submits.\n");
     cprintf(T_DIM,"  Ctrl+A/E moves to start/end; Ctrl+U clears input; Ctrl+L clears the screen.\n");
     cprintf(T_DIM,"  Ctrl+T shows tasks; Ctrl+R rolls back checkpoint; Shift+Tab cycles mode.\n");
     cprintf(T_CYAN,"  /permission list|allow|deny   ");printf("tool-level permission rules\n");
@@ -913,6 +924,7 @@ static void cache_status(const VSContext *c)
     printf("  key=%s\n",c->cache_key);
     printf("  local_hits=%lu  local_misses=%lu\n",c->file_cache_hits,c->file_cache_misses);
     printf("  provider_cached_tokens=%ld  provider_cache_write_tokens=%ld\n",c->provider_cached_tokens,c->provider_cache_write_tokens);
+    printf("  conversation_cached_tokens=%lu  conversation_cache_write_tokens=%lu\n",c->conversation_cached_tokens,c->conversation_cache_write_tokens);
     printf("  history_messages=%d  history_bytes=%lu  history_evicted=%lu\n",c->history_count,(unsigned long)c->history_bytes,c->history_evicted);
 }
 
@@ -995,7 +1007,7 @@ static void show_banner(const VSContext *c)
     cprintf(T_BOLD T_CYAN,"VibeSolaris %s TUI\n",VS_VERSION);
     cprintf(T_DIM,"  %s %s / %s\n",c->os_name,c->os_release,c->arch);
     cprintf(T_BLUE,"  provider=%s  model=%s  protocol=%s  cache=%s\n",c->provider.name,c->provider.model,vs_protocol_name(c->provider.protocol),c->cache_enabled?"on":"off");
-    cprintf(T_DIM,"  Type /help for commands. Tab completes / commands; long output is compacted on screen.\n");
+    cprintf(T_DIM,"  Type / for a command dropdown (/help lists all). Tab completes; long output is compacted on screen.\n");
     cprintf(T_DIM,"  Enter sends · Ctrl+J newline · paste multiline text · /paste-image (macOS clipboard).\n");
 }
 
@@ -1401,6 +1413,8 @@ int main(int argc, char **argv)
                 printf("  Cache read:       %ld\n", c.provider_cache_read_tokens);
                 printf("  Cache write:      %ld\n", c.provider_cache_write_tokens);
                 printf("  Cached tokens:    %ld\n", c.provider_cached_tokens);
+                printf("  Conv. cached:     %lu\n", c.conversation_cached_tokens);
+                printf("  Conv. cache write:%lu\n", c.conversation_cache_write_tokens);
             }
         } else if (!strcmp(line,"/clear")) {
             vs_history_clear(&c);
@@ -1409,6 +1423,8 @@ int main(int argc, char **argv)
             c.conversation_output_tokens = 0;
             c.conversation_total_tokens = 0;
             c.conversation_usage_responses = 0;
+            c.conversation_cached_tokens = 0;
+            c.conversation_cache_write_tokens = 0;
             c.provider_input_tokens = 0;
             c.provider_output_tokens = 0;
             c.provider_total_tokens = 0;

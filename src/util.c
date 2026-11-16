@@ -212,6 +212,10 @@ static void free_cache_entry(VSFileCacheEntry *e) {
     memset(e,0,sizeof(*e));
 }
 
+/* Parallel read-only tool batches share the file cache between worker
+   threads; all cache mutations and read-outs are serialised on this lock. */
+static pthread_mutex_t cache_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static VSFileCacheEntry *cache_slot(VSContext *ctx,const char *path,long mtime,long size,int is_image) {
     int i,idx;
     VSFileCacheEntry *e;
@@ -237,13 +241,17 @@ char *vs_cached_read_file(VSContext *ctx,const char *path) {
     if(stat(path,&st)!=0) return NULL;
     /* Do not keep another full copy of a multi-megabyte source file in RAM. */
     if((unsigned long)st.st_size > (unsigned long)VS_FILE_CACHE_BLOB_MAX) {
+        pthread_mutex_lock(&cache_lock);
         ctx->file_cache_misses++;
+        pthread_mutex_unlock(&cache_lock);
         return vs_read_file(path);
     }
+    pthread_mutex_lock(&cache_lock);
     e=cache_slot(ctx,path,(long)st.st_mtime,(long)st.st_size,0);
-    if(e->text) { ctx->file_cache_hits++; e->hits++; return dupstr(e->text); }
-    s=vs_read_file(path); if(!s) return NULL;
+    if(e->text) { ctx->file_cache_hits++; e->hits++; s=dupstr(e->text); pthread_mutex_unlock(&cache_lock); return s; }
+    s=vs_read_file(path); if(!s) { pthread_mutex_unlock(&cache_lock); return NULL; }
     e->text=dupstr(s); e->hash=vs_hash_string(s); ctx->file_cache_misses++;
+    pthread_mutex_unlock(&cache_lock);
     return s;
 }
 
@@ -254,29 +262,37 @@ char *vs_cached_base64_file(VSContext *ctx,const char *path,size_t *out_len) {
     /* Large images are already expanded ~4/3 by base64.  Caching another copy
        can double peak memory while the request body is being built. */
     if((unsigned long)st.st_size > (unsigned long)VS_FILE_CACHE_BLOB_MAX) {
+        pthread_mutex_lock(&cache_lock);
         ctx->file_cache_misses++;
+        pthread_mutex_unlock(&cache_lock);
         return vs_base64_file_ctx(ctx,path,out_len);
     }
+    pthread_mutex_lock(&cache_lock);
     e=cache_slot(ctx,path,(long)st.st_mtime,(long)st.st_size,1);
-    if(e->base64) { ctx->file_cache_hits++; e->hits++; if(out_len)*out_len=e->base64_len; return dupstr(e->base64); }
-    s=vs_base64_file_ctx(ctx,path,&n); if(!s) return NULL;
+    if(e->base64) { ctx->file_cache_hits++; e->hits++; if(out_len)*out_len=e->base64_len; s=dupstr(e->base64); pthread_mutex_unlock(&cache_lock); return s; }
+    s=vs_base64_file_ctx(ctx,path,&n); if(!s) { pthread_mutex_unlock(&cache_lock); return NULL; }
     e->base64=dupstr(s); e->base64_len=n; e->hash=vs_hash_string(s); ctx->file_cache_misses++;
     if(out_len)*out_len=n;
+    pthread_mutex_unlock(&cache_lock);
     return s;
 }
 
 void vs_cache_invalidate(VSContext *ctx,const char *path) {
     int i;
     if(!ctx)return;
+    pthread_mutex_lock(&cache_lock);
     for(i=0;i<ctx->file_cache_count;i++) if(!strcmp(ctx->file_cache[i].path,path)) free_cache_entry(&ctx->file_cache[i]);
+    pthread_mutex_unlock(&cache_lock);
 }
 
 void vs_cache_clear(VSContext *ctx) {
     int i;
     if(!ctx)return;
+    pthread_mutex_lock(&cache_lock);
     for(i=0;i<ctx->file_cache_count;i++) free_cache_entry(&ctx->file_cache[i]);
     ctx->file_cache_count=0;ctx->file_cache_next=0;ctx->file_cache_hits=0;ctx->file_cache_misses=0;
     ctx->provider_cached_tokens=0;ctx->provider_cache_read_tokens=0;ctx->provider_cache_write_tokens=0;
+    pthread_mutex_unlock(&cache_lock);
 }
 
 static char *compact_copy(const char *s) {
@@ -316,7 +332,7 @@ void vs_history_add(VSContext *ctx,const char *role,const char *content) {
 void vs_usage_clear(VSContext *ctx) {
     if(!ctx)return;
     ctx->provider_input_tokens=0;ctx->provider_output_tokens=0;ctx->provider_total_tokens=0;
-    ctx->conversation_input_tokens=0;ctx->conversation_output_tokens=0;ctx->conversation_total_tokens=0;ctx->conversation_usage_responses=0;
+    ctx->conversation_input_tokens=0;ctx->conversation_output_tokens=0;ctx->conversation_total_tokens=0;ctx->conversation_usage_responses=0;ctx->conversation_cached_tokens=0;ctx->conversation_cache_write_tokens=0;
 }
 
 void vs_cancel_request(VSContext *ctx) { if(ctx)ctx->cancel_requested=1; }

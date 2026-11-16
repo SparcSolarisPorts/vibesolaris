@@ -6,6 +6,7 @@
 
 #include <stddef.h>
 #include <signal.h>
+#include <pthread.h>
 
 #define VS_MAX_ATTACH 16
 #define VS_MAX_PATH 1024
@@ -1057,6 +1058,8 @@ typedef struct {
     unsigned long conversation_output_tokens;
     unsigned long conversation_total_tokens;
     unsigned long conversation_usage_responses;
+    unsigned long conversation_cached_tokens;
+    unsigned long conversation_cache_write_tokens;
 
     VSHistoryMessage history[VS_MAX_HISTORY];
     int history_count;
@@ -1665,6 +1668,7 @@ int  vs_computer_use_detect_backend(void);
 
 /* ---- Wayland Computer Use (optional) ---- */
 void agent_compact_force(VSContext *ctx, const char *task);
+void vs_agent_context_release(VSContext *ctx);
 #ifdef HAVE_WAYLAND
 int  vs_wayland_init(void);
 char *vs_wayland_screenshot(void);
@@ -1720,6 +1724,15 @@ int  vs_tui_suggestions_add(VSTUISuggestion *suggestions, int *count, const char
 int  vs_tui_suggestions_match(VSTUISuggestion *suggestions, int count, const char *input, VSTUISuggestion *results, int max_results);
 int  vs_tui_suggestions_fuzzy_match(const char *input, const char *candidate);
 void vs_tui_suggestions_render(const VSTUISuggestion *results, int count, int width);
+
+/* ---- TUI slash-command completion (dropdown model; plain-ANSI safe) ----
+ * The command table lives here so both the TUI and unit tests link the exact
+ * same data.  Descriptions are resolved by longest matching prefix so
+ * subcommands ("/effort low", "/cache clear", ...) inherit their family text. */
+int         vs_tui_slash_command_count(void);
+const char *vs_tui_slash_command_name(int index);
+const char *vs_tui_slash_desc(const char *name);
+int         vs_tui_slash_match(const char *buf, const char **names, const char **descs, int cap);
 
 /* ---- TUI Editor (multiline) ---- */
 #define VS_TUI_EDITOR_MAX_LINES 64

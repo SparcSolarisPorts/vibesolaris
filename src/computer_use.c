@@ -23,6 +23,36 @@ static char *cu_dupstr(const char *s)
     return p;
 }
 
+/* Runtime backend detection.  Preference order: native Wayland, native
+   Cocoa, then X11.  Wayland/Cocoa probes are compiled in only when the
+   corresponding backend objects are, because their entry points do not
+   exist otherwise.  The result is cached: the session environment does
+   not change during a process lifetime, and the probes shell out. */
+int vs_computer_use_detect_backend(void)
+{
+    static int cached = -1;
+    const char *display;
+    if (cached != -1) return cached;
+    cached = VS_COMPUTER_USE_NONE;
+#ifdef HAVE_WAYLAND
+    if (cached == VS_COMPUTER_USE_NONE && vs_wayland_init() == 0)
+        cached = VS_COMPUTER_USE_WAYLAND;
+#endif
+#ifdef HAVE_COCOA
+    if (cached == VS_COMPUTER_USE_NONE && vs_cocoa_init() == 0)
+        cached = VS_COMPUTER_USE_COCOA;
+#endif
+    display = getenv("DISPLAY");
+    if (cached == VS_COMPUTER_USE_NONE && display && *display)
+        cached = VS_COMPUTER_USE_X11;
+    return cached;
+}
+
+#if !defined(HAVE_X11) && (defined(HAVE_WAYLAND) || defined(HAVE_COCOA))
+/* Non-X11 build with portable backends linked in: delegate at runtime. */
+#define CU_HAVE_PORTABLE_BACKENDS 1
+#endif
+
 #ifdef HAVE_X11
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -215,35 +245,79 @@ void vs_computer_use_shutdown(void)
 int vs_computer_use_init(void)
 {
     const char *display = getenv("DISPLAY");
+#ifdef CU_HAVE_PORTABLE_BACKENDS
+    if (vs_computer_use_detect_backend() != VS_COMPUTER_USE_NONE) return 1;
+#endif
     return (display && *display) ? 1 : 0;
 }
 
 char *vs_computer_use_screenshot(void)
 {
-    return cu_dupstr("Computer Use: X11 not available on this system (compile with -DHAVE_X11)");
+#ifdef CU_HAVE_PORTABLE_BACKENDS
+    int backend = vs_computer_use_detect_backend();
+#ifdef HAVE_WAYLAND
+    if (backend == VS_COMPUTER_USE_WAYLAND) return vs_wayland_screenshot();
+#endif
+#ifdef HAVE_COCOA
+    if (backend == VS_COMPUTER_USE_COCOA) return vs_cocoa_screenshot();
+#endif
+#endif
+    return cu_dupstr("Computer Use: no supported display backend on this system (X11, Wayland, or macOS Cocoa required)");
 }
 
 char *vs_computer_use_click(int x, int y)
 {
+#ifdef CU_HAVE_PORTABLE_BACKENDS
+    int backend = vs_computer_use_detect_backend();
+#ifdef HAVE_WAYLAND
+    if (backend == VS_COMPUTER_USE_WAYLAND) return vs_wayland_click(x, y);
+#endif
+#ifdef HAVE_COCOA
+    if (backend == VS_COMPUTER_USE_COCOA) return vs_cocoa_click(x, y);
+#endif
+#else
     (void)x; (void)y;
-    return cu_dupstr("Computer Use: X11 not available on this system (compile with -DHAVE_X11)");
+#endif
+    return cu_dupstr("Computer Use: no supported display backend on this system (X11, Wayland, or macOS Cocoa required)");
 }
 
 char *vs_computer_use_type(const char *text)
 {
+#ifdef CU_HAVE_PORTABLE_BACKENDS
+    int backend;
+    if (!text) text = "";
+    backend = vs_computer_use_detect_backend();
+#ifdef HAVE_WAYLAND
+    if (backend == VS_COMPUTER_USE_WAYLAND) return vs_wayland_type(text);
+#endif
+#ifdef HAVE_COCOA
+    if (backend == VS_COMPUTER_USE_COCOA) return vs_cocoa_type(text);
+#endif
+#else
     (void)text;
-    return cu_dupstr("Computer Use: X11 not available on this system (compile with -DHAVE_X11)");
+#endif
+    return cu_dupstr("Computer Use: no supported display backend on this system (X11, Wayland, or macOS Cocoa required)");
 }
 
 char *vs_computer_use_move(int x, int y)
 {
+#ifdef CU_HAVE_PORTABLE_BACKENDS
+    int backend = vs_computer_use_detect_backend();
+#ifdef HAVE_WAYLAND
+    if (backend == VS_COMPUTER_USE_WAYLAND) return vs_wayland_move(x, y);
+#endif
+#ifdef HAVE_COCOA
+    if (backend == VS_COMPUTER_USE_COCOA) return vs_cocoa_move(x, y);
+#endif
+#else
     (void)x; (void)y;
-    return cu_dupstr("Computer Use: X11 not available on this system (compile with -DHAVE_X11)");
+#endif
+    return cu_dupstr("Computer Use: no supported display backend on this system (X11, Wayland, or macOS Cocoa required)");
 }
 
 void vs_computer_use_shutdown(void)
 {
-    /* Nothing to clean up */
+    /* The portable backends are stateless; nothing to clean up. */
 }
 
 #endif /* HAVE_X11 */

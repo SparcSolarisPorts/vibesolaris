@@ -4,9 +4,12 @@
    A subagent is a child VSContext created by copying the parent's provider
    and tool configuration, then clearing everything that owns heap memory or
    belongs to the parent's live session (history, trace, file cache, MCP
-   processes, attachments, token counters).  The child runs the normal
-   vs_agent_turn loop.  Its trace events are forwarded to the parent with a
-   [sub#N dK] prefix so the TUI and GUI can show what delegated work is doing. */
+   processes, attachments, token counters).  The delegation prompt carries a
+   bounded digest of the parent's recent conversation and open TODOs so the
+   child knows why it was delegated, without copying the full transcript.
+   The child runs the normal vs_agent_turn loop.  Its trace events are
+   forwarded to the parent with a [sub#N dK] prefix so the TUI and GUI can
+   show what delegated work is doing. */
 #include "vibesolaris.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,6 +48,60 @@ static void forward_child_trace(void *userdata,int step,const char *kind,const c
     vs_trace(parent,kind,d);
     if(!parent->subagent_parent)pthread_mutex_unlock(&subagent_lock);
     free(d);
+}
+
+/* ---- Parent context digest ---- */
+
+#define VS_SUBAGENT_DIGEST_TURNS 6
+#define VS_SUBAGENT_DIGEST_ENTRY_MAX 600
+#define VS_SUBAGENT_DIGEST_MAX 4096
+
+static void digest_line(char *out,size_t cap,size_t *used,const char *role,const char *text)
+{
+    char b[VS_SUBAGENT_DIGEST_ENTRY_MAX+8];
+    size_t i,j,limit,n;
+    if(!out||!used||!text||!*text||*used>=cap-64)return;
+    limit=strlen(text);if(limit>VS_SUBAGENT_DIGEST_ENTRY_MAX)limit=VS_SUBAGENT_DIGEST_ENTRY_MAX;
+    for(i=0,j=0;i<limit&&j<sizeof(b)-2;i++){char ch=text[i];b[j++]=(ch=='\n'||ch=='\r'||ch=='\t')?' ':ch;}
+    while(j>0&&b[j-1]==' ')j--;b[j]=0;
+    if(!b[0])return;
+    n=snprintf(out+*used,cap-*used,"[%s] %s\n",role?role:"?",b);
+    if(n>0)*used+=(n<cap-*used)?n:cap-*used;
+}
+
+/* Bounded digest of the parent's recent conversation and open TODOs so a
+   subagent understands WHY it was delegated, not just WHAT to do.  The full
+   transcript is deliberately not copied: the child keeps lifecycle isolation
+   and a bounded prompt.  Falls back to history[] when no autonomous-turn
+   history exists yet (e.g. delegation from a plain /subagent request). */
+static char *build_parent_digest(const VSContext *parent)
+{
+    char *out;size_t used=0,n,cap=VS_SUBAGENT_DIGEST_MAX+128;
+    const VSHistoryMessage *h;int hn,i,start;
+    if(!parent)return NULL;
+    out=(char*)malloc(cap);
+    if(!out)return NULL;
+    out[0]=0;
+    n=snprintf(out,cap,"PARENT CONTEXT - recent conversation (oldest first, newest last):\n");
+    if(n>0)used=(size_t)n;
+    if(parent->agent_history_count>0){h=parent->agent_history;hn=parent->agent_history_count;}
+    else{h=parent->history;hn=parent->history_count;}
+    start=hn>VS_SUBAGENT_DIGEST_TURNS?hn-VS_SUBAGENT_DIGEST_TURNS:0;
+    for(i=start;i<hn&&used<VS_SUBAGENT_DIGEST_MAX;i++)digest_line(out,cap,&used,h[i].role,h[i].content);
+    if(hn==0)digest_line(out,cap,&used,"-","(no prior conversation available)");
+    if(parent->todo.item_count>0){
+        int open=0;
+        for(i=0;i<parent->todo.item_count;i++)if(parent->todo.items[i].status!=VS_TODO_STATUS_COMPLETED&&parent->todo.items[i].status!=VS_TODO_STATUS_CANCELLED&&parent->todo.items[i].text[0])open++;
+        if(open&&used<VS_SUBAGENT_DIGEST_MAX){
+            n=snprintf(out+used,cap-used,"OPEN TODOS (%d):\n",open);
+            if(n>0)used+=(n<cap-used)?n:cap-used;
+            for(i=0;i<parent->todo.item_count&&used<VS_SUBAGENT_DIGEST_MAX;i++){
+                if(parent->todo.items[i].status==VS_TODO_STATUS_COMPLETED||parent->todo.items[i].status==VS_TODO_STATUS_CANCELLED||!parent->todo.items[i].text[0])continue;
+                digest_line(out,cap,&used,"todo",parent->todo.items[i].text);
+            }
+        }
+    }
+    return out;
 }
 
 /* Reset every field that owns memory or live parent state, so the child never
@@ -330,10 +387,14 @@ char *vs_subagent_run(VSContext *parent,const char *task)
               ans = NULL;
               if (vs_cancel_requested(parent)) break;
           } else {
-              /* First attempt: build normal prompt */
-              n=strlen(task)+640+strlen(scratch_dir)+64;
+              /* First attempt: build normal prompt with a bounded digest of
+                 the parent's context so the child understands why it was
+                 delegated.  Retry attempts reuse the child's own history,
+                 which already contains this prompt. */
+              char *digest=build_parent_digest(parent);
+              n=strlen(task)+640+strlen(scratch_dir)+64+(digest?strlen(digest):0);
               prompt=(char*)malloc(n);
-              if(!prompt){pthread_mutex_lock(&subagent_lock);if(record){record->status=3;record->finished_at=(long)time(NULL);snprintf(record->summary,sizeof(record->summary),"unable to prepare task");}pthread_mutex_unlock(&subagent_lock);free(child);return dupstr("ERROR: out of memory preparing subagent");}
+              if(!prompt){free(digest);pthread_mutex_lock(&subagent_lock);if(record){record->status=3;record->finished_at=(long)time(NULL);snprintf(record->summary,sizeof(record->summary),"unable to prepare task");}pthread_mutex_unlock(&subagent_lock);free(child);return dupstr("ERROR: out of memory preparing subagent");}
               snprintf(prompt,n,
                   "SUBAGENT TASK. You are a focused subagent delegated by the parent agent. Complete only this task "
                   "using the available tools. Coordinate through explicit handoffs: first establish a bounded "
@@ -342,8 +403,10 @@ char *vs_subagent_run(VSContext *parent,const char *task)
                   "End with a structured handoff headed FILES CHANGED, CHECKS RUN, RESULTS, "
                   "REMAINING RISKS. Do not claim success without evidence. "
                   "Do not ask the user questions; if blocked, say what is blocked and stop.\n\n"
+                  "%s\n"
                   "You can share files with sibling subagents in the scratch directory: %s\n\n"
-                  "TASK:\n%s", scratch_dir[0] ? scratch_dir : "(none)", task);
+                  "TASK:\n%s", digest?digest:"", scratch_dir[0] ? scratch_dir : "(none)", task);
+              free(digest);
           }
 
           snprintf(detail,sizeof(detail),"subagent %d started (depth %d): %.300s",id,child->subagent_depth,task);
@@ -377,10 +440,12 @@ char *vs_subagent_run(VSContext *parent,const char *task)
     vs_trace(parent,"subagent-done",detail);
     if(!parent->subagent_parent)pthread_mutex_unlock(&subagent_lock);
 
-    /* The child owns its own history, trace, and file cache; release them. */
+    /* The child owns its own history, trace, working state and file cache;
+       release them. */
     vs_history_clear(child);
     vs_cache_clear(child);
     vs_trace_clear(child);
+    vs_agent_context_release(child);
     free(child);
 
     /* Clean up worktree */

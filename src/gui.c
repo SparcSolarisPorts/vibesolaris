@@ -2210,7 +2210,7 @@ static void send_message(App *a)
     if(!strcmp(a->input,"/graph fields")){open_graph(a,VS_GRAPH_FIELDS);a->input[0]=0;a->input_len=a->input_cursor=0;selection_clear(a);return;}
     if(!strcmp(a->input,"/clear")){new_chat(a);return;}
     if(!strcmp(a->input,"/usage")){
-        snprintf(info,sizeof(info),"Conversation usage: %lu input + %lu output = %lu tokens across %lu provider response%s. Last provider response: %ld input, %ld output, %ld total.",a->ctx.conversation_input_tokens,a->ctx.conversation_output_tokens,a->ctx.conversation_total_tokens,a->ctx.conversation_usage_responses,a->ctx.conversation_usage_responses==1?"":"s",a->ctx.provider_input_tokens,a->ctx.provider_output_tokens,a->ctx.provider_total_tokens);
+        snprintf(info,sizeof(info),"Conversation usage: %lu input + %lu output = %lu tokens across %lu provider response%s; %lu cached read + %lu cached written (shared across OpenAI/Anthropic accounting). Last provider response: %ld input, %ld output, %ld total.",a->ctx.conversation_input_tokens,a->ctx.conversation_output_tokens,a->ctx.conversation_total_tokens,a->ctx.conversation_usage_responses,a->ctx.conversation_usage_responses==1?"":"s",a->ctx.conversation_cached_tokens,a->ctx.conversation_cache_write_tokens,a->ctx.provider_input_tokens,a->ctx.provider_output_tokens,a->ctx.provider_total_tokens);
         add_message(a,UI_ROLE_ASSISTANT,info);a->input[0]=0;a->input_len=a->input_cursor=0;selection_clear(a);return;
     }
     if(!strcmp(a->input,"/trace")){

@@ -85,10 +85,13 @@ static char *fallback_checkpoint(VSContext *c,const char *task){size_t cap=VS_AG
 
 static int bad_checkpoint(const char *s){if(!s||!*s)return 1;if(strstr(s,"[[VS_TOOL")||strstr(s,"[[VS_MCP")||strstr(s,"[[VS_FINAL")||strstr(s,"[[VS_NEED_USER"))return 1;if(!strncmp(s,"HTTP request failed",19)||!strncmp(s,"provider error",14)||!strncmp(s,"No API",6))return 1;return 0;}
 
-static void agent_compact(VSContext *c,const char *task,int completed_rounds){
+static void agent_compact_impl(VSContext *c,const char *task,int completed_rounds,int force){
     char *p,*summary,*bounded,*fallback;size_t n;int interval=compact_interval(),saved_attachment_from;VSHTTPChunkCallback saved_stream;void *saved_stream_data;char trace[256];
-    if(!c||c->agent_history_count<=0||interval==0)return;
-    if((completed_rounds%interval)!=0&&c->agent_history_bytes<(VS_AGENT_HISTORY_BUDGET*3)/4)return;
+    if(!c||c->agent_history_count<=0)return;
+    if(!force){
+        if(interval==0)return;
+        if((completed_rounds%interval)!=0&&c->agent_history_bytes<(VS_AGENT_HISTORY_BUDGET*3)/4)return;
+    }
     n=strlen(task?task:"")+(c->agent_checkpoint?strlen(c->agent_checkpoint):0)+1200;p=(char*)malloc(n);if(!p)return;
     snprintf(p,n,
         "INTERNAL_CONTEXT_COMPACTION. Return ONLY a dense working-state summary for another coding-agent round. Do not call tools, do not answer the user, and do not emit VS_* markers. Preserve: objective/constraints; host OS/toolchain facts; files inspected or changed; exact important errors; commands/tests and outcomes; design decisions; what has already been tried; unresolved issues; and the next concrete steps. Drop repeated protocol instructions, filler, duplicate logs, superseded plans, and unimportant raw output.\n\nACTIVE_TASK:\n%s\n\nPREVIOUS_CHECKPOINT:\n%s\n",
@@ -115,6 +118,24 @@ static void agent_compact(VSContext *c,const char *task,int completed_rounds){
     agent_checkpoint_clear(c);c->agent_checkpoint=bounded;c->agent_checkpoint_bytes=strlen(bounded);agent_history_clear(c);
     snprintf(trace,sizeof(trace),"working context compacted after %d rounds to %lu bytes",completed_rounds,(unsigned long)c->agent_checkpoint_bytes);vs_trace(c,"compact",trace);
     }
+}
+
+static void agent_compact(VSContext *c,const char *task,int completed_rounds){
+    agent_compact_impl(c,task,completed_rounds,0);
+}
+
+/* Public forced compaction used by the interactive /compact command. */
+void agent_compact_force(VSContext *ctx,const char *task){
+    agent_compact_impl(ctx,task,0,1);
+}
+
+/* Release per-turn working memory (history + checkpoint) owned by a context.
+   Turn boundaries keep this state now, so contexts that are destroyed rather
+   than reused — subagent children in particular — must release it here. */
+void vs_agent_context_release(VSContext *ctx){
+    if(!ctx)return;
+    agent_history_clear(ctx);
+    agent_checkpoint_clear(ctx);
 }
 
 static char *continuation_prompt(const char *task,const char *result,int planning_only,const char *checkpoint){
@@ -185,6 +206,32 @@ static char *execute_tool(VSContext *c,const char *d,int *command_runner_confirm
         result=dupstr(verified?"OK: file written; read-back verification passed":"ERROR: file write returned success but read-back verification failed");
     }else result=dupstr("ERROR: write failed");
     free(p);free(ct);return result;}
+    if(!strncmp(d+10,"todo ",5)){char *items=attr(d,"items"),*idx_s=attr(d,"index"),*st_s=attr(d,"status");
+        if(items){const char *arr[VS_MAX_TODO_ITEMS];int n=0;char *p,*sep;unesc(items);p=items;
+            while(p&&*p&&n<VS_MAX_TODO_ITEMS){sep=strchr(p,'|');if(sep)*sep=0;if(*p)arr[n++]=p;p=sep?sep+1:(char*)0;}
+            if(vs_todo_set_all(&c->todo,arr,n)==0){size_t z=64;result=(char*)malloc(z);if(result)snprintf(result,z,"OK: todo list updated (%d items)",n);}
+            if(!result)result=dupstr("ERROR: unable to update todo list");
+        }else if(idx_s&&st_s){int idx=atoi(idx_s);VSTodoStatus st;int st_ok=1;
+            if(!strcmp(st_s,"pending"))st=VS_TODO_STATUS_PENDING;
+            else if(!strcmp(st_s,"in_progress"))st=VS_TODO_STATUS_IN_PROGRESS;
+            else if(!strcmp(st_s,"completed"))st=VS_TODO_STATUS_COMPLETED;
+            else if(!strcmp(st_s,"cancelled"))st=VS_TODO_STATUS_CANCELLED;
+            else st_ok=0;
+            if(!st_ok)result=dupstr("ERROR: todo status must be pending, in_progress, completed, or cancelled");
+            else if(vs_todo_update_status(&c->todo,idx-1,st)==0)result=dupstr("OK: todo item updated");
+            else result=dupstr("ERROR: todo index out of range");
+        }else result=dupstr("ERROR: todo requires items=\"A|B|C\" or index=\"N\" status=\"STATUS\"");
+        free(items);free(idx_s);free(st_s);return result;}
+    if(!strncmp(d+10,"plan_task_complete ",19)){char *id_s=attr(d,"task_id"),*summary=attr(d,"summary"),*ep=0;long id=0;
+        if(summary)unesc(summary);
+        if(id_s){id=strtol(id_s,&ep,10);if(ep==id_s||*ep)id=0;}
+        if(id<=0)result=dupstr("ERROR: plan_task_complete requires a numeric task_id from the accepted plan");
+        else if(vs_workflow_set_task_status(&c->workflow,(int)id,VS_TASK_COMPLETED,summary&&*summary?summary:0)!=0)result=dupstr("ERROR: task_id is not part of the accepted plan");
+        else {size_t z=80+(summary?strlen(summary):0);result=(char*)malloc(z);if(result)snprintf(result,z,"OK: plan task %ld marked completed%s%s",id,summary&&*summary?": ":"",summary&&*summary?summary:"");}
+        free(id_s);free(summary);return result?result:dupstr("ERROR: tool result allocation failed");}
+    if(!strncmp(d+10,"computer_use_click ",19))return vs_computer_use_click((int)long_attr(d,"x",0,-100000,100000),(int)long_attr(d,"y",0,-100000,100000));
+    if(!strncmp(d+10,"computer_use_move ",18))return vs_computer_use_move((int)long_attr(d,"x",0,-100000,100000),(int)long_attr(d,"y",0,-100000,100000));
+    if(!strncmp(d+10,"computer_use_type ",18)){char *t=attr(d,"text");char *r;if(t)unesc(t);r=t?vs_computer_use_type(t):dupstr("ERROR: computer_use_type requires text=\"...\"");free(t);return r;}
     return dupstr("ERROR: unknown VS_TOOL operation");
 }
 
@@ -193,7 +240,7 @@ static int directive_count(const char *s){int n=0,m;const char *p=s,*d,*e;while(
 static char *directive_signature(const char *s){const char *p=s,*d,*e;int m;size_t n=0;char *out;while((d=earliest_directive(p,&m))!=0){e=strstr(d,"]]" );if(!e)break;n+=(size_t)(e+2-d)+1;p=e+2;}if(!n)return dupstr("");out=(char*)malloc(n+1);if(!out)return 0;out[0]=0;p=s;while((d=earliest_directive(p,&m))!=0){size_t z;e=strstr(d,"]]" );if(!e)break;z=(size_t)(e+2-d);strncat(out,d,z);strcat(out,"\n");p=e+2;}return out;}
 static char *next_directive(const char **cursor,int *is_mcp){const char *d,*e;char *o;size_t n;if(!cursor||!*cursor)return 0;d=earliest_directive(*cursor,is_mcp);if(!d)return 0;e=strstr(d,"]]" );if(!e){*cursor=d+strlen(d);return 0;}n=(size_t)(e+2-d);o=(char*)malloc(n+1);if(!o)return 0;memcpy(o,d,n);o[n]=0;*cursor=e+2;return o;}
 static int directive_known(const char *d,int is_mcp){
-    static const char *ops[]={"read ","list ","search ","graph ","web_search ","web_fetch ","run ","write ","image ","subagent ",NULL};
+    static const char *ops[]={"read ","list ","search ","graph ","web_search ","web_fetch ","run ","write ","image ","subagent ","todo ","plan_task_complete ","computer_use_click ","computer_use_move ","computer_use_type ",NULL};
     int i;if(is_mcp)return 1;if(strncmp(d,"[[VS_TOOL ",10))return 0;
     for(i=0;ops[i];i++)if(!strncmp(d+10,ops[i],strlen(ops[i])))return 1;
     return 0;
@@ -240,12 +287,16 @@ static int directive_schema_valid(VSContext *c,const char *d,int is_mcp){
     static const char *write_attrs[] = {"path","content",NULL};
     static const char *image_attrs[] = {"path",NULL};
     static const char *subagent_attrs[] = {"task",NULL};
+    static const char *todo_attrs[] = {"items","index","status",NULL};
+    static const char *plan_complete_attrs[] = {"summary",NULL};
+    static const char *cu_point_attrs[] = {"x","y",NULL};
+    static const char *cu_type_attrs[] = {"text",NULL};
     static const char *mcp_attrs[] = {"server","tool","args","task_id",NULL};
     const char *p,*end;char op[32],name[64],seen[16][64];int i,j,seen_count=0,seen_task=0;const char *const *allowed=0;char *value;
     if(!d)return 0;end=strstr(d,"]]" );if(!end)return 0;p=d+2;
     if(is_mcp){if(strncmp(p,"VS_MCP ",7))return 0;p+=7;strcpy(op,"MCP");allowed=mcp_attrs;}
     else {if(strncmp(p,"VS_TOOL ",8))return 0;p+=8;for(i=0;i<(int)sizeof(op)-1&&p<end&&!isspace((unsigned char)*p);i++,p++)op[i]=*p;op[i]=0;
-        if(!strcmp(op,"read"))allowed=read_attrs;else if(!strcmp(op,"list"))allowed=list_attrs;else if(!strcmp(op,"search"))allowed=search_attrs;else if(!strcmp(op,"graph"))allowed=graph_attrs;else if(!strcmp(op,"web_search"))allowed=web_search_attrs;else if(!strcmp(op,"web_fetch"))allowed=web_fetch_attrs;else if(!strcmp(op,"run"))allowed=run_attrs;else if(!strcmp(op,"write"))allowed=write_attrs;else if(!strcmp(op,"image"))allowed=image_attrs;else if(!strcmp(op,"subagent"))allowed=subagent_attrs;else return 0;}
+        if(!strcmp(op,"read"))allowed=read_attrs;else if(!strcmp(op,"list"))allowed=list_attrs;else if(!strcmp(op,"search"))allowed=search_attrs;else if(!strcmp(op,"graph"))allowed=graph_attrs;else if(!strcmp(op,"web_search"))allowed=web_search_attrs;else if(!strcmp(op,"web_fetch"))allowed=web_fetch_attrs;else if(!strcmp(op,"run"))allowed=run_attrs;else if(!strcmp(op,"write"))allowed=write_attrs;else if(!strcmp(op,"image"))allowed=image_attrs;else if(!strcmp(op,"subagent"))allowed=subagent_attrs;else if(!strcmp(op,"todo"))allowed=todo_attrs;else if(!strcmp(op,"plan_task_complete"))allowed=plan_complete_attrs;else if(!strcmp(op,"computer_use_click")||!strcmp(op,"computer_use_move"))allowed=cu_point_attrs;else if(!strcmp(op,"computer_use_type"))allowed=cu_type_attrs;else return 0;}
     while(p<end){while(p<end&&isspace((unsigned char)*p))p++;if(p==end)break;j=0;while(p<end&&(isalnum((unsigned char)*p)||*p=='_')){if(j>=(int)sizeof(name)-1)return 0;name[j++]=*p++;}if(!j)return 0;name[j]=0;if(*p++!='=')return 0;if(p>=end||*p++!='\"')return 0;
         {const char *v=p;while(p<end){if(*p=='\\'&&p+1<end){p+=2;continue;}if(*p=='\"')break;p++;}if(p>=end)return 0;value=(char*)malloc((size_t)(p-v)+1);if(!value)return 0;memcpy(value,v,(size_t)(p-v));value[p-v]=0;p++;}
         if(!name_in_list(name,allowed)&&!name_in_list(name,common)){free(value);return 0;}
@@ -260,6 +311,10 @@ static int directive_schema_valid(VSContext *c,const char *d,int is_mcp){
     if(!strcmp(op,"web_fetch"))return has_attr(d,"url");
     if(!strcmp(op,"write"))return has_attr(d,"path")&&has_attr(d,"content");
     if(!strcmp(op,"subagent"))return has_attr(d,"task");
+    if(!strcmp(op,"todo"))return has_attr(d,"items")||(has_attr(d,"index")&&has_attr(d,"status"));
+    if(!strcmp(op,"plan_task_complete"))return has_attr(d,"task_id");
+    if(!strcmp(op,"computer_use_click")||!strcmp(op,"computer_use_move"))return has_attr(d,"x")&&has_attr(d,"y");
+    if(!strcmp(op,"computer_use_type"))return has_attr(d,"text");
     return 1;
 }
 static int preflight_batch(VSContext *c,const char *answer,int *count_out){
@@ -272,7 +327,7 @@ static int preflight_batch(VSContext *c,const char *answer,int *count_out){
         if(authorized){char *id_s=attr(d,"task_id"),*ep=NULL;long id=0;int valid=0,k;
             if(!id_s){free(d);return -6;}
             id=strtol(id_s,&ep,10);if(ep==id_s||*ep||id<=0||id>2147483647L){free(id_s);free(d);return -6;}
-            if(!vs_workflow_task_ready(&c->workflow,(int)id) && strncmp(d,"plan_task_complete ",strlen("plan_task_complete "))){free(id_s);free(d);return -7;}
+            if(!vs_workflow_task_ready(&c->workflow,(int)id) && strncmp(d+10,"plan_task_complete ",strlen("plan_task_complete "))){free(id_s);free(d);return -7;}
             for(k=0;k<c->workflow.task_count;k++)if(c->workflow.tasks[k].id==(int)id){valid=1;break;}
             if(valid)staged_task=(int)id;
             free(id_s);
@@ -285,8 +340,10 @@ static int preflight_batch(VSContext *c,const char *answer,int *count_out){
         } else if(!directive_read_only(d,0)&&!authorized){free(d);return -2;}
         free(d);
     }
-    /* A marker without a closing delimiter is malformed; do not execute a valid prefix. */
-    while((scan=earliest_directive(scan,&is_mcp))!=NULL){const char *end=strstr(scan,"]]" );if(!end)return -1;scan=end+2;}
+    /* A marker without a closing delimiter is malformed; do not execute a valid
+       prefix.  This case is reported separately (-8) because the model can
+       usually repair a truncated directive on the next round. */
+    while((scan=earliest_directive(scan,&is_mcp))!=NULL){const char *end=strstr(scan,"]]" );if(!end)return -8;scan=end+2;}
     if(count_out)*count_out=n;
     if(c&&c->workflow.mode==VS_MODE_MANUAL&&authorized&&n>1)return -4;
     if(c&&c->workflow.mode==VS_MODE_MANUAL&&authorized&&c->workflow.action_approved){
@@ -378,7 +435,57 @@ static int all_subagent_directives(const char *answer,int total)
     }
     return total>1;
 }
-static char *execute_batch(VSContext *c,const char *answer,int *command_runner_confirmed){int total=directive_count(answer),original_total=total,i=0,is_mcp;const char *cur=answer;char *d,*r,*server,*name,*args,*single=0;ABuffer b;if(total<=0)return 0;if(total>VS_MAX_BATCH_TOOLS)total=VS_MAX_BATCH_TOOLS;if(all_subagent_directives(answer,total)){char *parallel=parallel_subagent_batch(c,answer,total);if(parallel)return parallel;}if(total==1){d=next_directive(&cur,&is_mcp);if(!d)return dupstr("ERROR: malformed directive");if(is_mcp){server=attr(d,"server");name=attr(d,"tool");args=attr(d,"args");if(args)unesc(args);single=(server&&name)?vs_mcp_call(c,server,name,args&&*args?args:"{}"):dupstr("ERROR: malformed VS_MCP directive");free(server);free(name);free(args);}else single=execute_tool(c,d,command_runner_confirmed);free(d);return single;}
+
+/* Batches made only of independent read-only tools and/or subagent tasks can
+   run concurrently: they do not mutate shared agent state, so ordering is
+   irrelevant and the wall-clock win on slow providers/filesystems is large.
+   Results are still reported in the original directive order. */
+static int all_parallel_safe_directives(const char *answer,int total)
+{
+    const char *cur=answer;int i,mcp;char *d;
+    for(i=0;i<total;i++){
+        d=next_directive(&cur,&mcp);
+        if(!d)return 0;
+        if(mcp||(!directive_read_only(d,0)&&strncmp(d+10,"subagent ",9))){free(d);return 0;}
+        free(d);
+    }
+    return total>1;
+}
+
+typedef struct { VSContext *c; char *directive; char *result; pthread_t thread; int started; int confirmed; } ParallelToolJob;
+static void *parallel_tool_worker(void *v)
+{
+    ParallelToolJob *j=(ParallelToolJob*)v;
+    j->result=execute_tool(j->c,j->directive,&j->confirmed);
+    return NULL;
+}
+static char *parallel_readonly_batch(VSContext *c,const char *answer,int total)
+{
+    ParallelToolJob jobs[VS_MAX_BATCH_TOOLS];
+    const char *cur=answer;ABuffer b;int i,mcp;char *out=NULL;
+    memset(jobs,0,sizeof(jobs));
+    for(i=0;i<total;i++){
+        jobs[i].directive=next_directive(&cur,&mcp);
+        if(!jobs[i].directive||mcp)goto cleanup;
+        jobs[i].c=c;
+    }
+    for(i=0;i<total;i++){
+        if(!pthread_create(&jobs[i].thread,NULL,parallel_tool_worker,&jobs[i]))jobs[i].started=1;
+        else jobs[i].result=execute_tool(c,jobs[i].directive,&jobs[i].confirmed); /* serial fallback */
+    }
+    for(i=0;i<total;i++)if(jobs[i].started)pthread_join(jobs[i].thread,NULL);
+    if(ab_init(&b,VS_AGENT_TOOL_RESULT_MAX)!=0)goto cleanup;
+    ab_addf(&b,"BATCH_TOOL_RESULT: %d independent directive(s) executed in parallel\n",total);
+    for(i=0;i<total;i++){
+        ab_addf(&b,"\n--- directive %d: %.220s ---\n",i+1,jobs[i].directive);
+        if(jobs[i].result){char *q=vs_compact_text_limit(jobs[i].result,VS_AGENT_TOOL_RESULT_MAX/(size_t)total,"batched tool result compacted");if(q){ab_add(&b,q);free(q);}}
+    }
+    out=ab_finish(&b);
+cleanup:
+    for(i=0;i<total;i++){free(jobs[i].directive);free(jobs[i].result);}
+    return out;
+}
+static char *execute_batch(VSContext *c,const char *answer,int *command_runner_confirmed){int total=directive_count(answer),original_total=total,i=0,is_mcp;const char *cur=answer;char *d,*r,*server,*name,*args,*single=0;ABuffer b;if(total<=0)return 0;if(total>VS_MAX_BATCH_TOOLS)total=VS_MAX_BATCH_TOOLS;if(all_subagent_directives(answer,total)){char *parallel=parallel_subagent_batch(c,answer,total);if(parallel)return parallel;}if(all_parallel_safe_directives(answer,total)){char *parallel=parallel_readonly_batch(c,answer,total);if(parallel)return parallel;}if(total==1){d=next_directive(&cur,&is_mcp);if(!d)return dupstr("ERROR: malformed directive");if(is_mcp){server=attr(d,"server");name=attr(d,"tool");args=attr(d,"args");if(args)unesc(args);single=(server&&name)?vs_mcp_call(c,server,name,args&&*args?args:"{}"):dupstr("ERROR: malformed VS_MCP directive");free(server);free(name);free(args);}else single=execute_tool(c,d,command_runner_confirmed);free(d);return single;}
     if(ab_init(&b,VS_AGENT_TOOL_RESULT_MAX)!=0)return 0;
     ab_addf(&b,"BATCH_TOOL_RESULT: %d directive(s) executed in order\n",total);
     while(i<total&&(d=next_directive(&cur,&is_mcp))!=0){i++;ab_addf(&b,"\n--- directive %d: %.220s ---\n",i,d);if(is_mcp){server=attr(d,"server");name=attr(d,"tool");args=attr(d,"args");if(args)unesc(args);r=(server&&name)?vs_mcp_call(c,server,name,args&&*args?args:"{}"):dupstr("ERROR: malformed VS_MCP directive");free(server);free(name);free(args);}else r=execute_tool(c,d,command_runner_confirmed);if(r){char *q=vs_compact_text_limit(r,VS_AGENT_TOOL_RESULT_MAX/(size_t)(total?total:1),"batched tool result compacted");if(q){ab_add(&b,q);free(q);}free(r);}free(d);}
@@ -386,12 +493,30 @@ static char *execute_batch(VSContext *c,const char *answer,int *command_runner_c
     return ab_finish(&b);}
 
 char *vs_agent_turn(VSContext *c,const char *user){
-    char *prompt=dupstr(user),*ans=0,*original=dupstr(user),*task_anchor=0,*last_tool_result=0,*last_directives=0;int round,plan_continues=0,no_progress=0,tool_recoveries=0,command_runner_confirmed=0,actual_tool_seen=0,execution_mode=0,cancelled=0,stalled=0,max_rounds=VS_MAX_TOOL_ROUNDS;char step[512];
+    char *prompt=dupstr(user),*ans=0,*original=dupstr(user),*task_anchor=0,*last_tool_result=0,*last_directives=0;int round,plan_continues=0,no_progress=0,tool_recoveries=0,command_runner_confirmed=0,actual_tool_seen=0,execution_mode=0,cancelled=0,max_rounds=VS_MAX_TOOL_ROUNDS;char step[512];
     {const char *mr=getenv("VIBESOLARIS_MAX_AGENT_ROUNDS");if(mr&&*mr){char *ep=0;long v=strtol(mr,&ep,10);if(ep&&*ep==0&&v>=8&&v<=256)max_rounds=(int)v;}}
     if(!prompt||!original){free(prompt);free(original);return dupstr("out of memory");}
     task_anchor=build_task_anchor(c,original);if(!task_anchor)task_anchor=dupstr(original);if(!task_anchor){free(prompt);free(original);return dupstr("out of memory");}
+    /* When a plan has been accepted, remind the model which tasks exist and
+       which of them are currently unblocked, so directives reference real
+       task_ids instead of hallucinated ones. */
+    if(vs_workflow_authorized(&c->workflow)&&c->workflow.task_count>0){size_t z=strlen(prompt)+256+(size_t)c->workflow.task_count*(VS_TASK_TITLE_MAX+96);char *np=(char*)malloc(z);size_t n=0;int i;
+        if(!np){free(prompt);free(task_anchor);free(original);return dupstr("out of memory");}
+        n=(size_t)snprintf(np,z,"ACCEPTED PLAN: %s\n",c->workflow.title);
+        for(i=0;i<c->workflow.task_count;i++){VSTaskRecord *t=&c->workflow.tasks[i];int ready=vs_workflow_task_ready(&c->workflow,t->id);n+=(size_t)snprintf(np+n,z-n,"task_id=%d title=\"%s\" status=%d ready=%s\n",t->id,t->title,(int)t->status,ready?"yes":"no");}
+        snprintf(np+n,z-n,"\n%s",prompt);
+        free(prompt);prompt=np;}
+    /* Carry the compacted working state across turns of the same session so
+       long tasks do not silently restart from zero.  The block is bounded by
+       VS_AGENT_CHECKPOINT_MAX and clearly labelled as possibly stale. */
+    if(c->subagent_depth==0&&!c->subagent_parent&&c->agent_checkpoint&&*c->agent_checkpoint){size_t z=strlen(prompt)+strlen(c->agent_checkpoint)+128;char *np=(char*)malloc(z);
+        if(!np){free(prompt);free(task_anchor);free(original);return dupstr("out of memory");}
+        snprintf(np,z,"WORKING STATE FROM EARLIER TURN (may be stale; verify before relying on it):\n%s\n\n%s",c->agent_checkpoint,prompt);
+        free(prompt);prompt=np;}
     if(c->pending_question){c->pending_question=0;c->question_option_count=0;c->question[0]=0;memset(c->question_options,0,sizeof(c->question_options));}
-    agent_context_clear(c);c->attachment_send_from=0;c->subagent_serial=0;if(c->subagent_depth==0&&!c->subagent_parent){c->subagent_record_count=0;memset(c->subagents,0,sizeof(c->subagents));}execution_mode=execution_intent(original);vs_trace_clear(c);vs_trace(c,"agent","starting agent turn");
+    /* Per-turn working history is reset, but the compacted checkpoint is
+       deliberately retained (see above). */
+    agent_history_clear(c);c->attachment_send_from=0;c->subagent_serial=0;if(c->subagent_depth==0&&!c->subagent_parent){c->subagent_record_count=0;memset(c->subagents,0,sizeof(c->subagents));}execution_mode=execution_intent(original);vs_trace_clear(c);vs_trace(c,"agent","starting agent turn");
     if(vs_cancel_requested(c)){cancelled=1;vs_trace(c,"cancel","agent turn stopped by user before work began");}
     if(!cancelled&&vs_workflow_authorized(&c->workflow)&&c->mcp_server_count>0){int n=vs_mcp_refresh_all(c,0);if(vs_cancel_requested(c)){cancelled=1;vs_trace(c,"cancel","agent turn stopped while preparing MCP tools");}else{snprintf(step,sizeof(step),"MCP catalogue ready: %d tool(s)",n<0?0:n);vs_trace(c,"mcp",step);}}
     for(round=0;!cancelled&&round<max_rounds;round++){
@@ -445,6 +570,7 @@ char *vs_agent_turn(VSContext *c,const char *user){
         }
         tool=strstr(ans,"[[VS_TOOL ");mcp=strstr(ans,"[[VS_MCP ");
         if(tool||mcp){int batch_count=0,gate=preflight_batch(c,ans,&batch_count);
+            if(gate==-8){vs_trace(c,"directive-rejected","directive marker was truncated before its closing delimiter; asking the model to re-emit it");agent_history_add(c,"user",prompt);agent_history_add(c,"assistant",ans);next=continuation_prompt(task_anchor,"ERROR: the previous response contained a VS_TOOL/VS_MCP directive that was truncated before its closing ]]. Nothing was executed. Re-emit the intended directive(s) in full.",1,c->agent_checkpoint);free(prompt);prompt=next;if(!prompt){vs_trace(c,"memory-error","could not allocate truncation recovery prompt");break;}continue;}
             if(gate<0&&gate!=-2){const char *why=gate==-4?"Manual mode approves one action at a time; request a single directive.":(gate==-3?"The requested MCP tool is not in the discovered tool catalogue.":(gate==-5?"This manual approval does not match the pending action; request approval again.":(gate==-7?"The requested task is blocked, complete, or not ready in the accepted plan.":(gate==-6?"Every action must name an accepted task_id from the reviewed plan.":"The directive batch was malformed and was rejected before any action ran."))));
                 if(c->workflow.mode==VS_MODE_MANUAL){c->workflow.action_approved=0;c->workflow.pending_request[0]=0;}
                 vs_trace(c,"directive-rejected",why);free(ans);ans=dupstr(why);break;}
@@ -485,23 +611,25 @@ char *vs_agent_turn(VSContext *c,const char *user){
                     free(prompt);prompt=retry;continue;
                 }
             }
-            if(execution_mode||actual_tool_seen){plan_continues++;no_progress++;if(no_progress>=2){stalled=1;snprintf(step,sizeof(step),"stopped after %d consecutive execution responses without a tool action or completion marker",no_progress);vs_trace(c,"no-progress",step);break;}snprintf(step,sizeof(step),"execution response had no directive/final marker; one recovery continuation remains (%d/2)",no_progress);vs_trace(c,"auto-continue",step);agent_history_add(c,"user",prompt);agent_history_add(c,"assistant",ans);agent_compact(c,task_anchor,round+1);next=continuation_prompt(task_anchor,last_tool_result,1,c->agent_checkpoint);free(prompt);prompt=next;if(!prompt){vs_trace(c,"memory-error","could not allocate continuation prompt");break;}continue;}
-            if(plan_continues<VS_MAX_PLAN_CONTINUES&&should_auto_continue(original,ans)){plan_continues++;snprintf(step,sizeof(step),"planning-only response detected; continuing (%d/%d)",plan_continues,VS_MAX_PLAN_CONTINUES);vs_trace(c,"auto-continue",step);agent_history_add(c,"user",prompt);agent_history_add(c,"assistant",ans);agent_compact(c,task_anchor,round+1);next=continuation_prompt(task_anchor,0,1,c->agent_checkpoint);free(prompt);prompt=next;if(!prompt){vs_trace(c,"memory-error","could not allocate continuation prompt");break;}continue;}
+            if(execution_mode||actual_tool_seen){plan_continues++;no_progress++;snprintf(step,sizeof(step),"execution response had no directive/final marker; continuing (%d consecutive) until the round ceiling",no_progress);vs_trace(c,"auto-continue",step);agent_history_add(c,"user",prompt);agent_history_add(c,"assistant",ans);next=continuation_prompt(task_anchor,last_tool_result,1,c->agent_checkpoint);free(prompt);prompt=next;if(!prompt){vs_trace(c,"memory-error","could not allocate continuation prompt");break;}continue;}
+            if(plan_continues<VS_MAX_PLAN_CONTINUES&&should_auto_continue(original,ans)){plan_continues++;snprintf(step,sizeof(step),"planning-only response detected; continuing (%d/%d)",plan_continues,VS_MAX_PLAN_CONTINUES);vs_trace(c,"auto-continue",step);agent_history_add(c,"user",prompt);agent_history_add(c,"assistant",ans);next=continuation_prompt(task_anchor,0,1,c->agent_checkpoint);free(prompt);prompt=next;if(!prompt){vs_trace(c,"memory-error","could not allocate continuation prompt");break;}continue;}
             vs_trace(c,"agent","completed informational turn without tool work");break;
         }
         plan_continues=0;actual_tool_seen=1;execution_mode=1;if(vs_cancel_requested(c)){cancelled=1;vs_trace(c,"cancel","agent turn stopped before tool action");break;}
-        {char *sig=directive_signature(ans);if(sig&&last_directives&&!strcmp(sig,last_directives)){free(sig);stalled=1;vs_trace(c,"no-progress","same tool directive repeated after its previous result; refusing to execute it again");break;}if(sig){free(last_directives);last_directives=sig;}}
+        {char *sig=directive_signature(ans);if(sig&&last_directives&&!strcmp(sig,last_directives)){free(sig);vs_trace(c,"no-progress","same tool directive repeated after its previous result; refusing to execute it again");result=dupstr("ERROR: this exact directive batch was already executed in this turn and its result is shown above; it was not run again. Continue with a different concrete action, VS_NEED_USER for a genuine blocker, or VS_FINAL when complete.");if(!result){vs_trace(c,"memory-error","could not allocate refusal result");break;}vs_trace(c,"tool-output",result);free(last_tool_result);last_tool_result=dupstr(result);agent_history_add(c,"user",prompt);agent_history_add(c,"assistant",ans);next=continuation_prompt(task_anchor,result,0,c->agent_checkpoint);free(result);free(prompt);prompt=next;if(!prompt){vs_trace(c,"memory-error","could not allocate next tool-round prompt");break;}continue;}if(sig){free(last_directives);last_directives=sig;}}
         {int dc=directive_count(ans),active=c->workflow.current_task_id;snprintf(step,sizeof(step),"executing %d directive(s)%s serially",dc,dc>1?" as a batch":"");vs_trace(c,"tool-batch",step);if(active)vs_workflow_set_task_status(&c->workflow,active,VS_TASK_RUNNING,"running serially");if(c->workflow.mode==VS_MODE_MANUAL)(void)vs_workflow_consume_action_approval(&c->workflow);result=execute_batch(c,ans,&command_runner_confirmed);if(active&&result&&strstr(result,"COMMAND_RUNNER_STATUS: host_error"))vs_workflow_set_task_status(&c->workflow,active,VS_TASK_FAILED,result);}no_progress=0;
         if(result){char *bounded=vs_compact_text_limit(result,VS_AGENT_TOOL_RESULT_MAX,"tool result compacted for model context");if(bounded){if(strlen(bounded)<strlen(result))vs_trace(c,"limit","tool result compacted to keep autonomous context bounded");free(result);result=bounded;}vs_trace(c,"tool-output",result);}
         if(vs_cancel_requested(c)){cancelled=1;free(result);result=0;vs_trace(c,"cancel","agent turn stopped after tool returned");break;}
         free(last_tool_result);last_tool_result=result?dupstr(result):0;agent_history_add(c,"user",prompt);agent_history_add(c,"assistant",ans);agent_compact(c,task_anchor,round+1);next=continuation_prompt(task_anchor,result,0,c->agent_checkpoint);if(!next){free(result);vs_trace(c,"memory-error","could not allocate next tool-round prompt");break;}free(result);free(prompt);prompt=next;
     }
-    if(stalled&&!cancelled){free(ans);ans=dupstr("Paused because the agent stopped making progress. The task was not marked complete; review the latest trace/result, then retry with a different approach or clarify the blocker.");}
-    else if(no_progress>=2&&!cancelled){free(ans);ans=dupstr("Paused after repeated responses without a tool action or completion marker. The task was not marked complete; retry with a concrete next step or clarify the blocker.");}
     if(!cancelled&&round>=max_rounds){snprintf(step,sizeof(step),"maximum autonomous agent rounds reached (%d); tools remain available next turn",max_rounds);vs_trace(c,"limit",step);if(execution_mode||(ans&&(strstr(ans,"[[VS_TOOL ")||strstr(ans,"[[VS_MCP ")))){free(ans);ans=dupstr("The single-turn autonomous ceiling was reached while work was still in progress. The task was not marked complete; continue from the existing files and conversation state, or raise VIBESOLARIS_MAX_AGENT_ROUNDS (up to 256).");}}
     if(cancelled){vs_workflow_clear_pending_task(c);free(ans);ans=dupstr("Stopped by user.");}
     if(c&&c->workflow.mode==VS_MODE_MANUAL&&c->workflow.action_approved){c->workflow.action_approved=0;c->workflow.pending_request[0]=0;if(c->workflow.phase==VS_WORKFLOW_DOING)c->workflow.phase=VS_WORKFLOW_AWAITING_ACTION;}
-    free(prompt);free(task_anchor);free(last_tool_result);free(last_directives);agent_context_clear(c);
+    /* Working history and the compacted checkpoint deliberately survive the
+       turn boundary: the next turn's start resets the history, and /compact
+       (agent_compact_force) needs the retained state to be meaningful when
+       the user invokes it between turns. */
+    free(prompt);free(task_anchor);free(last_tool_result);free(last_directives);
     if(ans&&original){
         if(!c->suppress_history_once){vs_history_add(c,"user",original);vs_history_add(c,"assistant",ans);}
         else c->suppress_history_once=0;
