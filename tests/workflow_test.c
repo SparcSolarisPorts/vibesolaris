@@ -23,6 +23,10 @@ int main(void)
     CHECK(vs_workflow_accept(&w)==0&&vs_workflow_authorized(&w));
     CHECK(vs_workflow_task_ready(&w,1));
     CHECK(vs_workflow_task_ready(&w,2)); /* parent is a visual grouping, dependencies gate execution */
+    CHECK(vs_workflow_set_task_status(&w,3,VS_TASK_FAILED,"retry") == 0);
+    CHECK(!vs_workflow_task_ready(&w,3)); /* failed tasks still require completed dependencies */
+    CHECK(vs_workflow_set_task_status(&w,2,VS_TASK_FAILED,"retry") == 0);
+    CHECK(vs_workflow_task_ready(&w,2));
     CHECK(vs_workflow_set_task_status(&w,2,VS_TASK_COMPLETED,"child done")==0);
     CHECK(!vs_workflow_task_ready(&w,2));
     CHECK(vs_workflow_task_ready(&w,3));

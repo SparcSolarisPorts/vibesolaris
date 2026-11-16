@@ -21,8 +21,9 @@ char *vs_chat(VSContext *c,const char *prompt){
     (void)prompt;
     if(c->subagent_depth==0){
         calls_d0++;
-        if(parallel_case)return strdup(calls_d0==1?"[[VS_TOOL subagent task_id=\"1\" task=\"Review alpha\"]] [[VS_TOOL subagent task_id=\"1\" task=\"Review beta\"]]":"Parallel work finished. [[VS_FINAL]]");
+        if(parallel_case)return strdup(calls_d0==1?"[[VS_TOOL subagent task_id=\"1\" task=\"Review alpha\"]] [[VS_TOOL subagent task_id=\"1\" task=\"Review beta\"]]":calls_d0==2?"[[VS_TOOL plan_task_complete task_id=\"1\" summary=\"Delegation complete\"]]":"Parallel work finished. [[VS_FINAL]]");
         if(calls_d0==1)return strdup("I will look into it.\n[[VS_TOOL subagent task_id=\"1\" task=\"Summarise README\"]]");
+        if(calls_d0==2)return strdup("[[VS_TOOL plan_task_complete task_id=\"1\" summary=\"Delegation complete\"]]");
         return strdup("Subagent reported back. [[VS_FINAL]]");
     }
     if(c->subagent_depth==1){
@@ -134,8 +135,14 @@ int main(void){
     CHECK(parent.subagent_record_count==0,"pre-cancelled request does not create a running task record");
     free(out);
     {
-        VSContext child;memset(&child,0,sizeof(child));child.subagent_parent=&parent;
-        CHECK(vs_cancel_requested(&child),"child reports cancelled when its parent is cancelled");
+        VSContext *child = calloc(1, sizeof(VSContext));
+        if (child) {
+            child->subagent_parent = &parent;
+            CHECK(vs_cancel_requested(child),"child reports cancelled when its parent is cancelled");
+            free(child);
+        } else {
+            CHECK(0,"child reports cancelled when its parent is cancelled");
+        }
     }
 
     /* 5. empty task is rejected */

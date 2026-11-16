@@ -204,6 +204,25 @@ int main(void){
     if(!strstr(last_headers,"Accept: text/event-stream")){fprintf(stderr,"FAIL: OpenAI streaming request omits Accept: text/event-stream\n");fails++;}else printf("ok: OpenAI streaming request asks for text/event-stream\n");
     if(strcmp(last_url,"https://gateway.example.test/v1/chat/completions")!=0){fprintf(stderr,"FAIL: OpenAI streaming endpoint was %s\n",last_url);fails++;}else printf("ok: OpenAI streaming request targets chat/completions\n");
 
+    /* Usage arrives separately from text and must be counted once. */
+    setup(VS_PROVIDER_CUSTOM,VS_PROTOCOL_ANTHROPIC,"https://gateway.example.test/v1/messages");
+    feed("data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":20,\"cache_creation_input_tokens\":5}}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":4}}\n\n");feed_slice=1;
+    out=vs_chat(&ctx,"hi");free(out);
+    if(ctx.provider_input_tokens!=35||ctx.provider_output_tokens!=4||ctx.provider_total_tokens!=39||ctx.provider_cache_read_tokens!=20||ctx.provider_cache_write_tokens!=5){fprintf(stderr,"FAIL: Anthropic streamed usage accounting\n");fails++;}else printf("ok: Anthropic streamed usage accounting\n");
+
+    setup(VS_PROVIDER_OPENAI,VS_PROTOCOL_OPENAI,"https://api.openai.com/v1");
+    feed("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":10,\"total_tokens\":111,\"prompt_tokens_details\":{\"cached_tokens\":40}}}\n\ndata: [DONE]\n\n");feed_slice=1;
+    out=vs_chat(&ctx,"hi");free(out);
+    if(ctx.provider_input_tokens!=100||ctx.provider_output_tokens!=10||ctx.provider_total_tokens!=111||ctx.provider_cache_read_tokens!=40){fprintf(stderr,"FAIL: OpenAI streamed usage accounting\n");fails++;}else printf("ok: OpenAI streamed usage accounting\n");
+    if(!strstr(last_body,"\"stream_options\":{\"include_usage\":true}")){fprintf(stderr,"FAIL: OpenAI stream does not request usage\n");fails++;}
+    setup(VS_PROVIDER_CUSTOM,VS_PROTOCOL_OPENAI,"https://gateway.example.test/v1");feed(OPENAI_SSE);out=vs_chat(&ctx,"hi");free(out);
+    if(strstr(last_body,"\"stream_options\"")){fprintf(stderr,"FAIL: custom gateway received stream_options\n");fails++;}
+
+    setup(VS_PROVIDER_CUSTOM,VS_PROTOCOL_OPENAI,"https://gateway.example.test/v1");
+    feed("data: {\"usage\":{\"prompt_tokens\":100,\"cached_tokens\":40,\"cache_write_tokens\":5}}\n\ndata: {\"usage\":{\"completion_tokens\":10,\"total_tokens\":110}}\n\n");feed_slice=1;
+    out=vs_chat(&ctx,"hi");free(out);
+    if(ctx.provider_cache_read_tokens!=40||ctx.provider_cache_write_tokens!=5||ctx.provider_total_tokens!=110){fprintf(stderr,"FAIL: partial usage preserves cache counts\n");fails++;}else printf("ok: partial usage preserves cache counts\n");
+
     printf("-- degradation and edge cases --\n");
     /* An SSE error event aborts the streaming read and retries without streaming. */
     setup(VS_PROVIDER_CUSTOM,VS_PROTOCOL_ANTHROPIC,"https://gateway.example.test/v1/messages");

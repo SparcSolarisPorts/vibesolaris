@@ -645,6 +645,52 @@ Exit:
 /quit
 ```
 
+### Advanced TUI commands
+
+Phase 4 adds advanced features for power users:
+
+```text
+/auto-mode on|off|status|rules   Action classifier (safe/risky/blocked)
+/team create NAME                Create agent team
+/team add TEAM ROLE              Add agent to team
+/team list                       List active teams
+/team shutdown TEAM              Shutdown team
+/plugin install URL              Install plugin bundle
+/plugin list                     List installed plugins
+/plugin uninstall NAME           Remove plugin
+/review [path] [scope] [focus]   Start code review
+/goal set TEXT                   Set persistent goal
+/goal show                       Show current goal
+/goal clear                      Clear goal
+/init [path]                     Auto-onboard repo
+/pause                           Pause session
+/style compact|verbose|default   Output style
+/keybindings                     Show custom keybindings
+/worktree [path]                 Enter worktree directory
+/worktree-exit                   Exit worktree
+/dream                           Run memory consolidation
+/dream off                       Disable auto-dream
+/checkpoint create               Create git snapshot
+/checkpoint rollback             Rollback to checkpoint
+/checkpoint list                 List checkpoints
+```
+
+**Shell passthrough**: Prefix any command with `!` to execute it directly in the shell:
+
+```text
+! ls -la
+! git status
+```
+
+**CLI flags**:
+
+```sh
+./vibesolaris --json                        # JSON output mode
+./vibesolaris --disable-slash-commands      # Pass / commands to agent
+./vibesolaris --resume                      # Resume previous conversation
+./vibesolaris --worktree /path/to/repo      # Enter worktree at startup
+```
+
 
 ## Autonomous continuation
 

@@ -17,7 +17,7 @@ char *vs_http_post_ctx(VSContext *c,const char *url,const char *headers[],int co
     const char *text;char *escaped,*response;int i;(void)c;
     http_calls++;snprintf(last_url,sizeof(last_url),"%s",url);last_headers[0]=0;snprintf(last_body,sizeof(last_body),"%s",body?body:"");
     for(i=0;i<count;i++){strncat(last_headers,headers[i],sizeof(last_headers)-strlen(last_headers)-2);strncat(last_headers,"\n",sizeof(last_headers)-strlen(last_headers)-1);}
-    text=http_calls==1?plan:(http_calls==2?run:done);escaped=json_escape(text);if(!escaped)return NULL;
+    text=http_calls==1?plan:(http_calls==2?run:(http_calls==3?"[[VS_TOOL plan_task_complete task_id=\"1\" summary=\"Command complete\"]]":done));escaped=json_escape(text);if(!escaped)return NULL;
     response=malloc(strlen(escaped)+96);if(response)sprintf(response,"{\"content\":[{\"type\":\"text\",\"text\":\"%s\"}]}",escaped);free(escaped);*status=200;return response;
 }
 const char *vs_command_shell_name(void){return "sh";}
@@ -60,6 +60,6 @@ int main(void){
     if(strcmp(last_url,"https://gateway.example.test/v1/messages")||!strstr(last_headers,"Authorization: Bearer custom-secret")||!strstr(last_body,"\"model\":\"Claude-Compatible-Model\"")){fprintf(stderr,"custom Anthropic request was not formed correctly\nurl=%s\nheaders=%s\nbody=%s\n",last_url,last_headers,last_body);return 2;}
     if(vs_workflow_accept(&c.workflow)!=0)return 3;
     out=vs_agent_turn(&c,"continue accepted work");
-    if(!out||strcmp(out,"done")||http_calls!=3||command_calls!=1){fprintf(stderr,"custom Anthropic command flow failed: out=%s http=%d commands=%d\n",out?out:"(null)",http_calls,command_calls);free(out);return 4;}
+    if(!out||strcmp(out,"done")||http_calls!=4||command_calls!=1){fprintf(stderr,"custom Anthropic command flow failed: out=%s http=%d commands=%d\n",out?out:"(null)",http_calls,command_calls);free(out);return 4;}
     free(out);puts("custom Anthropic agent command test passed");return 0;
 }

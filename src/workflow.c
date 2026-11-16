@@ -90,6 +90,16 @@ int vs_workflow_accept(VSWorkflow *w)
     w->accepted_revision=w->revision;
     w->action_approved=0;
     w->phase=VS_WORKFLOW_DOING;
+    if(w->current_task_id==0){
+        int i;
+        for(i=0;i<w->task_count;i++)
+            if(w->tasks[i].status!=VS_TASK_CANCELLED &&
+               w->tasks[i].status!=VS_TASK_BLOCKED &&
+               w->tasks[i].status!=VS_TASK_COMPLETED){
+                w->current_task_id=w->tasks[i].id;
+                break;
+            }
+    }
     return 0;
 }
 
@@ -161,7 +171,7 @@ int vs_workflow_task_ready(const VSWorkflow *w,int id)
     int i,j,found;
     if(!w)return 0;
     for(i=0;i<w->task_count;i++)if(w->tasks[i].id==id){
-        if(w->tasks[i].status==VS_TASK_CANCELLED||w->tasks[i].status==VS_TASK_FAILED||w->tasks[i].status==VS_TASK_BLOCKED||w->tasks[i].status==VS_TASK_COMPLETED)return 0;
+        if(w->tasks[i].status==VS_TASK_CANCELLED||w->tasks[i].status==VS_TASK_BLOCKED||w->tasks[i].status==VS_TASK_COMPLETED)return 0;
         for(j=0;j<w->tasks[i].dependency_count;j++){
             found=0;for(int k=0;k<w->task_count;k++)if(w->tasks[k].id==w->tasks[i].dependencies[j]){found=w->tasks[k].status==VS_TASK_COMPLETED;break;}
             if(!found)return 0;

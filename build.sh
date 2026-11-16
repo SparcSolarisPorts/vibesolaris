@@ -279,7 +279,7 @@ build_one() {
             CFLAGS="-O2 $warnflags $user_cflags" \
             LDFLAGS="$user_ldflags" \
             CURL_LIBS="$curl_libs" \
-            CRYPTO_LIBS="$crypto_libs" vibesolaris)
+            CRYPTO_LIBS="$crypto_libs" X11_LIBS= CU_X11_DEFS= vibesolaris)
     fi
 
     install_tree "$root" "$want_gui"
@@ -385,6 +385,7 @@ CPPFLAGS="-Iinclude $CURL_CFLAGS $CRYPTO_CFLAGS $X11_CFLAGS ${VS_CPPFLAGS:-}"
 
 WANT_GUI=yes
 if [ "${VS_NO_GUI:-0}" = 1 ]; then WANT_GUI=no; fi
+if [ -n "${SSH_CONNECTION:-}" ] && [ -z "${DISPLAY:-}" ] && [ -z "${VS_NO_GUI:-}" ]; then WANT_GUI=no; fi
 
 if ! command -v make >/dev/null 2>&1; then
     echo "No make utility found." >&2

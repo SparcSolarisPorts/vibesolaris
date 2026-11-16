@@ -12,6 +12,8 @@ char *vs_chat(VSContext *ctx,const char *p){(void)ctx;(void)p;chats++;
     if(chats==2)return xdup("I'll inspect it now. [[VS_TOOL run task_id=\"1\" cmd=\"printf inventory\"]]");
     if(chats==3)return xdup("The command runner is operational; the previous command had a shell syntax error. I'll use simpler POSIX-compatible commands. I'm unable to continue because the tool bridge stopped returning results after the initial inventory command.");
     if(chats==4)return xdup("Continuing now. [[VS_TOOL run task_id=\"2\" cmd=\"printf recovered\"]]");
+    if(chats==5)return xdup("[[VS_TOOL plan_task_complete task_id=\"1\" summary=\"Command recovery handled\"]]");
+    if(chats==6)return xdup("[[VS_TOOL plan_task_complete task_id=\"2\" summary=\"Recovery verified\"]]");
     return xdup("[[VS_FINAL]]Done after recovery.");
 }
 void vs_trace(VSContext *c,const char *k,const char *d){(void)c;fprintf(stderr,"[%s] %s\n",k,d);}
@@ -44,4 +46,4 @@ void vs_history_clear(VSContext *c){(void)c;}
 void vs_cache_clear(VSContext *c){(void)c;}
 int main(void){VSContext c;char *out;memset(&c,0,sizeof(c));vs_workflow_init(&c.workflow);out=vs_agent_turn(&c,"ok that all sounds good, do all that");if(!out||c.workflow.phase!=VS_WORKFLOW_AWAITING_ACCEPT||runs!=0){free(out);return 1;}free(out);if(vs_workflow_accept(&c.workflow)!=0)return 1;out=vs_agent_turn(&c,"continue accepted task");
     printf("answer=%s\nchats=%d runs=%d\n",out?out:"(null)",chats,runs);
-    if(!out||strcmp(out,"Done after recovery.")||chats!=5||runs!=3){free(out);return 1;}free(out);return 0;}
+    if(!out||strcmp(out,"Done after recovery.")||chats!=7||runs!=3){free(out);return 1;}free(out);return 0;}

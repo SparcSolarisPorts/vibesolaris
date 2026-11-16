@@ -237,3 +237,52 @@ char *vs_mcp_prompt_fragment(const VSContext *c)
 {
     MBuf b;int i;if(!c||c->mcp_tool_count<=0)return mdup("(no MCP tools configured/discovered)\n");if(mb_init(&b,4096)!=0)return NULL;mb_add(&b,"Available MCP tools. To call one, emit exactly one directive: [[VS_MCP server=\"SERVER\" tool=\"TOOL\" args=\"{\\\"key\\\":\\\"value\\\"}\"]]. The host will execute it and return MCP_RESULT.\n");for(i=0;i<c->mcp_tool_count;i++){mb_add(&b,"- ");mb_add(&b,c->mcp_tools[i].server);mb_add(&b,".");mb_add(&b,c->mcp_tools[i].name);if(c->mcp_tools[i].description[0]){mb_add(&b," — ");mb_add(&b,c->mcp_tools[i].description);}mb_add(&b,"\n  inputSchema: ");mb_add(&b,c->mcp_tools[i].input_schema);mb_add(&b,"\n");}return b.p;
 }
+
+/* ---- MCP Resources (resources/list and resources/read) ---- */
+
+char *vs_mcp_list_resources(VSContext *ctx, const char *server)
+{
+    int i;
+    char *r;
+
+    if (!ctx || !server || !server[0]) return mdup("ERROR: no server specified");
+    i = server_index(ctx, server);
+    if (i < 0) return mdup("ERROR: MCP server not configured");
+
+    r = request_server(ctx, &ctx->mcp_servers[i], "resources/list", NULL, NULL);
+    if (!r) return mdup("ERROR: resources/list failed");
+    return r;
+}
+
+char *vs_mcp_read_resource(VSContext *ctx, const char *server, const char *uri)
+{
+    int i;
+    char *r;
+    char args[1024];
+    char uri_esc[512];
+    int j;
+    size_t ulen;
+
+    if (!ctx || !server || !server[0] || !uri || !uri[0])
+        return mdup("ERROR: server and uri required");
+    i = server_index(ctx, server);
+    if (i < 0) return mdup("ERROR: MCP server not configured");
+
+    /* Escape URI for JSON */
+    ulen = strlen(uri);
+    if (ulen >= sizeof(uri_esc) - 1) ulen = sizeof(uri_esc) - 1;
+    for (j = 0; j < (int)ulen; j++) {
+        if (uri[j] == '"' || uri[j] == '\\') {
+            memmove(uri_esc + j + 1, uri_esc + j, (size_t)((int)ulen - j));
+            uri_esc[j] = '\\';
+            ulen++;
+            if (ulen >= sizeof(uri_esc)) break;
+        }
+    }
+    uri_esc[ulen] = 0;
+
+    snprintf(args, sizeof(args), "{\"uri\":\"%s\"}", uri_esc);
+    r = request_server(ctx, &ctx->mcp_servers[i], "resources/read", NULL, args);
+    if (!r) return mdup("ERROR: resources/read failed");
+    return r;
+}

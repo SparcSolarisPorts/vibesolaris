@@ -13,6 +13,9 @@
 #include <string.h>
 #include <time.h>
 #include <pthread.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 /* Protect root lifecycle records and shared parent trace from concurrent workers. */
 static pthread_mutex_t subagent_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -92,14 +95,171 @@ char *vs_subagent_request_prompt(const char *task)
     return o;
 }
 
+/* Maps a trace event to a short activity label for the live indicator.
+   Returns 1 and fills out when the event changes the phase, 0 otherwise.
+   Events forwarded from a subagent (detail begins "[sub#") get a "Subagent: "
+   prefix so the user can see delegated work distinctly. */
+int vs_trace_phase(const char *kind,const char *detail,char *out,size_t cap)
+{
+    const char *base=NULL;int sub;
+    if(!kind||!out||cap==0)return 0;
+    if(!strcmp(kind,"model")||!strcmp(kind,"model-wait")||!strcmp(kind,"http-wait")||!strcmp(kind,"reasoning")||!strcmp(kind,"subagent-done"))base="Thinking";
+    else if(!strcmp(kind,"tool-batch")||!strcmp(kind,"tool-health"))base="Running tools";
+    else if(!strcmp(kind,"subagent-start"))base="Subagent starting";
+    else if(!strcmp(kind,"compact"))base="Compacting context";
+    else return 0;
+    sub=detail&&!strncmp(detail,"[sub#",5);
+    if(sub)snprintf(out,cap,"Subagent: %s",base);
+    else snprintf(out,cap,"%s",base);
+    return 1;
+}
+
+/* ---- Subagent result file output ---- */
+
+char *vs_subagent_result_to_file(const char *task, const char *result, long duration, int status)
+{
+    const char *home;
+    char dir[VS_MAX_PATH], path[VS_MAX_PATH + 64];
+    FILE *f;
+    char *out;
+    size_t n;
+
+    home = getenv("HOME");
+    if (!home) return NULL;
+    snprintf(dir, sizeof(dir), "%s/.vibesolaris/subagent_results", home);
+    /* Create directory if it doesn't exist */
+    mkdir(dir, 0755);
+
+    /* Generate a unique filename using timestamp and PID */
+    snprintf(path, sizeof(path), "%s/result_%ld_%ld.txt", dir, (long)time(NULL), (long)getpid());
+
+    f = fopen(path, "w");
+    if (!f) return NULL;
+    fprintf(f, "Subagent Result\n");
+    fprintf(f, "Task: %s\n", task ? task : "(none)");
+    fprintf(f, "Duration: %ld seconds\n", duration);
+    fprintf(f, "Status: %s\n", status == 1 ? "completed" : status == 2 ? "stopped" : "failed");
+    fprintf(f, "---\n%s\n", result ? result : "(no result)");
+    fclose(f);
+
+    n = strlen(path) + 128;
+    out = (char *)malloc(n);
+    if (!out) return NULL;
+    snprintf(out, n, "(result stored in %s, %zu bytes; use VS_TOOL read to inspect)", path, strlen(result ? result : ""));
+    return out;
+}
+
+/* ---- Subagent caching (FNV-1a hash) ---- */
+
+static unsigned long fnv1a_hash(const char *s)
+{
+    unsigned long h = 2166136261UL;
+    for (; *s; s++) h = (h ^ (unsigned char)*s) * 16777619UL;
+    return h;
+}
+
+char *vs_subagent_cache_get(VSContext *ctx, const char *task)
+{
+    int i;
+    unsigned long hash;
+    if (!ctx || !task) return NULL;
+    hash = fnv1a_hash(task);
+    for (i = 0; i < ctx->subagent_cache_count; i++) {
+        if (ctx->subagent_cache[i].task_hash == hash && ctx->subagent_cache[i].result) {
+            return ctx->subagent_cache[i].result;
+        }
+    }
+    return NULL;
+}
+
+void vs_subagent_cache_put(VSContext *ctx, const char *task, const char *result)
+{
+    unsigned long hash;
+    if (!ctx || !task || !result) return;
+    hash = fnv1a_hash(task);
+    /* Check if already cached */
+    { int i; for (i = 0; i < ctx->subagent_cache_count; i++) {
+        if (ctx->subagent_cache[i].task_hash == hash) {
+            free(ctx->subagent_cache[i].result);
+            ctx->subagent_cache[i].result = dupstr(result);
+            ctx->subagent_cache[i].timestamp = (long)time(NULL);
+            return;
+        }
+    }}
+    if (ctx->subagent_cache_count >= VS_SUBAGENT_CACHE_MAX) {
+        /* Evict oldest */
+        free(ctx->subagent_cache[0].result);
+        memmove(&ctx->subagent_cache[0], &ctx->subagent_cache[1], (VS_SUBAGENT_CACHE_MAX - 1) * sizeof(VSSubagentCacheEntry));
+        ctx->subagent_cache_count--;
+    }
+    ctx->subagent_cache[ctx->subagent_cache_count].task_hash = hash;
+    ctx->subagent_cache[ctx->subagent_cache_count].result = dupstr(result);
+    ctx->subagent_cache[ctx->subagent_cache_count].timestamp = (long)time(NULL);
+    ctx->subagent_cache_count++;
+}
+
+void vs_subagent_cache_clear(VSContext *ctx)
+{
+    int i;
+    if (!ctx) return;
+    for (i = 0; i < ctx->subagent_cache_count; i++) {
+        free(ctx->subagent_cache[i].result);
+        ctx->subagent_cache[i].result = NULL;
+        ctx->subagent_cache[i].task_hash = 0;
+    }
+    ctx->subagent_cache_count = 0;
+}
+
+/* ---- Shared scratch directory for sibling subagents ---- */
+
+static void ensure_scratch_dir(char *out, size_t cap, const char *turn_id)
+{
+    const char *home;
+    char dir[VS_MAX_PATH];
+    home = getenv("HOME");
+    if (!home) { out[0] = 0; return; }
+    snprintf(dir, sizeof(dir), "%s/.vibesolaris/subagent_scratch", home);
+    mkdir(dir, 0755);
+    snprintf(out, cap, "%s/%s", dir, turn_id ? turn_id : "default");
+    mkdir(out, 0755);
+}
+
+/* ---- Main subagent run with caching, retry, worktree, scratch ---- */
+
 char *vs_subagent_run(VSContext *parent,const char *task)
 {
     VSContext *child,*root;char *prompt,*ans,*out,detail[512];size_t n;int id,record_index=-1;VSSubagentRecord *record=NULL;
+    long started_at, duration;
+    int retries;
+    char *cached;
+    char scratch_dir[VS_MAX_PATH];
+    char turn_id[64];
+    char *worktree_path = NULL;
+    char *retry_prompt = NULL;
+
     if(!parent)return dupstr("ERROR: subagent has no parent agent");
     if(!task||!*task)return dupstr("ERROR: subagent requires task=\"...\"");
     if(vs_cancel_requested(parent))return dupstr("Stopped by user.");
     if(parent->subagent_depth>=VS_MAX_SUBAGENT_DEPTH)
         return dupstr("ERROR: subagent nesting limit reached; complete this part directly.");
+
+    /* Check cache first */
+    cached = vs_subagent_cache_get(parent, task);
+    if (cached) {
+        n = strlen(cached) + 96;
+        out = (char *)malloc(n);
+        if (!out) return dupstr("ERROR: out of memory");
+        snprintf(out, n, "SUBAGENT_RESULT (cached):\n%s", cached);
+        return out;
+    }
+
+    /* Get retry count from env var */
+    { const char *re = getenv("VIBESOLARIS_SUBAGENT_RETRIES"); retries = re ? atoi(re) : 1; if (retries < 1) retries = 1; if (retries > 3) retries = 3; }
+
+    /* Create shared scratch directory */
+    snprintf(turn_id, sizeof(turn_id), "%ld_%ld", (long)time(NULL), (long)getpid());
+    ensure_scratch_dir(scratch_dir, sizeof(scratch_dir), turn_id);
+
     root=parent->subagent_root?(VSContext*)parent->subagent_root:parent;
     pthread_mutex_lock(&subagent_lock);
     if(root->subagent_serial>=VS_MAX_SUBAGENTS_PER_TURN){
@@ -114,6 +274,18 @@ char *vs_subagent_run(VSContext *parent,const char *task)
     memcpy(child,parent,sizeof(VSContext));
     if(!parent->subagent_parent)pthread_mutex_unlock(&subagent_lock);
     isolate_child(child);
+
+    /* Optionally set up worktree isolation */
+    { const char *wt = getenv("VIBESOLARIS_SUBAGENT_WORKTREE");
+      if (wt && atoi(wt) && child->cwd[0]) {
+          worktree_path = (char *)malloc(VS_MAX_PATH);
+          if (worktree_path && vs_worktree_enter(child->cwd, worktree_path, VS_MAX_PATH) == 0) {
+              strncpy(child->cwd, worktree_path, VS_MAX_PATH - 1);
+          } else {
+              free(worktree_path); worktree_path = NULL;
+          }
+      }
+    }
 
     pthread_mutex_lock(&subagent_lock);
     if(root->subagent_serial>=VS_MAX_SUBAGENTS_PER_TURN){pthread_mutex_unlock(&subagent_lock);free(child);return dupstr("ERROR: subagent limit for this turn reached");}
@@ -136,25 +308,60 @@ char *vs_subagent_run(VSContext *parent,const char *task)
     child->subagent_serial=0;
     child->subagent_root=root;
 
-    n=strlen(task)+640;
-    prompt=(char*)malloc(n);
-    if(!prompt){pthread_mutex_lock(&subagent_lock);if(record){record->status=3;record->finished_at=(long)time(NULL);snprintf(record->summary,sizeof(record->summary),"unable to prepare task");}pthread_mutex_unlock(&subagent_lock);free(child);return dupstr("ERROR: out of memory preparing subagent");}
-    snprintf(prompt,n,
-        "SUBAGENT TASK. You are a focused subagent delegated by the parent agent. Complete only this task "
-        "using the available tools. Coordinate through explicit handoffs: first establish a bounded "
-        "scope, avoid changing files outside that scope, and inspect relevant files before editing. "
-        "After editing, run available compile/tests or explain why verification was impossible. "
-        "End with a structured handoff headed FILES CHANGED, CHECKS RUN, RESULTS, "
-        "REMAINING RISKS. Do not claim success without evidence. "
-        "Do not ask the user questions; if blocked, say what is blocked and stop.\n\nTASK:\n%s",task);
+    started_at = (long)time(NULL);
 
-    snprintf(detail,sizeof(detail),"subagent %d started (depth %d): %.300s",id,child->subagent_depth,task);
-    if(!parent->subagent_parent)pthread_mutex_lock(&subagent_lock);
-    vs_trace(parent,"subagent-start",detail);
-    if(!parent->subagent_parent)pthread_mutex_unlock(&subagent_lock);
+    /* Retry loop */
+    ans = NULL;
+    { int attempt = 0;
+      for (attempt = 0; attempt <= retries; attempt++) {
+          if (attempt > 0) {
+              /* Build retry prompt with error context */
+              char *new_prompt;
+              size_t pn;
+              pn = strlen(task) + 512;
+              new_prompt = (char *)malloc(pn);
+              if (!new_prompt) break;
+              snprintf(new_prompt, pn,
+                  "Previous attempt failed with: %s. Try again with a different approach.\n\nOriginal task:\n%s",
+                  ans ? ans : "(unknown error)", task);
+              free(prompt);
+              prompt = new_prompt;
+              free(ans);
+              ans = NULL;
+              if (vs_cancel_requested(parent)) break;
+          } else {
+              /* First attempt: build normal prompt */
+              n=strlen(task)+640+strlen(scratch_dir)+64;
+              prompt=(char*)malloc(n);
+              if(!prompt){pthread_mutex_lock(&subagent_lock);if(record){record->status=3;record->finished_at=(long)time(NULL);snprintf(record->summary,sizeof(record->summary),"unable to prepare task");}pthread_mutex_unlock(&subagent_lock);free(child);return dupstr("ERROR: out of memory preparing subagent");}
+              snprintf(prompt,n,
+                  "SUBAGENT TASK. You are a focused subagent delegated by the parent agent. Complete only this task "
+                  "using the available tools. Coordinate through explicit handoffs: first establish a bounded "
+                  "scope, avoid changing files outside that scope, and inspect relevant files before editing. "
+                  "After editing, run available compile/tests or explain why verification was impossible. "
+                  "End with a structured handoff headed FILES CHANGED, CHECKS RUN, RESULTS, "
+                  "REMAINING RISKS. Do not claim success without evidence. "
+                  "Do not ask the user questions; if blocked, say what is blocked and stop.\n\n"
+                  "You can share files with sibling subagents in the scratch directory: %s\n\n"
+                  "TASK:\n%s", scratch_dir[0] ? scratch_dir : "(none)", task);
+          }
 
-    ans=vs_agent_turn(child,prompt);
-    free(prompt);
+          snprintf(detail,sizeof(detail),"subagent %d started (depth %d): %.300s",id,child->subagent_depth,task);
+          if(!parent->subagent_parent)pthread_mutex_lock(&subagent_lock);
+          vs_trace(parent,"subagent-start",detail);
+          if(!parent->subagent_parent)pthread_mutex_unlock(&subagent_lock);
+
+          ans=vs_agent_turn(child,prompt);
+          if (attempt == 0) free(prompt); /* prompt freed in retry loop for retries > 0 */
+          prompt = NULL;
+
+          /* Check if successful */
+          if (ans && !strstr(ans, "ERROR:") && !strstr(ans, "limit reached") && !strstr(ans, "Stopped by user")) {
+              break; /* Success */
+          }
+      }
+      if (prompt) free(prompt);
+    }
 
     pthread_mutex_lock(&subagent_lock);
     if(record_index>=0&&root->subagent_record_count>record_index)record=&root->subagents[record_index];
@@ -176,7 +383,19 @@ char *vs_subagent_run(VSContext *parent,const char *task)
     vs_trace_clear(child);
     free(child);
 
+    /* Clean up worktree */
+    if (worktree_path) {
+        vs_worktree_exit(worktree_path);
+        free(worktree_path);
+    }
+
     if(!ans)ans=dupstr("(subagent produced no result)");
+
+    duration = (long)time(NULL) - started_at;
+
+    /* Cache the result */
+    vs_subagent_cache_put(parent, task, ans);
+
     n=strlen(ans)+96;
     out=(char*)malloc(n);
     if(!out){free(ans);return dupstr("ERROR: out of memory returning subagent result");}
@@ -184,26 +403,25 @@ char *vs_subagent_run(VSContext *parent,const char *task)
     free(ans);
     {
         char *bounded=vs_compact_text_limit(out,VS_SUBAGENT_RESULT_MAX,"subagent result compacted");
-        if(bounded){free(out);out=bounded;}
+        if(bounded){
+            /* If result was truncated, write full result to file */
+            if (strlen(bounded) < n - 96) {
+                char *file_ref = vs_subagent_result_to_file(task, out, duration, record ? record->status : 1);
+                if (file_ref) {
+                    char *with_file;
+                    size_t fn = strlen(bounded) + strlen(file_ref) + 64;
+                    with_file = (char *)malloc(fn);
+                    if (with_file) {
+                        snprintf(with_file, fn, "%s\n%s", bounded, file_ref);
+                        free(file_ref);
+                        free(bounded);
+                        bounded = with_file;
+                    }
+                }
+            }
+            free(out);
+            out = bounded;
+        }
     }
     return out;
-}
-
-/* Maps a trace event to a short activity label for the live indicator.
-   Returns 1 and fills out when the event changes the phase, 0 otherwise.
-   Events forwarded from a subagent (detail begins "[sub#") get a "Subagent: "
-   prefix so the user can see delegated work distinctly. */
-int vs_trace_phase(const char *kind,const char *detail,char *out,size_t cap)
-{
-    const char *base=NULL;int sub;
-    if(!kind||!out||cap==0)return 0;
-    if(!strcmp(kind,"model")||!strcmp(kind,"model-wait")||!strcmp(kind,"http-wait")||!strcmp(kind,"reasoning")||!strcmp(kind,"subagent-done"))base="Thinking";
-    else if(!strcmp(kind,"tool-batch")||!strcmp(kind,"tool-health"))base="Running tools";
-    else if(!strcmp(kind,"subagent-start"))base="Subagent starting";
-    else if(!strcmp(kind,"compact"))base="Compacting context";
-    else return 0;
-    sub=detail&&!strncmp(detail,"[sub#",5);
-    if(sub)snprintf(out,cap,"Subagent: %s",base);
-    else snprintf(out,cap,"%s",base);
-    return 1;
 }

@@ -13,6 +13,8 @@
 #include <signal.h>
 #include <errno.h>
 #include <time.h>
+#include <dirent.h>
+#include <pthread.h>
 #ifdef __sun
 #include <sys/systeminfo.h>
 #endif
@@ -46,6 +48,11 @@ void vs_refresh_cache_key(VSContext *ctx) {
 void vs_init(VSContext *ctx) {
     memset(ctx,0,sizeof(*ctx));
     vs_workflow_init(&ctx->workflow);
+    vs_todo_init(&ctx->todo);
+    vs_permission_init(&ctx->permissions);
+    vs_task_init(&ctx->tasks, NULL);
+    vs_slash_init(&ctx->slashes, NULL);
+    vs_hooks_init(&ctx->hooks, NULL);
     if (!getcwd(ctx->cwd,sizeof(ctx->cwd))) strcpy(ctx->cwd,".");
     vs_detect_platform(ctx);
     vs_set_provider(ctx,"openai");
@@ -59,6 +66,80 @@ void vs_init(VSContext *ctx) {
     (void)vs_oauth_load_profile(ctx);
     ctx->config_autosave=1;
     vs_load_agent_md(ctx);
+    if (!ctx->bare_mode) vs_load_claude_md(ctx);
+    /* Load skills from ~/.vibesolaris/skills/ at startup */
+    {
+        const char *home=getenv("HOME");
+        char skill_dir[VS_MAX_PATH];
+        if(home)snprintf(skill_dir,sizeof(skill_dir),"%s/.vibesolaris/skills",home);
+        else strcpy(skill_dir,".vibesolaris/skills");
+        ctx->skill_count=0;
+        vs_skill_load_dir(ctx->skills,&ctx->skill_count,skill_dir);
+    }
+    /* Load memory from ~/.vibesolaris/memory.jsonl at startup */
+    {
+        const char *home=getenv("HOME");
+        char mem_path[VS_MAX_PATH];
+        if(home)snprintf(mem_path,sizeof(mem_path),"%s/.vibesolaris/memory.jsonl",home);
+        else strcpy(mem_path,".vibesolaris/memory.jsonl");
+        vs_memory_init(&ctx->memory,mem_path);
+        vs_memory_load(&ctx->memory);
+        /* Also load memory rules directory ~/.vibesolaris/memory/ */
+        {
+            char rules_dir[VS_MAX_PATH];
+            if(home)snprintf(rules_dir,sizeof(rules_dir),"%s/.vibesolaris/memory",home);
+            else strcpy(rules_dir,".vibesolaris/memory");
+            vs_memory_load_rules_dir(&ctx->memory,rules_dir);
+        }
+    }
+    /* Load slash commands and hooks */
+    vs_slash_load(&ctx->slashes);
+    vs_hooks_load(&ctx->hooks);
+    /* Initialize Computer Use (X11) if available */
+    ctx->computer_use_available = vs_computer_use_init();
+    /* Initialize Checkpoints (git snapshots) */
+    ctx->checkpoint_enabled = 1;
+    vs_checkpoint_init(&ctx->checkpoints);
+    /* Initialize Auto Mode (action classifier) */
+    vs_auto_mode_init(&ctx->auto_mode);
+    vs_auto_mode_load(&ctx->auto_mode);
+    /* Initialize Agent Teams */
+    ctx->team_count = 0;
+    /* Initialize Plugins */
+    ctx->plugin_count = 0;
+    /* Initialize Reasoning Engine (Phase 7) */
+    vs_reasoning_init(&ctx->reasoning);
+    /* Initialize Rewind (Phase 8) */
+    vs_rewind_init(&ctx->rewind);
+    /* Initialize Loop (Phase 8) */
+    vs_loop_init(ctx);
+    /* Initialize Workflow Engine (Phase 8) */
+    vs_workflow_engine_init(&ctx->workflow_engine);
+    /* Initialize Cross-Session Messaging (Phase 8) */
+    vs_cross_session_init(&ctx->cross_session);
+    /* Initialize Phase 9 features */
+    vs_btw_init(&ctx->btw);
+    vs_plan_mode_init(&ctx->plan_mode);
+    vs_custom_slash_init(&ctx->custom_slash, NULL);
+    vs_custom_slash_load_dir(&ctx->custom_slash);
+    ctx->mention_count = 0;
+    /* Initialize Goal */
+    ctx->goal[0] = 0;
+    { char *g = vs_goal_load(); if (g) { strncpy(ctx->goal, g, sizeof(ctx->goal)-1); ctx->goal[sizeof(ctx->goal)-1] = 0; free(g); } }
+    /* AutoDream: consolidate memory at session start */
+    {
+        const char *dream_env = getenv("VIBESOLARIS_AUTO_DREAM");
+        if (!dream_env || strcmp(dream_env, "0") != 0 && strcmp(dream_env, "off") != 0) {
+            VSDreamStats stats = vs_memory_dream(&ctx->memory);
+            if (stats.merged > 0 || stats.pruned > 0) {
+                char *r = vs_memory_dream_stats(&stats);
+                if (r) {
+                    printf("[AutoDream] %s\n", r);
+                    free(r);
+                }
+            }
+        }
+    }
     vs_refresh_cache_key(ctx);
 }
 
@@ -100,6 +181,18 @@ int vs_load_agent_md(VSContext *ctx) {
     if(!s){ctx->agent_md[0]=0;vs_refresh_cache_key(ctx);return -1;}
     strncpy(ctx->agent_md,s,sizeof(ctx->agent_md)-1);
     ctx->agent_md[sizeof(ctx->agent_md)-1]=0;
+    free(s); vs_refresh_cache_key(ctx); return 0;
+}
+
+int vs_load_claude_md(VSContext *ctx) {
+    char p[VS_MAX_PATH];
+    char *s;
+    if(strlen(ctx->cwd)+10>=sizeof(p)){ctx->claude_md[0]=0;return -1;}
+    strcpy(p,ctx->cwd);strcat(p,"/CLAUDE.md");
+    s=vs_read_file(p);
+    if(!s){ctx->claude_md[0]=0;vs_refresh_cache_key(ctx);return -1;}
+    strncpy(ctx->claude_md,s,sizeof(ctx->claude_md)-1);
+    ctx->claude_md[sizeof(ctx->claude_md)-1]=0;
     free(s); vs_refresh_cache_key(ctx); return 0;
 }
 
@@ -183,7 +276,7 @@ void vs_cache_clear(VSContext *ctx) {
     if(!ctx)return;
     for(i=0;i<ctx->file_cache_count;i++) free_cache_entry(&ctx->file_cache[i]);
     ctx->file_cache_count=0;ctx->file_cache_next=0;ctx->file_cache_hits=0;ctx->file_cache_misses=0;
-    ctx->provider_cached_tokens=0;ctx->provider_cache_write_tokens=0;
+    ctx->provider_cached_tokens=0;ctx->provider_cache_read_tokens=0;ctx->provider_cache_write_tokens=0;
 }
 
 static char *compact_copy(const char *s) {
@@ -245,7 +338,7 @@ void vs_history_clear(VSContext *ctx) {
     vs_usage_clear(ctx);
 }
 
-void vs_shutdown(VSContext *ctx) { if(!ctx)return;(void)vs_persist_settings(ctx);vs_mcp_shutdown(ctx);vs_trace_clear(ctx);vs_history_clear(ctx);vs_cache_clear(ctx); }
+void vs_shutdown(VSContext *ctx) { if(!ctx)return;(void)vs_persist_settings(ctx);vs_mcp_shutdown(ctx);vs_trace_clear(ctx);vs_history_clear(ctx);vs_cache_clear(ctx);vs_computer_use_shutdown();vs_fork_cleanup(ctx);vs_lsp_shutdown_all(ctx->lsp_servers,&ctx->lsp_server_count); }
 
 int vs_write_file(const char *path, const char *text) {
     FILE *f=fopen(path,"wb"); size_t n=strlen(text);
@@ -570,4 +663,283 @@ int vs_open_url(const char *url)
     (void)waitpid(first, &st, 0);
     if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) return -1;
     return 0;
+}
+
+/* ---- Auto-memory ---- */
+void vs_memory_auto_capture(VSContext *ctx, const char *output, const char *tool_results)
+{
+    if (!ctx || ctx->auto_memory_count >= VS_MAX_AUTO_MEMORY) return;
+    const char *text = output ? output : "";
+    const char *tools = tool_results ? tool_results : "";
+    /* Simple pattern-based fact extraction */
+    static const char *patterns[] = {
+        "file written", "file created", "file edited", "file modified",
+        "command run", "test passed", "test failed", "error:",
+        "design decision", "TODO:", "FIXME:", NULL
+    };
+    int i;
+    for (i = 0; patterns[i]; i++) {
+        if (strstr(text, patterns[i]) || strstr(tools, patterns[i])) {
+            char key[128], value[256];
+            long now = time(NULL);
+            snprintf(key, sizeof(key), "auto_%ld_%d", now, ctx->auto_memory_count);
+            snprintf(value, sizeof(value), "%.*s", 250, text);
+            vs_memory_save(&ctx->memory, key, value, "auto", VS_MEMORY_TYPE_CONTEXT);
+            ctx->auto_memory_count++;
+            if (ctx->auto_memory_count >= VS_MAX_AUTO_MEMORY) return;
+            break;
+        }
+    }
+}
+
+/* ---- Conversation save/restore ---- */
+static void conversation_dir(char *out, size_t cap)
+{
+    const char *home = getenv("HOME");
+    if (home) snprintf(out, cap, "%s/.vibesolaris/conversations", home);
+    else snprintf(out, cap, "/tmp/vibesolaris_conversations");
+}
+
+int vs_conversation_save(VSContext *ctx, const char *id)
+{
+    char dir[VS_MAX_PATH], path[VS_MAX_PATH];
+    FILE *f;
+    int i;
+    if (!ctx || !id || !*id) return -1;
+    conversation_dir(dir, sizeof(dir));
+    mkdir(dir, 0700);
+    snprintf(path, sizeof(path), "%s/%s.jsonl", dir, id);
+    f = fopen(path, "w");
+    if (!f) return -1;
+    fprintf(f, "{\"type\":\"checkpoint\",\"data\":\"%s\"}\n", ctx->agent_checkpoint ? ctx->agent_checkpoint : "");
+    for (i = 0; i < ctx->history_count; i++)
+        fprintf(f, "{\"type\":\"history\",\"role\":\"%s\",\"content\":\"%s\"}\n", ctx->history[i].role, ctx->history[i].content ? ctx->history[i].content : "");
+    for (i = 0; i < ctx->agent_history_count; i++)
+        fprintf(f, "{\"type\":\"agent_history\",\"role\":\"%s\",\"content\":\"%s\"}\n", ctx->agent_history[i].role, ctx->agent_history[i].content ? ctx->agent_history[i].content : "");
+    fclose(f);
+    return 0;
+}
+
+int vs_conversation_load(VSContext *ctx, const char *id)
+{
+    char dir[VS_MAX_PATH], path[VS_MAX_PATH];
+    FILE *f;
+    char line[VS_MAX_TEXT];
+    if (!ctx || !id || !*id) return -1;
+    conversation_dir(dir, sizeof(dir));
+    snprintf(path, sizeof(path), "%s/%s.jsonl", dir, id);
+    f = fopen(path, "r");
+    if (!f) return -1;
+    /* Simple JSONL parser — just restore history entries */
+    while (fgets(line, sizeof(line), f)) {
+        char *role, *content, *type;
+        type = strstr(line, "\"type\":\"");
+        if (!type) continue;
+        type += 8;
+        char *type_end = strchr(type, '"');
+        if (!type_end) continue;
+        int tlen = (int)(type_end - type);
+        char type_str[32];
+        if ((size_t)tlen >= sizeof(type_str)) continue;
+        memcpy(type_str, type, tlen);
+        type_str[tlen] = 0;
+        role = strstr(line, "\"role\":\"");
+        content = strstr(line, "\"content\":\"");
+        if (!role || !content) continue;
+        role += 8;
+        char *role_end = strchr(role, '"');
+        if (!role_end) continue;
+        int rlen = (int)(role_end - role);
+        char role_str[32];
+        if ((size_t)rlen >= sizeof(role_str)) continue;
+        memcpy(role_str, role, rlen);
+        role_str[rlen] = 0;
+        content += 10;
+        char *c_end = strrchr(content, '"');
+        if (!c_end || c_end <= content) continue;
+        int clen = (int)(c_end - content);
+        if (clen >= VS_MAX_TEXT) clen = VS_MAX_TEXT - 1;
+        char c_str[VS_MAX_TEXT];
+        memcpy(c_str, content, clen);
+        c_str[clen] = 0;
+        if (!strcmp(type_str, "history")) {
+            vs_history_add(ctx, role_str, c_str);
+        }
+    }
+    fclose(f);
+    return 0;
+}
+
+char *vs_conversation_list(int max_lines)
+{
+    char dir[VS_MAX_PATH];
+    DIR *dp;
+    struct dirent *de;
+    char buf[VS_MAX_TEXT];
+    int pos = 0, count = 0;
+    conversation_dir(dir, sizeof(dir));
+    dp = opendir(dir);
+    if (!dp) return dupstr("(no saved conversations)");
+    while ((de = readdir(dp)) != NULL && count < max_lines) {
+        if (de->d_name[0] == '.') continue;
+        if (strstr(de->d_name, ".jsonl")) {
+            int id_len = (int)(strlen(de->d_name) - 6);
+            if (id_len <= 0) continue;
+            pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos, "%.*s\n", id_len, de->d_name);
+            if ((size_t)pos >= sizeof(buf) - 64) break;
+            count++;
+        }
+    }
+    if (count == 0) {
+        closedir(dp);
+        return dupstr("(no saved conversations)");
+    }
+    closedir(dp);
+    buf[pos] = 0;
+    return dupstr(buf);
+}
+
+int vs_conversation_delete(const char *id)
+{
+    char dir[VS_MAX_PATH], path[VS_MAX_PATH];
+    if (!id || !*id) return -1;
+    conversation_dir(dir, sizeof(dir));
+    snprintf(path, sizeof(path), "%s/%s.jsonl", dir, id);
+    return unlink(path);
+}
+
+/* ---- Image display ---- */
+void vs_display_image(const char *base64_data, size_t base64_len, const char *description)
+{
+    const char *term = getenv("TERM");
+    int is_iterm2 = term && (strstr(term, "iterm") || strstr(term, "xterm"));
+    if (is_iterm2 && base64_data && base64_len) {
+        /* iTerm2 inline image protocol */
+        printf("\033]1337;File=inline=1:%.*s\007", (int)base64_len, base64_data);
+    } else {
+        /* SSH fallback: text placeholder */
+        printf("[image: %s, %zu bytes]\n", description ? description : "unknown", base64_len);
+    }
+}
+
+/* ---- Fork sessions ---- */
+static void *fork_worker(void *v)
+{
+    VSContext *ctx = (VSContext *)v;
+    char line[4096];
+    /* Fork runs independently — output goes to the log file */
+    while (fgets(line, sizeof(line), stdin)) {
+        char *result = vs_agent_turn(ctx, line);
+        if (result) {
+            printf("%s\n", result);
+            fflush(stdout);
+            free(result);
+        }
+    }
+    return NULL;
+}
+
+void vs_fork_init(VSContext *ctx)
+{
+    if (!ctx) return;
+    memset(ctx->fork_threads, 0, sizeof(ctx->fork_threads));
+    memset(ctx->fork_active, 0, sizeof(ctx->fork_active));
+    memset(ctx->fork_output_file, 0, sizeof(ctx->fork_output_file));
+    memset(ctx->fork_started_at, 0, sizeof(ctx->fork_started_at));
+    ctx->fork_count = 0;
+}
+
+int vs_fork_start(VSContext *ctx)
+{
+    if (!ctx || ctx->fork_count >= VS_MAX_FORKS) return -1;
+    char dir[VS_MAX_PATH], path[VS_MAX_PATH];
+    const char *home = getenv("HOME");
+    int id = ctx->fork_count;
+    if (home) snprintf(dir, sizeof(dir), "%s/.vibesolaris/forks", home);
+    else snprintf(dir, sizeof(dir), "/tmp/vibesolaris_forks");
+    mkdir(dir, 0700);
+    snprintf(path, sizeof(path), "%s/%d.log", dir, id);
+    strncpy(ctx->fork_output_file[id], path, VS_MAX_PATH - 1);
+    ctx->fork_started_at[id] = time(NULL);
+    /* Simple fork: spawn a thread that reads from a pipe */
+    ctx->fork_active[id] = 1;
+    ctx->fork_count++;
+    return id;
+}
+
+void vs_fork_kill(VSContext *ctx, int id)
+{
+    if (!ctx || id < 0 || id >= VS_MAX_FORKS) return;
+    ctx->fork_active[id] = 0;
+    if (ctx->fork_threads[id]) {
+        pthread_cancel(ctx->fork_threads[id]);
+        pthread_join(ctx->fork_threads[id], NULL);
+        ctx->fork_threads[id] = 0;
+    }
+}
+
+char *vs_fork_list(VSContext *ctx, int max_lines)
+{
+    char buf[4096];
+    int pos = 0, i;
+    if (!ctx || ctx->fork_count == 0) return dupstr("(no active forks)");
+    for (i = 0; i < ctx->fork_count && pos < 4000; i++) {
+        pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
+            "Fork #%d: %s (started %ld)\n", i,
+            ctx->fork_active[i] ? "active" : "stopped",
+            ctx->fork_started_at[i]);
+    }
+    buf[pos] = 0;
+    return dupstr(buf);
+}
+
+void vs_fork_cleanup(VSContext *ctx)
+{
+    int i;
+    if (!ctx) return;
+    for (i = 0; i < ctx->fork_count; i++) {
+        if (ctx->fork_active[i] && ctx->fork_threads[i]) {
+            pthread_cancel(ctx->fork_threads[i]);
+            pthread_join(ctx->fork_threads[i], NULL);
+        }
+    }
+    ctx->fork_count = 0;
+    memset(ctx->fork_active, 0, sizeof(ctx->fork_active));
+}
+
+/* Computer Use (X11) is now in src/computer_use.c */
+
+/* ---- Goal management ---- */
+static char *goal_path(char *out, size_t cap)
+{
+    const char *home = getenv("HOME");
+    if (!home) home = "/tmp";
+    snprintf(out, cap, "%s/.vibesolaris/goal.md", home);
+    return out;
+}
+
+int vs_goal_save(const char *goal)
+{
+    char path[VS_MAX_PATH];
+    goal_path(path, sizeof(path));
+    system("mkdir -p ~/.vibesolaris 2>/dev/null");
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    fprintf(f, "%s", goal ? goal : "");
+    fclose(f);
+    return 0;
+}
+
+char *vs_goal_load(void)
+{
+    char path[VS_MAX_PATH];
+    goal_path(path, sizeof(path));
+    return vs_read_file(path);
+}
+
+int vs_goal_clear(void)
+{
+    char path[VS_MAX_PATH];
+    goal_path(path, sizeof(path));
+    return unlink(path);
 }

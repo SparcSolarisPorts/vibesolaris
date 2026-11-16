@@ -49,6 +49,12 @@ int main(void){
     /* 1. official endpoint + Claude OAuth session => bearer, no x-api-key */
     setup("https://api.anthropic.com/v1/messages","sk-ant-api-key",1);
     out=vs_chat(&ctx,"hello");CHECK(out!=NULL,"chat completes with Claude OAuth");free(out);
+    CHECK(strstr(last_body,"Read-only inspection")!=NULL,"system prompt permits read-only inspection without task_id");
+    CHECK(strstr(last_body,"PLANNING DEPTH:")!=NULL && strstr(last_body,"failure modes and concrete verification")!=NULL,"prompt asks for detailed planning and verification");
+    CHECK(strstr(last_body,"batches consisting only of multiple subagent directives run concurrently")!=NULL,"prompt describes parallel subagent batches");
+    CHECK(strstr(last_body,"same ready task_id")!=NULL && strstr(last_body,"manual mode permits only one directive")!=NULL,"prompt describes batch safety requirements");
+    CHECK(strstr(last_body,"may share the filesystem")!=NULL && strstr(last_body,"avoid overlapping concurrent writes")!=NULL,"prompt warns about shared filesystem writes");
+    CHECK(strstr(last_body,"VS_TOOL read task_id")==NULL,"read-only example does not require task_id");
     CHECK(strstr(last_headers,"Authorization: Bearer CLAUDE-OAUTH-TOKEN")!=NULL,"official endpoint uses Claude OAuth bearer");
     CHECK(strstr(last_headers,"x-api-key")==NULL,"OAuth session does not also send x-api-key");
     CHECK(strstr(last_headers,"OPENAI-OAUTH-TOKEN")==NULL,"OpenAI OAuth token is never sent to Claude");

@@ -272,7 +272,7 @@ static int preflight_batch(VSContext *c,const char *answer,int *count_out){
         if(authorized){char *id_s=attr(d,"task_id"),*ep=NULL;long id=0;int valid=0,k;
             if(!id_s){free(d);return -6;}
             id=strtol(id_s,&ep,10);if(ep==id_s||*ep||id<=0||id>2147483647L){free(id_s);free(d);return -6;}
-            if(!vs_workflow_task_ready(&c->workflow,(int)id)){free(id_s);free(d);return -7;}
+            if(!vs_workflow_task_ready(&c->workflow,(int)id) && strncmp(d,"plan_task_complete ",strlen("plan_task_complete "))){free(id_s);free(d);return -7;}
             for(k=0;k<c->workflow.task_count;k++)if(c->workflow.tasks[k].id==(int)id){valid=1;break;}
             if(valid)staged_task=(int)id;
             free(id_s);

@@ -33,6 +33,9 @@ static int tui_colour_mode = -1; /* -1 auto, 0 never, 1 always */
 static VSContext *tui_active_ctx = NULL;
 static pthread_mutex_t spin_mutex=PTHREAD_MUTEX_INITIALIZER;
 static void cprintf(const char *colour,const char *fmt,...);
+static void successf(const char *fmt,...);
+static void warnf(const char *fmt,...);
+static void errorf(const char *fmt,...);
 static int tui_effort = 0; /* 0 default, 1 low, 2 medium, 3 high */
 static int tui_output_mode = 0; /* 0 compact, 1 normal, 2 full */
 
@@ -49,7 +52,31 @@ static const char *tui_completions[] = {
     "/cache status","/cache on","/cache off","/cache clear","/history status","/history clear",
     "/globalconfig status","/globalconfig load","/globalconfig save","/saveconfig ",
     "/mcp list","/mcp refresh","/mcp tools","/mcp add-stdio ","/mcp add-http ","/mcp remove ",
-    "/colour auto","/colour on","/colour off","/colour status","/mode auto","/mode plan","/mode manual","/mode status","/plan","/plan accept","/plan approve-action","/plan reject","/plan revise",NULL
+    "/colour auto","/colour on","/colour off","/colour status","/mode auto","/mode plan","/mode manual","/mode status","/plan","/plan accept","/plan approve-action","/plan reject","/plan revise",
+     "/permission list","/permission allow ","/permission deny ","/tasks list","/tasks search ","/tasks create ","/skills list","/memory list","/memory search ","/memory save ","/context","/compact","/checkpoint create","/checkpoint rollback","/checkpoint list","/dream","/dream off","/tui fullscreen","/tui prompt",
+    "/auto-mode on","/auto-mode off","/auto-mode status","/auto-mode rules",
+    "/team create ","/team add ","/team list","/team shutdown ",
+    "/cost","/clear","/export","/export ","/doctor","/bashes","/hooks","/hooks list","/rename ",
+    "/plugin install ","/plugin list","/plugin uninstall ",
+    "/review ","/goal set ","/goal show","/goal clear","/init ","/pause",
+    "/style compact","/style verbose","/style default","/keybindings",
+    "/worktree ","/worktree-exit","/config","/config layer",
+    "/search ","/search-next","/search-prev","/search-exit",
+    "/reason ","/reason on","/reason off","/reason depth",
+    "/rewind","/rewind 1","/rewind 2","/rewind mark ","/rewind to ","/rewind list",
+    "/security-review ","/security-review . staged",
+    "/loop start ","/loop stop ","/loop list",
+    "/workflow run ","/workflow status",
+    "/sessions list","/sessions send ","/sessions inbox",
+    "/btw ","/btw list","/btw clear",
+    "/plan on","/plan off","/plan status",
+    "/model ","/model list",
+    "/branch ","/branch list",
+    "/diff","/diff staged",
+    "/commit","/commit generate",
+    "/pr ","/pr generate",
+    "/custom-commands list",
+    "/effort low","/effort medium","/effort high","/effort xhigh","/effort max","/effort ultracode",NULL
 };
 
 static unsigned long count_lines(const char *s)
@@ -63,8 +90,18 @@ static void one_line_preview(const char *s,char *out,size_t cap,size_t maxchars)
     while(*s&&n+1<cap&&n<maxchars){unsigned char c=(unsigned char)*s++;if(c=='\n'||c=='\r'||c=='\t'||c==' '){space=1;continue;}if(space&&n&&n+1<cap)out[n++]=' ';space=0;if(c<32||c==127)c='?';out[n++]=(char)c;}out[n]=0;
 }
 
+static void tui_print_bounded(const char *,size_t,size_t);
+
+static int tui_is_error_detail(const char *kind,const char *detail)
+{
+    if(kind && (!strcmp(kind,"tool-error") || !strcmp(kind,"error") || !strcmp(kind,"directive-error")))return 1;
+    if(!detail)return 0;
+    return !strncmp(detail,"ERROR:",6) || strstr(detail,"\nERROR:") != NULL || strstr(detail,"malformed") != NULL;
+}
+
 static void tui_print_detail(const char *kind,const char *detail)
 {
+    if(tui_is_error_detail(kind,detail)){tui_print_bounded(detail,4096U,4096U);return;}
     size_t bytes=detail?strlen(detail):0;unsigned long lines=count_lines(detail);char preview[320];char *q;
     if(!detail)detail="";
     if(tui_output_mode>=2){printf("%s",detail);if(bytes&&detail[bytes-1]!='\n')putchar('\n');return;}
@@ -358,6 +395,8 @@ static int tui_read_line(char *buf,size_t cap)
         if(ch==4){if(len==0){tui_clear_popup(popup_rows);fputs("\033[?2004l",stdout);tcsetattr(STDIN_FILENO,TCSAFLUSH,&oldt);return 0;}continue;}
         if(ch=='\n'){if(len+1<cap){memmove(buf+cursor+1,buf+cursor,len-cursor+1);buf[cursor++]='\n';len++;slash_dismissed=1;tui_redraw_cursor(buf,cursor);}else fputc('\a',stdout);continue;}
         if(ch==127||ch==8){if(cursor){size_t prev=tui_prev_char(buf,cursor);memmove(buf+prev,buf+cursor,len-cursor+1);len-=cursor-prev;cursor=prev;slash_selected=0;slash_dismissed=0;tui_redraw_editor(buf,cursor,slash_selected,slash_dismissed,&popup_rows);}continue;}
+        if(ch==20){/* Ctrl+T: show tasks list */if(tui_active_ctx){char *r=vs_task_list(&tui_active_ctx->tasks,64);if(r){cprintf(T_BOLD T_BLUE,"\nTasks\n");printf("%s\n",r);free(r);}else warnf("No tasks.\n");}else warnf("No active context.\n");continue;}
+        if(ch==18){/* Ctrl+R: checkpoint rollback */if(tui_active_ctx){int rc=vs_checkpoint_rollback(&tui_active_ctx->checkpoints,NULL);if(rc==0)successf("Rolled back to previous checkpoint\n");else errorf("No checkpoint to rollback\n");}else errorf("No active context.\n");continue;}
         if(ch==21){buf[0]=0;len=cursor=0;browsing=0;slash_selected=0;slash_dismissed=0;tui_redraw_editor(buf,cursor,slash_selected,slash_dismissed,&popup_rows);continue;}
         if(ch==23){size_t start=cursor;while(start>0&&buf[start-1]==' ')start--;while(start>0&&buf[start-1]!=' ')start=tui_prev_char(buf,start);memmove(buf+start,buf+cursor,len-cursor+1);len-=cursor-start;cursor=start;slash_selected=0;slash_dismissed=0;tui_redraw_editor(buf,cursor,slash_selected,slash_dismissed,&popup_rows);continue;}
         if(ch==1){cursor=0;slash_dismissed=1;tui_redraw_cursor(buf,cursor);continue;}if(ch==5){cursor=len;slash_dismissed=0;tui_redraw_editor(buf,cursor,slash_selected,slash_dismissed,&popup_rows);continue;}
@@ -665,6 +704,10 @@ static char *tui_run_agent(VSContext *c,const char *prompt,const char *heading,i
     pthread_mutex_lock(&spin_mutex);
     spin_erase_locked();
     tui_stream_render_final_locked(answer,cancelled);
+    if(cancelled)printf("\n[Agent stopped by user.]\n");
+    else if(c->pending_question)printf("\n[Agent is waiting for your answer.]\n");
+    else printf("\n[Agent turn finished.]\n");
+    fflush(stdout);
     pthread_mutex_unlock(&spin_mutex);
     return answer;
 }
@@ -795,8 +838,72 @@ static void help(void)
     cprintf(T_CYAN,"  /output compact|normal|full   ");printf("control how much command/trace output is painted to the terminal\n");
     cprintf(T_DIM,"  Tab completes slash commands and relative paths; Up/Down recalls history (draft restored). Ctrl+J inserts a newline; Enter submits.\n");
     cprintf(T_DIM,"  Ctrl+A/E moves to start/end; Ctrl+U clears input; Ctrl+L clears the screen.\n");
+    cprintf(T_DIM,"  Ctrl+T shows tasks; Ctrl+R rolls back checkpoint; Shift+Tab cycles mode.\n");
+    cprintf(T_CYAN,"  /permission list|allow|deny   ");printf("tool-level permission rules\n");
+    cprintf(T_CYAN,"  /tasks list|search|create     ");printf("cross-session task management\n");
+    cprintf(T_CYAN,"  /skills list                  ");printf("list loaded skills\n");
+    cprintf(T_CYAN,"  /memory list|search|save      ");printf("persistent memory\n");
+    cprintf(T_CYAN,"  /checkpoint create|rollback|list");printf("git snapshot before edits\n");
+    cprintf(T_CYAN,"  /dream                        ");printf("memory consolidation (AutoDream)\n");
+    cprintf(T_CYAN,"  /context                      ");printf("show context window usage\n");
+    cprintf(T_CYAN,"  /compact                      ");printf("force context compaction\n");
+    cprintf(T_CYAN,"  /tui fullscreen|prompt        ");printf("switch TUI display mode\n");
+    cprintf(T_BOLD T_BLUE,"\nAdvanced features\n");
+    cprintf(T_CYAN,"  /auto-mode on|off|status|rules");printf("action classifier (safe/risky/blocked)\n");
+    cprintf(T_CYAN,"  /team create NAME             ");printf("create agent team\n");
+    cprintf(T_CYAN,"  /team add TEAM ROLE           ");printf("add agent to team\n");
+    cprintf(T_CYAN,"  /team list                    ");printf("list active teams\n");
+    cprintf(T_CYAN,"  /team shutdown TEAM           ");printf("shutdown team\n");
+    cprintf(T_CYAN,"  /plugin install URL           ");printf("install plugin bundle\n");
+    cprintf(T_CYAN,"  /plugin list                  ");printf("list installed plugins\n");
+    cprintf(T_CYAN,"  /plugin uninstall NAME        ");printf("remove plugin\n");
+    cprintf(T_CYAN,"  /review [path] [scope] [focus]");printf("start code review\n");
+    cprintf(T_CYAN,"  /goal set TEXT                ");printf("set persistent goal\n");
+    cprintf(T_CYAN,"  /goal show                    ");printf("show current goal\n");
+    cprintf(T_CYAN,"  /goal clear                   ");printf("clear goal\n");
+    cprintf(T_CYAN,"  /init [path]                  ");printf("auto-onboard repo (generate CLAUDE.md)\n");
+    cprintf(T_CYAN,"  /pause                        ");printf("pause session (away summary on resume)\n");
+    cprintf(T_CYAN,"  /style compact|verbose|default");printf("output style\n");
+    cprintf(T_CYAN,"  /keybindings                  ");printf("show custom keybindings\n");
+    cprintf(T_CYAN,"  /worktree [path]              ");printf("enter/exit worktree directory\n");
+    cprintf(T_CYAN,"  /config [key] [value]         ");printf("view/set multi-layer settings\n");
+    cprintf(T_CYAN,"  /search QUERY                 ");printf("search scrollback buffer\n");
+    cprintf(T_CYAN,"  /search-next                  ");printf("jump to next search result\n");
+    cprintf(T_CYAN,"  /search-prev                  ");printf("jump to previous search result\n");
+    cprintf(T_CYAN,"  /search-exit                  ");printf("exit search mode\n");
+    cprintf(T_CYAN,"  /config layer                 ");printf("show settings layers\n");
+    cprintf(T_CYAN,"  /reason [QUERY]               ");printf("analyze a task with reasoning engine\n");
+    cprintf(T_CYAN,"  /reason on|off                ");printf("enable/disable reasoning\n");
+    cprintf(T_CYAN,"  /reason depth [1-3]           ");printf("set reasoning depth\n");
+    cprintf(T_CYAN,"  /rewind [N]                   ");printf("undo last N conversation messages\n");
+    cprintf(T_CYAN,"  /rewind mark LABEL            ");printf("set a rewind marker\n");
+    cprintf(T_CYAN,"  /rewind to LABEL              ");printf("rewind to a named marker\n");
+    cprintf(T_CYAN,"  /rewind list                  ");printf("show rewind state\n");
+    cprintf(T_CYAN,"  /security-review [path] [scope]");printf("scan for vulnerabilities\n");
+    cprintf(T_CYAN,"  /loop start PROMPT INTERVAL  ");printf("start recurring prompt (seconds)\n");
+    cprintf(T_CYAN,"  /loop stop [ID]              ");printf("stop a loop by ID\n");
+    cprintf(T_CYAN,"  /loop list                   ");printf("list active loops\n");
+    cprintf(T_CYAN,"  /workflow run FILE            ");printf("execute a JSON workflow file\n");
+    cprintf(T_CYAN,"  /workflow status              ");printf("show workflow status\n");
+    cprintf(T_CYAN,"  /sessions list                ");printf("list other VibeSolaris sessions\n");
+    cprintf(T_CYAN,"  /sessions send PID MESSAGE    ");printf("send message to another session\n");
+    cprintf(T_CYAN,"  /sessions inbox               ");printf("show messages from other sessions\n");
+    cprintf(T_CYAN,"  /btw MESSAGE                  ");printf("side comment (doesn't pollute main thread)\n");
+    cprintf(T_CYAN,"  /btw list                     ");printf("list side comments\n");
+    cprintf(T_CYAN,"  /btw clear                    ");printf("clear side comments\n");
+    cprintf(T_CYAN,"  /plan on|off|status           ");printf("plan mode: propose without executing\n");
+    cprintf(T_CYAN,"  /model PROVIDER/MODEL         ");printf("switch model mid-session\n");
+    cprintf(T_CYAN,"  /branch NAME                  ");printf("create git branch\n");
+    cprintf(T_CYAN,"  /branch list                  ");printf("list git branches\n");
+    cprintf(T_CYAN,"  /diff [staged]                ");printf("preview staged changes\n");
+    cprintf(T_CYAN,"  /commit [generate]            ");printf("generate and run git commit\n");
+    cprintf(T_CYAN,"  /pr [BRANCH]                  ");printf("generate PR description\n");
+    cprintf(T_CYAN,"  /custom-commands list         ");printf("list custom slash commands from .md files\n");
+    cprintf(T_CYAN,"  /effort LEVEL                 ");printf("set effort: low, medium, high, xhigh, max, ultracode\n");
     cprintf(T_CYAN,"  /help                         ");printf("show this help\n");
     cprintf(T_CYAN,"  /quit                         ");printf("exit\n");
+    cprintf(T_BOLD T_BLUE,"\nShell passthrough\n");
+    cprintf(T_DIM,"  ! command args                ");printf("execute shell command directly\n");
 }
 
 static void cache_status(const VSContext *c)
@@ -894,24 +1001,53 @@ static void show_banner(const VSContext *c)
 
 int main(int argc, char **argv)
 {
-    VSContext c;
+    static VSContext c;
     /* Agent activity is interactive progress, not batch output.  Disable stdio
        buffering so terminals and pseudo-terminals never hold a run of steps. */
     setvbuf(stdout,NULL,_IONBF,0);
     char line[262144];
     int i,has_prefill=0;
     const char *config_path=NULL;
+    const char *worktree_path=NULL;
+    int resume_mode=0;
     for(i=1;i<argc;i++){
         if(!strcmp(argv[i],"--no-colour")||!strcmp(argv[i],"--no-color"))tui_colour_mode=0;
         else if(!strcmp(argv[i],"--colour")||!strcmp(argv[i],"--color"))tui_colour_mode=1;
         else if(!strcmp(argv[i],"--help")){colour_refresh();help();return 0;}
+        else if(!strcmp(argv[i],"--json")){c.json_output_mode=1;}
+        else if(!strcmp(argv[i],"--disable-slash-commands")){c.slash_commands_disabled=1;}
+        else if(!strcmp(argv[i],"--resume")){resume_mode=1;}
+        else if(!strncmp(argv[i],"--worktree=",11)){
+            worktree_path=argv[i]+11;
+        } else if(i+1<argc && !strcmp(argv[i],"--worktree")){
+            i++;worktree_path=argv[i];
+        }
         else config_path=argv[i];
+    }
+    /* Enter worktree if specified */
+    if(worktree_path){
+        c.worktree_active=1;
+        strncpy(c.worktree_path, worktree_path, sizeof(c.worktree_path)-1);
+        c.worktree_path[sizeof(c.worktree_path)-1]=0;
+        /* Change to worktree directory */
+        if(chdir(c.worktree_path)!=0){
+            fprintf(stderr,"Warning: cannot chdir to worktree %s: %s\n",c.worktree_path,strerror(errno));
+            c.worktree_active=0;
+        }
     }
     colour_refresh();
     vs_init(&c);
     vs_tui_stream_init(&tui_stream);
     if (config_path) vs_load_config(&c, config_path);
+    /* Resume mode: load previous conversation if available */
+    if(resume_mode){
+        cprintf(T_YELLOW,"Resume mode: will continue previous conversation context.\n");
+    }
     show_banner(&c);
+    /* Show worktree info if active */
+    if(c.worktree_active){
+        cprintf(T_DIM,"  Working in worktree: %s\n",c.worktree_path);
+    }
     while (1) {
         if(!has_prefill){printf("\n");tui_status(&c);tui_active_ctx=&c;if (!tui_read_line(line, sizeof(line))){tui_active_ctx=NULL;break;}tui_active_ctx=NULL;}
         has_prefill=0;
@@ -1105,10 +1241,951 @@ int main(int argc, char **argv)
             print_subagents(&c);
         } else if (!strcmp(line, "/trace") || !strcmp(line,"/trace full")) {
             int old=tui_output_mode;if(!strcmp(line,"/trace full"))tui_output_mode=2;cprintf(T_BOLD T_MAGENTA,"Activity trace\n");print_trace(&c);tui_output_mode=old;
+        } else if (!strncmp(line,"/permission ",12)) {
+            char *arg=line+12;
+            if(!strcmp(arg,"list")||!strcmp(arg,"")){
+                char *r=vs_permission_list(&c.permissions,64);
+                if(r){cprintf(T_BOLD T_BLUE,"Permission rules\n");printf("%s",r);free(r);}
+            } else if(!strncmp(arg,"allow ",6)){
+                if(vs_permission_add_rule(&c.permissions,arg+6,1)==0)successf("Permission allowed: %s\n",arg+6);
+                else errorf("Permission rule limit reached\n");
+            } else if(!strncmp(arg,"deny ",5)){
+                if(vs_permission_add_rule(&c.permissions,arg+5,0)==0)successf("Permission denied: %s\n",arg+5);
+                else errorf("Permission rule limit reached\n");
+            } else {
+                errorf("usage: /permission list|allow TOOL|deny TOOL\n");
+            }
+        } else if (!strncmp(line,"/tasks ",7)) {
+            char *arg=line+7;
+            if(!strcmp(arg,"list")||!strcmp(arg,"")){
+                char *r=vs_task_list(&c.tasks,64);
+                if(r){cprintf(T_BOLD T_BLUE,"Tasks\n");printf("%s",r);free(r);}
+            } else if(!strncmp(arg,"search ",7)){
+                char *r=vs_task_search(&c.tasks,arg+7,-1,64);
+                if(r){cprintf(T_BOLD T_BLUE,"Task search\n");printf("%s",r);free(r);}
+            } else if(!strncmp(arg,"create ",7)){
+                char *desc=strchr(arg+7,' ');
+                char title[256];
+                if(desc){
+                    size_t tlen=(size_t)(desc-(arg+7));
+                    if(tlen>=sizeof(title))tlen=sizeof(title)-1;
+                    memcpy(title,arg+7,tlen);title[tlen]=0;
+                    vs_task_create(&c.tasks,title,desc+1,VS_TASK_PRIORITY_MEDIUM);
+                    successf("Task created: %s\n",title);
+                } else {
+                    vs_task_create(&c.tasks,arg+7,"",VS_TASK_PRIORITY_MEDIUM);
+                    successf("Task created: %s\n",arg+7);
+                }
+            } else {
+                errorf("usage: /tasks list|search QUERY|create TITLE\n");
+            }
+        } else if (!strncmp(line,"/skills ",8)) {
+            char *arg=line+8;
+            VSSkill skills[VS_MAX_SKILLS];
+            int count=0;
+            const char *home=getenv("HOME");
+            char skill_dir[VS_MAX_PATH];
+            if(home)snprintf(skill_dir,sizeof(skill_dir),"%s/.vibesolaris/skills",home);
+            else strcpy(skill_dir,".vibesolaris/skills");
+            vs_skill_load_dir(skills,&count,skill_dir);
+            if(!strcmp(arg,"list")||!strcmp(arg,"")){
+                if(!count)warnf("No skills loaded from %s\n",skill_dir);
+                else {cprintf(T_BOLD T_BLUE,"Skills\n");char buf[4096];vs_skill_list(skills,count,buf,sizeof(buf));printf("%s",buf);}
+            } else {
+                errorf("usage: /skills list\n");
+            }
+        } else if (!strncmp(line,"/memory ",8)) {
+            char *arg=line+8;
+            VSMemoryStore store;
+            const char *home=getenv("HOME");
+            char mem_path[VS_MAX_PATH];
+            if(home)snprintf(mem_path,sizeof(mem_path),"%s/.vibesolaris/memory.jsonl",home);
+            else strcpy(mem_path,".vibesolaris/memory.jsonl");
+            vs_memory_init(&store,mem_path);
+            vs_memory_load(&store);
+            if(!strcmp(arg,"list")||!strcmp(arg,"")){
+                char *r=vs_memory_list(&store,64);
+                if(r){cprintf(T_BOLD T_BLUE,"Memory\n");printf("%s",r);free(r);}
+            } else if(!strncmp(arg,"search ",7)){
+                char *r=vs_memory_search(&store,arg+7,16);
+                if(r){cprintf(T_BOLD T_BLUE,"Memory search\n");printf("%s",r);free(r);}
+            } else if(!strncmp(arg,"save ",5)){
+                char *eq=strchr(arg+7,' ');
+                char key[256],val[4096];
+                if(eq){
+                    size_t klen=(size_t)(eq-(arg+7));
+                    if(klen>=sizeof(key))klen=sizeof(key)-1;
+                    memcpy(key,arg+7,klen);key[klen]=0;
+                    strncpy(val,eq+1,sizeof(val)-1);val[sizeof(val)-1]=0;
+                    if(vs_memory_save(&store,key,val,"",VS_MEMORY_TYPE_NOTE)==0){
+                        vs_memory_persist(&store);
+                        successf("Memory saved: %s\n",key);
+                    } else errorf("Memory save failed\n");
+                } else {
+                    errorf("usage: /memory save KEY VALUE\n");
+                }
+            } else {
+                errorf("usage: /memory list|search QUERY|save KEY VALUE\n");
+            }
+        } else if (!strncmp(line,"/checkpoint ",12)) {
+            char *arg=line+12;
+            if(!strcmp(arg,"create")||!strcmp(arg,"")){
+                int rc=vs_checkpoint_create(&c.checkpoints,"manual checkpoint");
+                if(rc>=0) successf("Checkpoint created: %s\n",c.checkpoints.entries[rc].id);
+                else successf("No changes to checkpoint (working tree clean)\n");
+            } else if(!strcmp(arg,"rollback")){
+                int rc=vs_checkpoint_rollback(&c.checkpoints,NULL);
+                if(rc==0) successf("Rolled back to previous checkpoint\n");
+                else errorf("No checkpoint to rollback\n");
+            } else if(!strcmp(arg,"list")){
+                char *r=vs_checkpoint_list(&c.checkpoints,16);
+                if(r){cprintf(T_BOLD T_BLUE,"Checkpoints\n");printf("%s",r);free(r);}
+            } else {
+                errorf("usage: /checkpoint create|rollback|list\n");
+            }
+        } else if (!strcmp(line,"/dream") || !strncmp(line,"/dream ",7)) {
+            char *arg = line+6;
+            if (arg && !strcmp(arg, " off")) {
+                c.auto_memory_count = -1;
+                successf("AutoDream disabled\n");
+            } else {
+                VSMemoryStore store;
+                const char *home=getenv("HOME");
+                char mem_path[VS_MAX_PATH];
+                if(home)snprintf(mem_path,sizeof(mem_path),"%s/.vibesolaris/memory.jsonl",home);
+                else strcpy(mem_path,".vibesolaris/memory.jsonl");
+                vs_memory_init(&store,mem_path);
+                vs_memory_load(&store);
+                VSDreamStats stats = vs_memory_dream(&store);
+                char *r = vs_memory_dream_stats(&stats);
+                if(r){cprintf(T_BOLD T_BLUE,"AutoDream\n");printf("%s\n",r);free(r);}
+            }
+        } else if (!strcmp(line,"/context")) {
+            int window = vs_provider_context_window(&c.provider);
+            long est = vs_estimate_request_tokens(&c, "");
+            int pct = window > 0 ? (int)(est * 100 / (long)window) : 0;
+            cprintf(T_BOLD T_BLUE, "Context Window\n");
+            printf("  Provider:       %s\n", c.provider.name);
+            printf("  Model:          %s\n", c.provider.model);
+            printf("  Window size:    %d tokens\n", window);
+            printf("  Est. used:      %ld tokens (%d%%)\n", est, pct);
+            printf("  History:        %d entries (%lu bytes)\n", c.history_count, (unsigned long)c.history_bytes);
+            printf("  Agent history:  %d entries (%lu bytes)\n", c.agent_history_count, (unsigned long)c.agent_history_bytes);
+            printf("  Compaction:     %s\n", c.compaction_triggered ? "triggered this turn" : "not triggered");
+            printf("  Last compact:   round %ld\n", c.last_compaction_round);
+            if (pct >= VS_COMPACT_AT_PERCENT) warnf("  WARNING: approaching context window limit!\n");
+        } else if (!strcmp(line,"/compact")) {
+            cprintf(T_BOLD T_YELLOW, "Forcing compaction...\n");
+            /* Force compaction by temporarily setting estimated tokens high */
+            c.estimated_request_tokens = (unsigned long)vs_provider_context_window(&c.provider);
+            if (c.agent_history_count > 0) {
+                char *task_anchor = c.pending_task_valid ? c.pending_task : "current task";
+                extern void agent_compact_force(VSContext *ctx, const char *task);
+                agent_compact_force(&c, task_anchor);
+                c.compaction_triggered = 1;
+                successf("Compaction complete. Agent history: %d entries (%lu bytes)\n",
+                    c.agent_history_count, (unsigned long)c.agent_history_bytes);
+            } else {
+                warnf("Nothing to compact (agent history is empty)\n");
+            }
+        } else if (!strcmp(line,"/cost")) {
+            cprintf(T_BOLD T_BLUE, "Token Usage\n");
+            printf("  Input tokens:     %lu\n", c.conversation_input_tokens);
+            printf("  Output tokens:    %lu\n", c.conversation_output_tokens);
+            printf("  Total tokens:     %lu\n", c.conversation_total_tokens);
+            printf("  Responses:        %lu\n", c.conversation_usage_responses);
+            printf("  Provider input:   %ld\n", c.provider_input_tokens);
+            printf("  Provider output:  %ld\n", c.provider_output_tokens);
+            printf("  Provider total:   %ld\n", c.provider_total_tokens);
+            if (c.cache_enabled) {
+                printf("  Cache read:       %ld\n", c.provider_cache_read_tokens);
+                printf("  Cache write:      %ld\n", c.provider_cache_write_tokens);
+                printf("  Cached tokens:    %ld\n", c.provider_cached_tokens);
+            }
+        } else if (!strcmp(line,"/clear")) {
+            vs_history_clear(&c);
+            vs_cache_clear(&c);
+            c.conversation_input_tokens = 0;
+            c.conversation_output_tokens = 0;
+            c.conversation_total_tokens = 0;
+            c.conversation_usage_responses = 0;
+            c.provider_input_tokens = 0;
+            c.provider_output_tokens = 0;
+            c.provider_total_tokens = 0;
+            c.agent_history_count = 0;
+            c.agent_history_bytes = 0;
+            successf("Conversation cleared\n");
+        } else if (!strncmp(line,"/export ",8)) {
+            const char *fname = line + 8;
+            char *content = (char*)malloc(VS_MAX_TEXT);
+            if (!content) { errorf("out of memory\n"); continue; }
+            int offset = 0, i;
+            for (i = 0; i < c.history_count && offset < VS_MAX_TEXT - 1024; i++) {
+                offset += snprintf(content + offset, VS_MAX_TEXT - offset,
+                    "{\"role\":\"%s\",\"content\":\"", c.history[i].role);
+                /* Simple JSON escaping */
+                const char *p = c.history[i].content;
+                while (*p && offset < VS_MAX_TEXT - 1024) {
+                    if (*p == '"') { offset += snprintf(content + offset, VS_MAX_TEXT - offset, "\\\""); }
+                    else if (*p == '\\') { offset += snprintf(content + offset, VS_MAX_TEXT - offset, "\\\\"); }
+                    else if (*p == '\n') { offset += snprintf(content + offset, VS_MAX_TEXT - offset, "\\n"); }
+                    else if (*p == '\r') { offset += snprintf(content + offset, VS_MAX_TEXT - offset, "\\r"); }
+                    else if (*p == '\t') { offset += snprintf(content + offset, VS_MAX_TEXT - offset, "\\t"); }
+                    else { content[offset++] = *p; }
+                    p++;
+                }
+                offset += snprintf(content + offset, VS_MAX_TEXT - offset, "\"}\n");
+            }
+            content[offset] = 0;
+            if (vs_write_file(fname, content) == 0) {
+                successf("Exported %d messages to %s\n", c.history_count, fname);
+            } else {
+                errorf("Failed to write %s\n", fname);
+            }
+            free(content);
+        } else if (!strcmp(line,"/export")) {
+            char fname[VS_MAX_PATH];
+            time_t now = time(NULL);
+            struct tm *tb = localtime(&now);
+            if (tb) {
+                snprintf(fname, sizeof(fname), "conversation_%04d%02d%02d_%02d%02d%02d.jsonl",
+                    1900+tb->tm_year, 1+tb->tm_mon, tb->tm_mday, tb->tm_hour, tb->tm_min, tb->tm_sec);
+            } else {
+                snprintf(fname, sizeof(fname), "conversation.jsonl");
+            }
+            strncpy(line, "/export ", sizeof(line)-1);
+            strncat(line, fname, sizeof(line)-strlen(line)-1);
+            continue;  /* re-process with filename */
+        } else if (!strcmp(line,"/doctor")) {
+            cprintf(T_BOLD T_BLUE, "System Health Check\n");
+            printf("  Provider:       %s (%s)\n", c.provider.name, c.provider.model);
+            printf("  API key:        %s\n", c.provider.api_key[0] ? "configured" : "NOT SET");
+            printf("  Base URL:       %s\n", c.provider.base_url[0] ? c.provider.base_url : "default");
+            printf("  Protocol:       %s\n", vs_protocol_name(c.provider.protocol));
+            printf("  Cache:          %s\n", c.cache_enabled ? "enabled" : "disabled");
+            printf("  MCP servers:    %d\n", c.mcp_server_count);
+            printf("  Skills:         %d loaded\n", c.skill_count);
+            printf("  Memory:         %d entries\n", c.memory.entry_count);
+            printf("  Tasks:          %d entries\n", c.tasks.task_count);
+            printf("  Permissions:    %d rules\n", c.permissions.rule_count);
+            printf("  Auto Mode:      %s\n", c.auto_mode.enabled ? "enabled" : "disabled");
+            printf("  Checkpoints:    %s\n", c.checkpoint_enabled ? "enabled" : "disabled");
+            printf("  Computer Use:   %s\n", c.computer_use_available ? "available" : "unavailable");
+            /* Check disk space */
+            char *df = vs_run_command("df -h ~/.vibesolaris 2>/dev/null | tail -1", NULL);
+            if (df) {
+                printf("  Disk space:     %s", df);
+                free(df);
+            }
+        } else if (!strcmp(line,"/bashes")) {
+            cprintf(T_BOLD T_BLUE, "Background Processes\n");
+            int found = 0;
+            int i;
+            for (i = 0; i < VS_MAX_MONITORS; i++) {
+                extern int vs_monitor_is_running(int id);
+                if (vs_monitor_is_running(i)) {
+                    char *out = vs_monitor_output(i);
+                    if (out) {
+                        printf("  Monitor #%d: running\n", i);
+                        /* Show last 3 lines */
+                        char *last = out;
+                        int lines = 0;
+                        char *p = out;
+                        while ((p = strchr(p, '\n')) && lines < 10) { p++; lines++; last = p; }
+                        if (lines > 3) { printf("    ... (last lines)\n"); }
+                        size_t len = strlen(last);
+                        if (len > 200) len = 200;
+                        if (len > 0) printf("    %.*s\n", (int)len, last);
+                        free(out);
+                    }
+                    found++;
+                }
+            }
+            if (!found) warnf("No background processes running.\n");
+        } else if (!strncmp(line,"/hooks ",7) || !strcmp(line,"/hooks")) {
+            const char *arg = strlen(line) > 6 ? line + 7 : "";
+            if (!strcmp(arg,"list") || !strcmp(arg,"")) {
+                char *r = vs_hooks_list(&c.hooks, 32);
+                if (r) { cprintf(T_BOLD T_BLUE, "Hooks\n"); printf("%s", r); free(r); }
+            } else if (!strncmp(arg,"add ",4)) {
+                char *rest = arg + 4;
+                /* Simple parsing: pre|post TOOL_PATTERN COMMAND */
+                int pre = 1;
+                if (!strncmp(rest,"post ",5)) { pre = 0; rest += 5; }
+                else if (!strncmp(rest,"pre ",4)) { rest += 4; }
+                char *sp = strchr(rest, ' ');
+                if (!sp) { errorf("usage: /hooks add [pre|post] TOOL_PATTERN COMMAND\n"); continue; }
+                *sp = 0;
+                if (vs_hooks_add(&c.hooks, rest, sp+1, pre) == 0) {
+                    vs_hooks_persist(&c.hooks);
+                    successf("Hook added\n");
+                } else {
+                    errorf("Hook limit reached\n");
+                }
+            } else if (!strncmp(arg,"remove ",7)) {
+                int idx = atoi(arg + 7) - 1;
+                if (vs_hooks_remove(&c.hooks, idx) == 0) {
+                    vs_hooks_persist(&c.hooks);
+                    successf("Hook removed\n");
+                } else {
+                    errorf("Invalid hook index\n");
+                }
+            } else {
+                errorf("usage: /hooks list|add [pre|post] TOOL CMD|remove INDEX\n");
+            }
+        } else if (!strncmp(line,"/rename ",8)) {
+            const char *new_name = line + 8;
+            if (!new_name[0]) { errorf("usage: /rename NAME\n"); continue; }
+            /* Rename conversation by saving with new ID */
+            strncpy(c.conversation_id, new_name, sizeof(c.conversation_id)-1);
+            successf("Session renamed to: %s\n", new_name);
+        } else if (!strncmp(line,"/tui ",5)) {
+            const char *arg=line+5;
+            if(!strcmp(arg,"fullscreen")){
+                if(!vs_tui_supports_alt_screen()){
+                    warnf("Terminal does not support alternate screen (SSH-safe prompt mode active)\n");
+                } else {
+                    VSTUICompositor comp;
+                    vs_tui_compositor_init(&comp);
+                    if(vs_tui_compositor_enter(&comp)!=0){
+                        warnf("Full-screen mode not supported on this terminal\n");
+                    } else {
+                        char fs_line[262144];
+                        successf("Entering full-screen TUI mode. Type /tui prompt to exit.\n");
+                        vs_tui_compositor_render(&comp,&c);
+                        while(1){
+                            if(!vs_tui_compositor_read_input(&comp,fs_line,sizeof(fs_line)))break;
+                            if(!fs_line[0])continue;
+                            if(!strcmp(fs_line,"/tui prompt")||!strcmp(fs_line,"/quit")){
+                                vs_tui_compositor_shutdown(&comp);
+                                successf("Exited full-screen mode.\n");
+                                break;
+                            }
+                            if(!strcmp(fs_line,"/help")){
+                                vs_tui_compositor_clear(&comp);
+                                vs_tui_compositor_append_stream(&comp,"Type /tui prompt to exit full-screen mode.\n",58);
+                                vs_tui_compositor_render(&comp,&c);
+                                continue;
+                            }
+                            if(fs_line[0]=='/'&&strncmp(fs_line,"/subagent ",10)){
+                                /* Pass TUI commands through */
+                                vs_tui_compositor_clear(&comp);
+                                strncpy(line,fs_line,sizeof(line)-1);line[sizeof(line)-1]=0;
+                                continue;
+                            }
+                            /* Run agent turn */
+                            vs_tui_compositor_clear(&comp);
+                            vs_tui_compositor_start_streaming(&comp);
+                            {
+                                char *delegated=NULL;const char *prompt=fs_line;
+                                if(!strncmp(fs_line,"/subagent ",10)){delegated=vs_subagent_request_prompt(fs_line+10);if(delegated)prompt=delegated;}
+                                vs_cancel_clear(&c);
+                                vs_set_trace_callback(&c,live_trace,NULL);
+                                vs_set_stream_callback(&c,live_stream,NULL);
+                                char *a=tui_run_agent(&c,prompt,"VibeSolaris answer",0);
+                                free(delegated);
+                                vs_tui_compositor_end_streaming(&comp);
+                                if(a){
+                                    vs_tui_compositor_append_stream(&comp,a,strlen(a));
+                                    free(a);
+                                }
+                                while(c.workflow.phase==VS_WORKFLOW_AWAITING_ACCEPT){
+                                    const char *choices[]={"Yes — accept plan","No — reject plan"};
+                                    char selected[VS_NEED_USER_OPTION_MAX];int pick;
+                                    /* The ordinary selector writes to the terminal directly.  Leave
+                                       the alternate screen so it cannot be clipped by the
+                                       compositor layout, and show the complete plan there. */
+                                    vs_tui_compositor_exit(&comp);
+                                    cprintf(T_BOLD T_BLUE,"Plan: %s\n",c.workflow.title);
+                                    tui_plan_tree(&c.workflow);
+                                    pick=tui_choose("Accept this plan?",choices,2,selected,sizeof(selected));
+                                    if(pick==0){char continuation[VS_ACTIVE_TASK_MAX];if(vs_workflow_accept(&c.workflow)==0){if(vs_workflow_take_pending_task(&c,continuation,sizeof(continuation))==0){char *continued;tui_active_ctx=NULL;continued=tui_run_agent(&c,continuation,"VibeSolaris continuation",1);free(continued);}}}
+                                    else if(pick==1){vs_workflow_reject(&c.workflow);vs_workflow_clear_pending_task(&c);}
+                                    vs_tui_compositor_enter(&comp);
+                                    if(pick<0)break;
+                                }
+                                usage_status(&c);
+                                vs_clear_attachments(&c);vs_cancel_clear(&c);
+                            }
+                            vs_tui_compositor_render(&comp,&c);
+                        }
+                    }
+                }
+            } else if(!strcmp(arg,"prompt")){
+                successf("Prompt mode (default)\n");
+            } else {
+                errorf("usage: /tui fullscreen|prompt\n");
+            }
+        } else if (!strcmp(line,"/auto-mode")||!strncmp(line,"/auto-mode ",11)) {
+            char *arg=!strcmp(line,"/auto-mode")?NULL:line+11;
+            if(arg&&!strcmp(arg,"on")){c.auto_mode.enabled=1;vs_auto_mode_persist(&c.auto_mode);successf("Auto Mode enabled\n");}
+            else if(arg&&!strcmp(arg,"off")){c.auto_mode.enabled=0;vs_auto_mode_persist(&c.auto_mode);successf("Auto Mode disabled\n");}
+            else if(!arg||!strcmp(arg,"status")||!strcmp(arg,"")){
+                cprintf(T_BOLD T_BLUE,"Auto Mode status\n");
+                printf("  enabled=%s\n  rules=%d\n",c.auto_mode.enabled?"on":"off",c.auto_mode.rule_count);
+            }
+            else if(arg&&!strcmp(arg,"rules")){
+                char *r=vs_auto_mode_list_rules(&c.auto_mode,32);
+                if(r){cprintf(T_BOLD T_BLUE,"Auto Mode rules\n");printf("%s",r);free(r);}
+            }
+            else {errorf("usage: /auto-mode on|off|status|rules\n");}
+        } else if (!strncmp(line,"/team ",6)) {
+            char *arg=line+6;
+            if(!strcmp(arg,"list")||!strcmp(arg,"")){
+                if(!c.team_count)warnf("No active teams.\n");
+                else {char *r=vs_team_list(c.team_count,c.teams,32);if(r){cprintf(T_BOLD T_BLUE,"Agent teams\n");printf("%s",r);free(r);}}
+            } else if(!strncmp(arg,"create ",7)){
+                if(c.team_count>=VS_MAX_TEAMS){errorf("Team limit reached (%d max)\n",VS_MAX_TEAMS);continue;}
+                VSTeam *t=&c.teams[c.team_count];
+                if(vs_team_init(t,arg+7)==0){c.team_count++;successf("Team created: %s\n",t->id);}
+                else errorf("Team creation failed\n");
+            } else if(!strncmp(arg,"add ",4)){
+                char *sp=strchr(arg+4,' ');
+                if(!sp){errorf("usage: /team add TEAM ROLE\n");continue;}
+                *sp=0;char *team_id=arg+4,*role=sp+1;int found=0;
+                for(i=0;i<c.team_count;i++){
+                    if(!strcmp(c.teams[i].id,team_id)){
+                        if(vs_team_add_agent(&c.teams[i],"main",role)==0)successf("Agent added to team %s as %s\n",team_id,role);
+                        else errorf("Failed to add agent\n");
+                        found=1;break;
+                    }
+                }
+                if(!found)errorf("Team not found: %s\n",team_id);
+            } else if(!strncmp(arg,"shutdown ",9)){
+                int found=0;
+                for(i=0;i<c.team_count;i++){
+                    if(!strcmp(c.teams[i].id,arg+9)){
+                        vs_team_shutdown(&c.teams[i]);
+                        successf("Team shut down: %s\n",c.teams[i].id);
+                        /* Shift remaining teams */
+                        for(int j=i;j<c.team_count-1;j++)c.teams[j]=c.teams[j+1];
+                        c.team_count--;found=1;break;
+                    }
+                }
+                if(!found)errorf("Team not found: %s\n",arg+9);
+            } else {errorf("usage: /team create NAME|add TEAM ROLE|list|shutdown TEAM\n");}
+        } else if (!strncmp(line,"/plugin ",8)) {
+            char *arg=line+8;
+            if(!strcmp(arg,"list")||!strcmp(arg,"")){
+                if(!c.plugin_count)warnf("No plugins installed.\n");
+                else {char *r=vs_plugin_list(c.plugins,c.plugin_count,32);if(r){cprintf(T_BOLD T_BLUE,"Plugins\n");printf("%s",r);free(r);}}
+            } else if(!strncmp(arg,"install ",8)){
+                if(c.plugin_count>=VS_MAX_PLUGINS){errorf("Plugin limit reached (%d max)\n",VS_MAX_PLUGINS);continue;}
+                if(vs_plugin_install(c.plugins,&c.plugin_count,arg+8)==0)successf("Plugin installed\n");
+                else errorf("Plugin install failed\n");
+            } else if(!strncmp(arg,"uninstall ",10)){
+                if(vs_plugin_uninstall(c.plugins,&c.plugin_count,arg+10)==0)successf("Plugin uninstalled: %s\n",arg+10);
+                else errorf("Plugin not found: %s\n",arg+10);
+            } else {errorf("usage: /plugin install URL|list|uninstall NAME\n");}
+        } else if (!strncmp(line,"/review ",8)) {
+            char tmp[4096],*cur,*p0,*p1,*p2,*out;
+            copyv(tmp,sizeof(tmp),line+8);cur=tmp;
+            p0=tui_next_word(&cur);p1=tui_next_word(&cur);p2=tui_next_word(&cur);
+            out=vs_code_review_start(p0&&*p0?p0:NULL,p1&&*p1?p1:NULL,p2&&*p2?p2:NULL);
+            if(out){cprintf(T_BOLD T_BLUE,"Code review\n");tui_print_bounded(out,24U*1024U,64U*1024U);free(out);}
+        } else if (!strncmp(line,"/goal ",6)) {
+            char *arg=line+6;
+            if(!strcmp(arg,"show")||!strcmp(arg,"")){
+                if(c.goal[0])cprintf(T_BOLD T_BLUE,"Goal: %s\n",c.goal);
+                else warnf("No goal set.\n");
+            } else if(!strncmp(arg,"set ",4)){
+                strncpy(c.goal,arg+4,sizeof(c.goal)-1);c.goal[sizeof(c.goal)-1]=0;
+                if(vs_goal_save(c.goal)==0)successf("Goal saved: %s\n",c.goal);
+                else errorf("Goal save failed\n");
+            } else if(!strcmp(arg,"clear")){
+                c.goal[0]=0;
+                if(vs_goal_clear()==0)successf("Goal cleared\n");
+                else warnf("Goal cleared locally\n");
+            } else {errorf("usage: /goal set TEXT|show|clear\n");}
+        } else if (!strncmp(line,"/init ",6)) {
+            char *path=line+6;
+            if(!path[0])path=NULL;
+            char *out=vs_init_repo(path);
+            if(out){cprintf(T_BOLD T_BLUE,"Init\n");tui_print_bounded(out,24U*1024U,64U*1024U);free(out);}
+        } else if (!strcmp(line,"/pause")) {
+            c.session_paused_at=(long)time(NULL);
+            cprintf(T_BOLD T_YELLOW,"Session paused. Resume by entering a prompt.\n");
+        } else if (!strncmp(line,"/style ",7)) {
+            const char *v=line+7;
+            if(!strcmp(v,"compact")){c.output_style=VS_OUTPUT_STYLE_COMPACT;tui_output_mode=0;successf("output style=compact\n");}
+            else if(!strcmp(v,"verbose")){c.output_style=VS_OUTPUT_STYLE_VERBOSE;tui_output_mode=2;successf("output style=verbose\n");}
+            else if(!strcmp(v,"default")){c.output_style=VS_OUTPUT_STYLE_DEFAULT;tui_output_mode=1;successf("output style=default\n");}
+            else {errorf("usage: /style compact|verbose|default\n");}
+        } else if (!strcmp(line,"/keybindings")) {
+            if(c.keybinding_count<=0){
+                vs_keybindings_load(c.keybindings,&c.keybinding_count);
+            }
+            if(c.keybinding_count<=0)warnf("No custom keybindings configured.\n");
+            else {
+                cprintf(T_BOLD T_BLUE,"Custom keybindings\n");
+                for(i=0;i<c.keybinding_count;i++)
+                    printf("  %-20s -> %s\n",c.keybindings[i].key,c.keybindings[i].command);
+            }
+        } else if (!strncmp(line,"/worktree ",10)) {
+            char *arg=line+10;
+            if(arg[0]){
+                /* Enter worktree */
+                if(chdir(arg)==0){
+                    c.worktree_active=1;
+                    strncpy(c.worktree_path, arg, sizeof(c.worktree_path)-1);
+                    c.worktree_path[sizeof(c.worktree_path)-1]=0;
+                    successf("Worktree entered: %s\n",c.worktree_path);
+                } else {
+                    errorf("Cannot chdir to %s: %s\n",arg,strerror(errno));
+                }
+            } else {
+                /* Show or exit worktree */
+                if(c.worktree_active){
+                    cprintf(T_BOLD T_BLUE,"Current worktree: %s\n",c.worktree_path);
+                } else {
+                    warnf("No active worktree.\n");
+                }
+            }
+        } else if (!strcmp(line,"/config layer")) {
+            char *dump = vs_settings_dump(&c.settings);
+            if(dump){
+                cprintf(T_BOLD T_BLUE,"Settings Layers\n");
+                tui_print_bounded(dump, 24U*1024U, 64U*1024U);
+                free(dump);
+            } else {
+                cprintf(T_YELLOW,"No settings loaded\n");
+            }
+        } else if (strncmp(line,"/config ",8)==0) {
+            char *arg = line + 8;
+            if(arg[0]){
+                char *sp = strchr(arg, ' ');
+                if(sp){
+                    *sp = 0;
+                    char *val = sp + 1;
+                    vs_settings_set(&c.settings, arg, val, VS_SETTINGS_LAYER_LOCAL);
+                    successf("set %s=%s [local]\n", arg, val);
+                } else {
+                    const char *v = vs_settings_get(&c.settings, arg);
+                    if(v) successf("%s = %s\n", arg, v);
+                    else cprintf(T_YELLOW,"setting '%s' not found\n", arg);
+                }
+            } else {
+                char *dump = vs_settings_dump(&c.settings);
+                if(dump){
+                    cprintf(T_BOLD T_BLUE,"Settings\n");
+                    tui_print_bounded(dump, 24U*1024U, 64U*1024U);
+                    free(dump);
+                } else {
+                    cprintf(T_YELLOW,"No settings loaded\n");
+                }
+            }
+        } else if (!strcmp(line,"/worktree-exit")) {
+            if(c.worktree_active){
+                c.worktree_active=0;
+                c.worktree_path[0]=0;
+                successf("Worktree exited.\n");
+            } else {
+                warnf("No active worktree.\n");
+            }
+        } else if (!strncmp(line,"/search ",8)) {
+            const char *query = line + 8;
+            if(c.tui_composer.search_mode){
+                /* Update search query */
+                int count = vs_tui_compositor_search(&c.tui_composer, query);
+                if(count > 0){
+                    successf("Found %d matches for '%s'\n", count, query);
+                } else {
+                    warnf("No matches for '%s'\n", query);
+                }
+            } else {
+                int count = vs_tui_compositor_search(&c.tui_composer, query);
+                if(count > 0){
+                    successf("Found %d matches for '%s' (use /search-next /search-prev to navigate)\n", count, query);
+                } else {
+                    warnf("No matches for '%s'\n", query);
+                }
+            }
+        } else if (!strcmp(line,"/search-next")) {
+            if(c.tui_composer.search_mode && c.tui_composer.search_result_count > 0){
+                vs_tui_compositor_search_next(&c.tui_composer);
+                successf("Match %d/%d\n", c.tui_composer.search_current + 1, c.tui_composer.search_result_count);
+            } else {
+                warnf("No active search. Use /search QUERY first.\n");
+            }
+        } else if (!strcmp(line,"/search-prev")) {
+            if(c.tui_composer.search_mode && c.tui_composer.search_result_count > 0){
+                vs_tui_compositor_search_prev(&c.tui_composer);
+                successf("Match %d/%d\n", c.tui_composer.search_current + 1, c.tui_composer.search_result_count);
+            } else {
+                warnf("No active search. Use /search QUERY first.\n");
+            }
+        } else if (!strcmp(line,"/search-exit")) {
+            if(c.tui_composer.search_mode){
+                vs_tui_compositor_search_exit(&c.tui_composer);
+                successf("Search exited.\n");
+            } else {
+                warnf("Not in search mode.\n");
+            }
+        } else if (!strncmp(line,"/reason ",8)) {
+            const char *arg = line + 8;
+            if(arg[0]){
+                /* /reason QUERY — analyze a task */
+                char *analysis = vs_reasoning_analyze(&c.reasoning, arg);
+                char *decomp = vs_reasoning_decompose(&c.reasoning, arg);
+                int conf = vs_reasoning_confidence(&c.reasoning, arg, "execute");
+                cprintf(T_BOLD T_BLUE,"Reasoning Analysis\n");
+                if(analysis){printf("%s\n",analysis);free(analysis);}
+                if(decomp){printf("%s\n",decomp);free(decomp);}
+                printf("Confidence: %d%% (%s)\n", conf, vs_reasoning_confidence_label(conf));
+            } else {
+                warnf("Usage: /reason QUERY — analyze a task with the reasoning engine\n");
+            }
+        } else if (!strcmp(line,"/reason on")) {
+            c.reasoning.enabled = 1;
+            successf("Reasoning engine enabled.\n");
+        } else if (!strcmp(line,"/reason off")) {
+            c.reasoning.enabled = 0;
+            warnf("Reasoning engine disabled.\n");
+        } else if (!strncmp(line,"/reason depth ",14)) {
+            char *ep = NULL;
+            long v = strtol(line + 14, &ep, 10);
+            if(ep && *ep == 0 && v >= 1 && v <= 3){
+                c.reasoning.depth = (int)v;
+                successf("Reasoning depth set to %ld.\n", v);
+            } else {
+                warnf("Usage: /reason depth [1-3]\n");
+            }
+        } else if (!strcmp(line,"/reason depth")) {
+            successf("Current reasoning depth: %d (1=minimal, 2=standard, 3=deep)\n", c.reasoning.depth);
+        } else if (!strncmp(line,"/security-review ",17)) {
+            char *arg = line + 17;
+            char *path = ".";
+            char *scope = "all";
+            /* Parse: /security-review [path] [scope] */
+            if (strlen(arg) > 0) {
+                path = arg;
+                char *space = strchr(arg, ' ');
+                if (space) {
+                    *space = 0;
+                    scope = space + 1;
+                }
+            }
+            VSSecurityFinding findings[VS_MAX_SECURITY_FINDINGS];
+            int count = vs_security_review_start(path, scope, findings, VS_MAX_SECURITY_FINDINGS);
+            char *r = vs_security_review_render(findings, count, 40);
+            if (r) {
+                cprintf(T_BOLD T_BLUE, "Security Review\n");
+                printf("%s\n", r);
+                free(r);
+            }
+        } else if (!strcmp(line,"/security-review")) {
+            /* Default: scan current directory */
+            VSSecurityFinding findings[VS_MAX_SECURITY_FINDINGS];
+            int count = vs_security_review_start(".", "all", findings, VS_MAX_SECURITY_FINDINGS);
+            char *r = vs_security_review_render(findings, count, 40);
+            if (r) {
+                cprintf(T_BOLD T_BLUE, "Security Review\n");
+                printf("%s\n", r);
+                free(r);
+            }
+        } else if (!strncmp(line,"/loop ",6)) {
+            char *arg = line + 6;
+            if (!strncmp(arg, "start ", 6)) {
+                /* /loop start PROMPT INTERVAL */
+                char *rest = arg + 6;
+                /* Find last space for interval */
+                char *last_space = strrchr(rest, ' ');
+                if (last_space) {
+                    *last_space = 0;
+                    char *prompt = rest;
+                    char *ep = NULL;
+                    long interval = strtol(last_space + 1, &ep, 10);
+                    if (interval > 0 && ep[0] == 0) {
+                        int id = vs_loop_add(&c, prompt, (int)interval);
+                        if (id >= 0) successf("Loop started (ID: %d), interval: %lds\n", id, interval);
+                        else errorf("Failed to start loop (max capacity?)\n");
+                    } else {
+                        warnf("Usage: /loop start PROMPT INTERVAL_SECONDS\n");
+                    }
+                } else {
+                    warnf("Usage: /loop start PROMPT INTERVAL_SECONDS\n");
+                }
+            } else if (!strncmp(arg, "stop ", 5)) {
+                char *ep = NULL;
+                long id = strtol(arg + 5, &ep, 10);
+                if (id > 0 && ep[0] == 0) {
+                    if (vs_loop_remove(&c, (int)id) == 0)
+                        successf("Loop %ld stopped\n", id);
+                    else
+                        errorf("Loop %ld not found\n", id);
+                } else {
+                    warnf("Usage: /loop stop ID\n");
+                }
+            } else if (!strcmp(arg, "list")) {
+                char *r = vs_loop_list(&c, 20);
+                if (r) { cprintf(T_BOLD T_BLUE, "Loops\n"); printf("%s\n", r); free(r); }
+            } else {
+                warnf("Usage: /loop start PROMPT INTERVAL | /loop stop ID | /loop list\n");
+            }
+        } else if (!strncmp(line,"/workflow ",10)) {
+            char *arg = line + 10;
+            if (!strncmp(arg, "run ", 4)) {
+                char *file = arg + 4;
+                char *content = vs_read_file(file);
+                if (content) {
+                    int steps = vs_workflow_engine_parse(&c.workflow_engine, content);
+                    free(content);
+                    if (steps > 0) {
+                        successf("Parsed workflow: %d steps\n", steps);
+                        int rc = vs_workflow_engine_run(&c.workflow_engine, &c);
+                        if (rc == 0) successf("Workflow completed\n");
+                        else errorf("Workflow failed or cancelled\n");
+                    } else {
+                        errorf("Failed to parse workflow file\n");
+                    }
+                } else {
+                    errorf("Cannot read workflow file: %s\n", file);
+                }
+            } else if (!strcmp(arg, "status")) {
+                char *r = vs_workflow_engine_status(&c.workflow_engine, 20);
+                if (r) { cprintf(T_BOLD T_BLUE, "Workflow Status\n"); printf("%s\n", r); free(r); }
+            } else {
+                warnf("Usage: /workflow run FILE | /workflow status\n");
+            }
+        } else if (!strncmp(line,"/sessions ",10)) {
+            char *arg = line + 10;
+            if (!strcmp(arg, "list")) {
+                vs_cross_session_discover(&c.cross_session);
+                char *r = vs_cross_session_list(&c.cross_session, 20);
+                if (r) { cprintf(T_BOLD T_BLUE, "Sessions\n"); printf("%s\n", r); free(r); }
+            } else if (!strncmp(arg, "send ", 5)) {
+                char *rest = arg + 5;
+                char *space = strchr(rest, ' ');
+                if (space) {
+                    *space = 0;
+                    char *ep = NULL;
+                    long pid = strtol(rest, &ep, 10);
+                    if (pid > 0 && ep[0] == 0) {
+                        if (vs_cross_session_send(&c.cross_session, pid, space + 1) == 0)
+                            successf("Message sent to PID %ld\n", pid);
+                        else
+                            errorf("Failed to send message\n");
+                    } else {
+                        warnf("Usage: /sessions send PID MESSAGE\n");
+                    }
+                } else {
+                    warnf("Usage: /sessions send PID MESSAGE\n");
+                }
+            } else if (!strcmp(arg, "inbox")) {
+                vs_cross_session_receive(&c.cross_session);
+                char *r = vs_cross_session_inbox(&c.cross_session, 20);
+                if (r) { cprintf(T_BOLD T_BLUE, "Inbox\n"); printf("%s\n", r); free(r); }
+            } else {
+                warnf("Usage: /sessions list | /sessions send PID MSG | /sessions inbox\n");
+            }
+        } else if (!strncmp(line,"/rewind ",8)) {
+            char *arg = line + 8;
+            if (!strcmp(arg, "mark ")) {
+                char *label = arg + 5;
+                if (strlen(label) > 0) {
+                    c.rewind.last_history_count = c.history_count;
+                    int idx = vs_rewind_mark(&c.rewind, label);
+                    if (idx >= 0) successf("Rewind marker '%s' set at %d messages\n", label, c.history_count);
+                    else errorf("Failed to set marker\n");
+                } else {
+                    warnf("Usage: /rewind mark LABEL\n");
+                }
+            } else if (!strncmp(arg, "to ", 3)) {
+                char *label = arg + 3;
+                if (strlen(label) > 0) {
+                    int removed = vs_rewind_to_marker(&c.rewind, &c, label);
+                    if (removed > 0) successf("Rewound to marker '%s': removed %d messages\n", label, removed);
+                    else if (removed == 0) warnf("Already at marker '%s'\n", label);
+                    else errorf("Marker '%s' not found\n", label);
+                } else {
+                    warnf("Usage: /rewind to LABEL\n");
+                }
+            } else if (!strcmp(arg, "list")) {
+                char *r = vs_rewind_list(&c.rewind, 20);
+                if (r) { cprintf(T_BOLD T_BLUE, "Rewind State\n"); printf("%s\n", r); free(r); }
+            } else {
+                /* /rewind N — undo last N messages */
+                char *ep = NULL;
+                long n = strtol(arg, &ep, 10);
+                if (n > 0 && n <= c.history_count) {
+                    int removed = vs_rewind_undo(&c.rewind, &c, (int)n);
+                    if (removed > 0) successf("Rewound %d messages (%d remaining)\n", removed, c.history_count);
+                    else warnf("Nothing to rewind\n");
+                } else if (strlen(arg) == 0) {
+                    /* /rewind with no arg — undo last 1 message */
+                    int removed = vs_rewind_undo(&c.rewind, &c, 1);
+                    if (removed > 0) successf("Rewound 1 message (%d remaining)\n", c.history_count);
+                    else warnf("Nothing to rewind\n");
+                } else {
+                    warnf("Usage: /rewind [N] — undo last N messages\n");
+                }
+            }
+        } else if (!strcmp(line, "/rewind")) {
+            /* /rewind with no args — undo last 1 message */
+            int removed = vs_rewind_undo(&c.rewind, &c, 1);
+            if (removed > 0) successf("Rewound 1 message (%d remaining)\n", c.history_count);
+            else warnf("Nothing to rewind\n");
+        } else if (!strncmp(line, "/btw ", 5)) {
+            /* /btw MESSAGE — side comment without polluting main thread */
+            char *msg = line + 5;
+            if (strlen(msg) > 0) {
+                /* Process in isolated context — don't add to main history */
+                vs_btw_add(&c.btw, msg, "(pending response)");
+                /* Run agent turn for the side comment */
+                char *a = vs_agent_turn(&c, msg);
+                if (a) {
+                    if (c.btw.message_count > 0) {
+                        snprintf(c.btw.messages[c.btw.message_count - 1].response,
+                                 sizeof(c.btw.messages[0].response), "%s", a);
+                    }
+                    printf("%s\n", a);
+                    free(a);
+                }
+            } else {
+                warnf("Usage: /btw MESSAGE\n");
+            }
+        } else if (!strncmp(line, "/btw ", 5) == 0 && strcmp(line + 5, "") == 0) {
+            /* /btw with no message */
+            warnf("Usage: /btw MESSAGE\n");
+        } else if (!strcmp(line, "/btw list")) {
+            char *r = vs_btw_list(&c.btw, 20);
+            if (r) { cprintf(T_BOLD T_BLUE, "Side Comments\n"); printf("%s\n", r); free(r); }
+        } else if (!strcmp(line, "/btw clear")) {
+            vs_btw_clear(&c.btw);
+            successf("Side comments cleared\n");
+        } else if (!strcmp(line, "/plan on")) {
+            vs_plan_mode_enable(&c.plan_mode);
+            successf("Plan mode enabled — changes will be proposed, not executed\n");
+        } else if (!strcmp(line, "/plan off")) {
+            vs_plan_mode_disable(&c.plan_mode);
+            successf("Plan mode disabled — changes will be executed normally\n");
+        } else if (!strcmp(line, "/plan status")) {
+            if (c.plan_mode.enabled)
+                printf("Plan mode: ON\n");
+            else
+                printf("Plan mode: OFF\n");
+        } else if (!strncmp(line, "/model ", 7)) {
+            /* /model PROVIDER/MODEL — switch model mid-session */
+            char *model_arg = line + 7;
+            char *slash = strchr(model_arg, '/');
+            if (slash) {
+                *slash = 0;
+                char *provider_name = model_arg;
+                char *model_name = slash + 1;
+                if (vs_set_provider(&c, provider_name) == 0)
+                    successf("Provider set to %s\n", provider_name);
+                else
+                    warnf("Unknown provider: %s\n", provider_name);
+                vs_set_model(&c, model_name);
+                successf("Model set to %s/%s\n", provider_name, model_name);
+            } else if (strlen(model_arg) > 0) {
+                vs_set_model(&c, model_arg);
+                successf("Model set to %s/%s\n", c.provider.name, model_arg);
+            } else {
+                printf("Current: %s/%s\n", c.provider.name, c.provider.model);
+            }
+        } else if (!strncmp(line, "/branch ", 8)) {
+            /* /branch NAME — create git branch */
+            char *arg = line + 8;
+            if (!strcmp(arg, "list")) {
+                char *r = vs_git_branch_list(c.cwd, 20);
+                if (r) { cprintf(T_BOLD T_BLUE, "Branches\n"); printf("%s\n", r); free(r); }
+            } else if (strlen(arg) > 0) {
+                char *r = vs_git_branch_create(arg, c.cwd);
+                if (r) {
+                    if (strstr(r, "Switched to")) {
+                        successf("Created and switched to branch '%s'\n", arg);
+                    } else {
+                        printf("%s\n", r);
+                    }
+                    free(r);
+                }
+            } else {
+                warnf("Usage: /branch NAME | /branch list\n");
+            }
+        } else if (!strncmp(line, "/diff", 5)) {
+            /* /diff [staged] — preview staged changes */
+            char *r = vs_git_diff_staged(c.cwd, 50);
+            if (r) {
+                if (strlen(r) > 0) {
+                    cprintf(T_BOLD T_BLUE, "Staged Changes\n");
+                    printf("%s\n", r);
+                } else {
+                    printf("No staged changes\n");
+                }
+                free(r);
+            }
+        } else if (!strncmp(line, "/commit", 7)) {
+            /* /commit [generate] — smart commit */
+            char *msg = vs_git_commit_generate_message(c.cwd);
+            if (msg) {
+                if (strlen(msg) > 0 && strlen(msg) < 200) {
+                    cprintf(T_BOLD T_BLUE, "Generated Commit Message\n");
+                    printf("%s\n", msg);
+                    char *rest = line + 7;
+                    while (*rest == ' ') rest++;
+                    if (strlen(rest) == 0 || strcmp(rest, "generate") == 0) {
+                        printf("Run /commit apply to apply this message\n");
+                    }
+                } else {
+                    printf("No staged changes to commit\n");
+                }
+                free(msg);
+            }
+        } else if (!strncmp(line, "/pr ", 4)) {
+            /* /pr [BRANCH] — generate PR description */
+            char *branch = line + 4;
+            char *r = vs_git_pr_description(c.cwd, strlen(branch) > 0 ? branch : NULL, 20);
+            if (r) {
+                cprintf(T_BOLD T_BLUE, "Pull Request Description\n");
+                printf("%s\n", r);
+                free(r);
+            }
+        } else if (!strcmp(line, "/custom-commands list")) {
+            char *r = vs_custom_slash_list(&c.custom_slash, 20);
+            if (r) { cprintf(T_BOLD T_BLUE, "Custom Commands\n"); printf("%s\n", r); free(r); }
+        } else if (!strncmp(line, "/effort ", 8)) {
+            /* /effort LEVEL — set effort level */
+            char *level = line + 8;
+            int effort = vs_effort_from_string(level);
+            if (effort > 0) {
+                c.effort = effort;
+                successf("Effort set to %s\n", vs_effort_label(effort));
+            } else {
+                warnf("Unknown effort level: %s (use: low, medium, high, xhigh, max, ultracode)\n", level);
+            }
         } else if (line[0] == '/' && strncmp(line, "/subagent ", 10)) {
-            errorf("Unknown command: %s\n",line);cprintf(T_DIM,"Type /help to see available commands.\n");
+            if(c.slash_commands_disabled){
+                /* Slash commands disabled: pass through to agent */
+                /* fall through to agent turn below */
+            } else {
+                errorf("Unknown command: %s\n",line);cprintf(T_DIM,"Type /help to see available commands.\n");
+            }
+        } else if(line[0] == '!' && !c.slash_commands_disabled) {
+            /* Shell passthrough: execute command directly */
+            char *cmd = line + 1;
+            /* Skip leading space */
+            while(*cmd == ' ') cmd++;
+            if(*cmd){
+                int status;
+                cprintf(T_BOLD T_GREEN,"$ %s\n",cmd);
+                char *out = vs_run_command(cmd, &status);
+                if(out){
+                    tui_print_bounded(out, 24U*1024U, 64U*1024U);
+                    free(out);
+                }
+                printf("Exit code: %d\n", status);
+            } else {
+                warnf("Empty shell command.\n");
+            }
         } else if(line[0]) {
             char *a;
+            /* Away summary: if session was paused, show resume message */
+            if(c.session_paused_at>0){
+                long elapsed=(long)time(NULL)-c.session_paused_at;
+                cprintf(T_BOLD T_YELLOW,"Session resumed after %ld seconds away.\n",(unsigned long)elapsed);
+                c.session_paused_at=0;
+            }
             cprintf(T_BOLD T_MAGENTA,"\nActivity (live)\n");
             {
                 char *delegated=NULL;const char *prompt=line;
@@ -1116,8 +2193,8 @@ int main(int argc, char **argv)
                 a=tui_run_agent(&c,prompt,"VibeSolaris answer",0);
                 free(delegated);
             }
-            if(c.workflow.phase==VS_WORKFLOW_AWAITING_ACCEPT){const char *choices[]={"Yes — accept plan","No — reject plan"};char selected[VS_NEED_USER_OPTION_MAX];int pick;cprintf(T_BOLD T_BLUE,"Plan: %s\n",c.workflow.title);tui_plan_tree(&c.workflow);pick=tui_choose("Accept this plan?",choices,2,selected,sizeof(selected));if(pick==0){char continuation[VS_ACTIVE_TASK_MAX];if(vs_workflow_accept(&c.workflow)==0){successf("Plan accepted; continuing...\n");if(vs_workflow_take_pending_task(&c,continuation,sizeof(continuation))==0){char *continued;tui_active_ctx=NULL;continued=tui_run_agent(&c,continuation,"VibeSolaris continuation",1);free(continued);}}}else if(pick==1){vs_workflow_reject(&c.workflow);vs_workflow_clear_pending_task(&c);warnf("Plan rejected.\n");}}
-            else if(c.pending_question&&c.question_option_count>0){const char *choices[VS_NEED_USER_MAX_OPTIONS];char selected[VS_NEED_USER_OPTION_MAX];int qi,pick;for(qi=0;qi<c.question_option_count;qi++)choices[qi]=c.question_options[qi];pick=tui_choose(c.question,choices,c.question_option_count,selected,sizeof(selected));if(pick>=0){snprintf(line,sizeof(line),"%s",selected);has_prefill=1;c.pending_question=0;c.question_option_count=0;}else{c.pending_question=0;c.question_option_count=0;}}
+            while(c.workflow.phase==VS_WORKFLOW_AWAITING_ACCEPT){const char *choices[]={"Yes — accept plan","No — reject plan"};char selected[VS_NEED_USER_OPTION_MAX];int pick;cprintf(T_BOLD T_BLUE,"Plan: %s\n",c.workflow.title);tui_plan_tree(&c.workflow);pick=tui_choose("Accept this plan?",choices,2,selected,sizeof(selected));if(pick==0){char continuation[VS_ACTIVE_TASK_MAX];if(vs_workflow_accept(&c.workflow)==0){successf("Plan accepted; continuing...\n");if(vs_workflow_take_pending_task(&c,continuation,sizeof(continuation))==0){char *continued;tui_active_ctx=NULL;continued=tui_run_agent(&c,continuation,"VibeSolaris continuation",1);free(continued);}}}else if(pick==1){vs_workflow_reject(&c.workflow);vs_workflow_clear_pending_task(&c);warnf("Plan rejected.\n");}else break;}
+            if(c.pending_question&&c.question_option_count>0){const char *choices[VS_NEED_USER_MAX_OPTIONS];char selected[VS_NEED_USER_OPTION_MAX];int qi,pick;for(qi=0;qi<c.question_option_count;qi++)choices[qi]=c.question_options[qi];pick=tui_choose(c.question,choices,c.question_option_count,selected,sizeof(selected));if(pick>=0){snprintf(line,sizeof(line),"%s",selected);has_prefill=1;c.pending_question=0;c.question_option_count=0;}else{c.pending_question=0;c.question_option_count=0;}}
             usage_status(&c);
             free(a);vs_clear_attachments(&c);vs_cancel_clear(&c);
         }
