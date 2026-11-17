@@ -128,7 +128,6 @@ int vs_http_post_stream_ctx(VSContext *ctx,const char *url,const char *headers[]
     if(rc!=CURLE_OK){if(ctx){if(vs_cancel_requested(ctx)&&rc==CURLE_ABORTED_BY_CALLBACK)vs_trace(ctx,"cancel","streaming HTTP request cancelled by user");else{snprintf(tracebuf,sizeof(tracebuf),"streaming HTTP transport failed: %s",curl_easy_strerror(rc));vs_trace(ctx,"http-error",tracebuf);}}return -1;}return 0;
 }
 char *vs_http_post_ctx(VSContext *ctx,const char *url,const char *headers[],int nheaders,const char *body,long *status){return vs_http_post_capture_ctx(ctx,url,headers,nheaders,body,status,NULL,0);}
-char *vs_http_post_capture(const char *url,const char *headers[],int nheaders,const char *body,long *status,char *session_id,size_t session_cap){return vs_http_post_capture_ctx(NULL,url,headers,nheaders,body,status,session_id,session_cap);}
 char *vs_http_post(const char *url,const char *headers[],int nheaders,const char *body,long *status){return vs_http_post_ctx(NULL,url,headers,nheaders,body,status);}
 char *vs_http_get_ctx(VSContext *ctx,const char *url,long *status,size_t max_bytes){
     CURL *c;Buf b;CURLcode rc;char phost[1024],pauth[1024],redacted[1024],tracebuf[1200];

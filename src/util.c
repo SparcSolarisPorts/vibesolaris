@@ -585,7 +585,6 @@ static char *vs_base64_file_ctx(VSContext *ctx,const char *path,size_t *out_len)
     if(carry_n){unsigned t=(unsigned)carry[0]<<16;if(carry_n>1)t|=(unsigned)carry[1]<<8;out[j++]=T[(t>>18)&63];out[j++]=T[(t>>12)&63];out[j++]=carry_n>1?T[(t>>6)&63]:'=';out[j++]='=';}
     out[j]=0;if(out_len)*out_len=j;return out;
 }
-char *vs_base64_file(const char *path,size_t *out_len){return vs_base64_file_ctx(NULL,path,out_len);}
 
 static int vs_exec_in_path(const char *name)
 {

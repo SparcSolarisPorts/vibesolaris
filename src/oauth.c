@@ -512,11 +512,6 @@ int vs_oauth_refresh_for(VSContext *ctx,VSOAuthProvider which,char *err,size_t e
     free(resp);setmsg(err,errcap,"");return 0;
 }
 
-int vs_oauth_refresh(VSContext *ctx,char *err,size_t errcap)
-{
-    return vs_oauth_refresh_for(ctx,VS_OAUTH_OPENAI,err,errcap);
-}
-
 int vs_oauth_ensure_access_token_for(VSContext *ctx,VSOAuthProvider which,char *err,size_t errcap)
 {
     const VSOAuthConfig *cfg;long now;
