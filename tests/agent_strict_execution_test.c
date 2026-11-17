@@ -3,13 +3,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-static int chats=0,runs=0,scenario=0;
+static int chats=0,runs=0,scenario=0,resume_seen=0;
 static char *d(const char*s){size_t n=strlen(s);char*p=(char*)malloc(n+1);memcpy(p,s,n+1);return p;}
 char *vs_chat(VSContext*c,const char*p){(void)c;(void)p;chats++;
  if(scenario==1)return d("[[VS_TOOL run task_id=\"1\" cmd=\"printf first\"]]");
  if(scenario==4){if(chats==1)return d("Still investigating.");return d("[[VS_NEED_USER question=\"Ready?\"]]");}
  if(scenario==3){if(chats==1)return d("[[VS_TOOL run task_id=\"1\" cmd=\"printf broken\"");if(chats==2)return d("[[VS_TOOL run task_id=\"1\" cmd=\"printf repaired\"]]");return d("[[VS_NEED_USER question=\"Ready?\"]]");}
  if(scenario==2){if(chats==1)return d("[[VS_TOOL run task_id=\"1\" cmd=\"printf first\"]]");return d("Still thinking about the next step.");}
+ if(scenario==5)return d("I'll inspect the repository now.");
+ if(scenario==6){if(strstr(p,"RESUME DISCIPLINE"))resume_seen=1;if(chats==1)return d("[[VS_TOOL run task_id=\"1\" cmd=\"printf resumed\"]]");return d("[[VS_FINAL]]resumed ok");}
  if(chats==1)return d("[[VS_TOOL run task_id=\"1\" cmd=\"printf first\"]]");
  if(chats==2)return d("I am still investigating this state and have not finished yet.");
  if(chats==3)return d("[[VS_TOOL run task_id=\"1\" cmd=\"printf second\"]]");
@@ -35,7 +37,7 @@ void vs_history_clear(VSContext *c){(void)c;}
 void vs_cache_clear(VSContext *c){(void)c;}
 int main(void){VSContext c;char*out;VSTaskRecord task;memset(&c,0,sizeof(c));vs_workflow_init(&c.workflow);memset(&task,0,sizeof(task));task.id=1;strcpy(task.title,"Authorized test actions");if(vs_workflow_set_plan(&c.workflow,"Strict execution test",&task,1)!=0||vs_workflow_accept(&c.workflow)!=0)return 1;out=vs_agent_turn(&c,"ok sounds good, do all that");printf("%s chats=%d runs=%d\n",out,chats,runs);if(strcmp(out,"complete")||chats!=5||runs!=2)return 1;free(out);memset(&c,0,sizeof(c));vs_workflow_init(&c.workflow);if(vs_workflow_set_plan(&c.workflow,"Repeated action test",&task,1)!=0||vs_workflow_accept(&c.workflow)!=0)return 1;chats=runs=0;scenario=1;out=vs_agent_turn(&c,"fix the repeated action");if(!out||!strstr(out,"single-turn autonomous ceiling")||chats!=64||runs!=1){free(out);return 2;}free(out);memset(&c,0,sizeof(c));vs_workflow_init(&c.workflow);if(vs_workflow_set_plan(&c.workflow,"No progress test",&task,1)!=0||vs_workflow_accept(&c.workflow)!=0)return 1;chats=runs=0;scenario=2;out=vs_agent_turn(&c,"implement the requested change");if(!out||!strstr(out,"no [[VS_TOOL]]/[[VS_MCP]]/[[VS_FINAL]] marker")||chats!=1+VS_MAX_NO_MARKER_RECOVERIES||runs!=1){free(out);return 3;}free(out);
  memset(&c,0,sizeof(c));vs_workflow_init(&c.workflow);if(vs_workflow_set_plan(&c.workflow,"Malformed recovery",&task,1)!=0||vs_workflow_accept(&c.workflow)!=0)return 1;chats=runs=0;scenario=3;out=vs_agent_turn(&c,"continue");if(!out||strcmp(out,"Ready?")||chats!=3||runs!=1){free(out);return 4;}free(out);
- memset(&c,0,sizeof(c));vs_workflow_init(&c.workflow);if(vs_workflow_set_plan(&c.workflow,"Short continuation",&task,1)!=0||vs_workflow_accept(&c.workflow)!=0)return 1;chats=runs=0;scenario=4;out=vs_agent_turn(&c,"continue");if(!out||strcmp(out,"Ready?")||chats!=2||runs!=0){free(out);return 5;}free(out);return 0;}
+ memset(&c,0,sizeof(c));vs_workflow_init(&c.workflow);if(vs_workflow_set_plan(&c.workflow,"Short continuation",&task,1)!=0||vs_workflow_accept(&c.workflow)!=0)return 1;chats=runs=0;scenario=4;out=vs_agent_turn(&c,"continue");if(!out||strcmp(out,"Ready?")||chats!=2||runs!=0){free(out);return 5;}free(out);memset(&c,0,sizeof(c));vs_workflow_init(&c.workflow);c.workflow.mode=VS_MODE_AUTO;chats=runs=0;scenario=5;out=vs_agent_turn(&c,"tell me about P1");if(!out||!strstr(out,"no [[VS_TOOL]]/[[VS_MCP]]/[[VS_FINAL]] marker")||chats!=VS_MAX_NO_MARKER_RECOVERIES||runs!=0){free(out);return 6;}free(out);if(!c.agent_stalled_on_narration)return 7;memset(&task,0,sizeof(task));task.id=1;strcpy(task.title,"Resume actions");if(vs_workflow_set_plan(&c.workflow,"Resume test",&task,1)!=0||vs_workflow_accept(&c.workflow)!=0)return 8;chats=runs=0;scenario=6;out=vs_agent_turn(&c,"ok");if(!out||strcmp(out,"resumed ok")||!resume_seen||runs!=1){free(out);return 9;}free(out);return 0;}
 
 /* Stub for util.c (agent tests do not link it). */
 char *vs_shell_quote(const char *s){const char *p;size_t n=2;char *o,*w;if(!s)s="";for(p=s;*p;p++)n+=(*p=='\'')?4:1;o=(char*)malloc(n+1);if(!o)return NULL;w=o;*w++='\'';for(p=s;*p;p++){if(*p=='\''){memcpy(w,"'\\''",4);w+=4;}else *w++=*p;}*w++='\'';*w=0;return o;}

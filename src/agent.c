@@ -153,7 +153,11 @@ static char *no_marker_recovery_prompt(const char *task,const char *prev,int con
         "PROTOCOL ERROR: your previous %d response(s) contained prose only — no [[VS_TOOL ...]], [[VS_MCP ...]], or [[VS_FINAL]] marker. Prose does not execute anything; the host cannot act on narration, so the turn makes no progress. This is recovery %d of %d; after that the turn stops.\n\n"
         "Your last response was (verbatim, truncated):\n%.*s\n\n"
         "ACTIVE_TASK:\n%s\n\nCOMPACTED_WORKING_STATE:\n%s\n\n"
-        "Emit concrete action NOW: one or more [[VS_TOOL ...]] directives on their own lines (each naming task_id=\"<id>\" from the accepted plan when side effects require one), or [[VS_FINAL]] only when the task is genuinely complete. Do not describe the work — issue the directives that do it.\n",
+        "Do NOT announce what you will do next — issue the directive for the exact file or step you just named, for example:\n"
+        "[[VS_TOOL read path=\"<file>\" start_line=\"1\" max_lines=\"200\"]]\n"
+        "or, for the accepted plan task you are working on:\n"
+        "[[VS_TOOL run task_id=\"<id>\" cmd=\"<command>\"]]\n\n"
+        "Emit concrete action NOW: one or more [[VS_TOOL ...]] directives on their own lines (each naming task_id=\"<id>\" from the accepted plan when side effects require one), or [[VS_FINAL]] only when the task is genuinely complete.\n",
         consecutive,consecutive,VS_MAX_NO_MARKER_RECOVERIES,700,prev?prev:"(empty)",task?task:"",checkpoint?checkpoint:"(none)");
     return o;
 }
@@ -859,6 +863,17 @@ char *vs_agent_turn(VSContext *c,const char *user){
         snprintf(np,z,"%s\n\n%s",plan_guide,prompt);
         free(prompt);prompt=np;}
     if(c->pending_question){c->pending_question=0;c->question_option_count=0;c->question[0]=0;memset(c->question_options,0,sizeof(c->question_options));}
+    /* One-shot reminder after a narration stall: the previous turn stopped
+       because the model never emitted a directive, so the next turn must
+       open with concrete tool calls, not more announcements. */
+    if(c->agent_stalled_on_narration){static const char stall_guide[]=
+        "RESUME DISCIPLINE: the previous turn stopped because responses contained narration only — no [[VS_TOOL]]/[[VS_MCP]]/[[VS_FINAL]] marker ever executed anything. Do NOT announce what you will do. Open this turn with the concrete directive(s) for the pending work, e.g. [[VS_TOOL read path=\"<file>\" start_line=\"1\" max_lines=\"200\"]] or [[VS_TOOL run task_id=\"<id>\" cmd=\"<command>\"]], and keep issuing directives until the task is done or you emit [[VS_FINAL]].";
+        size_t z=strlen(prompt)+sizeof(stall_guide)+8;char *np=(char*)malloc(z);
+        c->agent_stalled_on_narration=0;
+        if(!np){free(prompt);free(task_anchor);free(original);return dupstr("out of memory");}
+        snprintf(np,z,"%s\n\n%s",stall_guide,prompt);
+        vs_trace(c,"resume","previous turn stalled on narration-only responses; prepending directive-first reminder");
+        free(prompt);prompt=np;}
     /* Per-turn working history is reset, but the compacted checkpoint is
        deliberately retained (see above). */
     agent_history_clear(c);c->attachment_send_from=0;c->subagent_serial=0;if(c->subagent_depth==0&&!c->subagent_parent){c->subagent_record_count=0;memset(c->subagents,0,sizeof(c->subagents));}execution_mode=execution_intent(original);vs_trace_clear(c);vs_trace(c,"agent","starting agent turn");
@@ -1032,7 +1047,7 @@ char *vs_agent_turn(VSContext *c,const char *user){
                     free(prompt);prompt=retry;continue;
                 }
             }
-            if(execution_mode||actual_tool_seen){
+            if(execution_mode||actual_tool_seen||(c->workflow.mode==VS_MODE_AUTO&&prospective_language(ans))){
                 plan_continues++;no_progress++;
                 /* Surface what the model actually said, truncated, so the
                    user can see why the round made no progress. */
@@ -1048,6 +1063,7 @@ char *vs_agent_turn(VSContext *c,const char *user){
                         no_progress,ans,strlen(ans)>300?"...":"");
                     free(ans);ans=dupstr(report);
                     if(!ans){vs_trace(c,"memory-error","could not allocate no-marker failure report");break;}
+                    c->agent_stalled_on_narration=1;
                     break;
                 }
                 snprintf(step,sizeof(step),"execution response had no directive/final marker; continuing (%d/%d) before the turn stops",no_progress,VS_MAX_NO_MARKER_RECOVERIES);vs_trace(c,"auto-continue",step);agent_history_add(c,"user",prompt);agent_history_add(c,"assistant",ans);next=no_marker_recovery_prompt(task_anchor,ans,no_progress,c->agent_checkpoint);free(prompt);prompt=next;if(!prompt){vs_trace(c,"memory-error","could not allocate no-marker recovery prompt");break;}continue;}

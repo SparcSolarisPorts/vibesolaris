@@ -1167,6 +1167,10 @@ typedef struct {
     char pending_task[VS_ACTIVE_TASK_MAX];
     unsigned long pending_task_revision;
     int pending_task_valid;
+    /* Set when the previous turn stopped because the model kept emitting
+       prose without any executable marker; the next turn prepends a
+       one-shot reminder that directives must come first. */
+    int agent_stalled_on_narration;
     int suppress_history_once;
     /* Ephemeral user-choice prompt returned by the agent. Never serialized. */
     int pending_question;
