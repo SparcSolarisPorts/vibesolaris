@@ -333,6 +333,18 @@ int main(void){
     else printf("ok: MiniMax raw XML tool calls convert to VS_TOOL directives\n");
     free(out);
 
+    /* A thinking-only non-streaming response (content array with no text
+       blocks) must yield the descriptive empty-response message, not a
+       mangled fragment like "type" grabbed from [{"type":"thinking"}]. */
+    setup(VS_PROVIDER_CUSTOM,VS_PROTOCOL_ANTHROPIC,"https://gateway.example.test/v1/messages");
+    feed("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");feed_slice=1;
+    snprintf(plain_response,sizeof(plain_response),"%s",
+        "{\"content\":[{\"type\":\"thinking\",\"thinking\":\"hmm\"}],\"stop_reason\":\"end_turn\",\"usage\":{\"output_tokens\":30}}");
+    out=vs_chat(&ctx,"hi");
+    if(!out||strcmp(out,"The provider returned an empty response with no text content. If this repeats, check the model and gateway configuration.")!=0){fprintf(stderr,"FAIL: thinking-only response should give the empty-response message, got [%s]\n",out?out:"(null)");fails++;}
+    else printf("ok: thinking-only non-streaming response yields the empty-response message\n");
+    free(out);
+
     /* Long answer split across many small chunks: every byte delivered once. */
     {
         static char big[65536];size_t i;char *w=big;

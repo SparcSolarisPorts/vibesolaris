@@ -74,7 +74,11 @@ static char *extract_anthropic_text(const char *json){
         if(found)badd(&b,"\n");badd(&b,part);free(part);found=1;
         p=t+1;while(p<end){if(*p=='\\'&&p+1<end){p+=2;continue;}if(*p=='\"'){p++;break;}p++;}
     }
-    if(found)return bfinish(NULL,&b);free(b.p);return extract_text(json);
+    /* The content array existed but held no text blocks (e.g. thinking-only,
+       or tool_use handled by the caller).  extract_text() would grab the
+       first quoted string after "content" — the word "type" from
+       [{"type":"thinking"}] — so report "no text" instead of that garbage. */
+    if(found)return bfinish(NULL,&b);free(b.p);return NULL;
 }
 /* Aggregating gateways sometimes translate the text-marker protocol into
    native Anthropic tool_use blocks (stop_reason=tool_use).  The agent loop
