@@ -76,6 +76,125 @@ static char *extract_anthropic_text(const char *json){
     }
     if(found)return bfinish(NULL,&b);free(b.p);return extract_text(json);
 }
+/* Aggregating gateways sometimes translate the text-marker protocol into
+   native Anthropic tool_use blocks (stop_reason=tool_use).  The agent loop
+   only understands [[VS_TOOL ...]] directives, so convert each block back:
+   the tool name becomes the op and each input JSON member becomes a
+   key="value" attribute.  Side-effecting ops inherit the staged plan
+   task_id when the model did not supply one.  Returns directives added. */
+static const char *match_braced(const char *open,const char *end){
+    int depth=0,in_str=0,esc=0;const char *p;
+    if(!open||open>=end||(*open!='{'&&*open!='['))return 0;
+    for(p=open;p<end;p++){
+        if(in_str){if(esc)esc=0;else if(*p=='\\')esc=1;else if(*p=='"')in_str=0;continue;}
+        if(*p=='"'){in_str=1;continue;}
+        if(*p=='{'||*p=='[')depth++;
+        else if(*p=='}'||*p==']'){if(--depth==0)return p+1;}
+    }
+    return 0;
+}
+static int tool_use_readonly_op(const char *name){
+    static const char *ro[]={"read","list","search","graph","web_search","web_fetch","glob","grep","notebook_read","monitor_output","task_list","task_search","lsp","tool_search","list_mcp_resources","read_mcp_resource","computer_use_screenshot",0};
+    int i;for(i=0;ro[i];i++)if(!strcmp(name,ro[i]))return 1;return 0;
+}
+/* Walk a JSON object ([obj,obj_end), obj at '{') and append each member as a
+   key="value" attribute.  Sets *has_task when a task_id member was seen. */
+static void append_json_object_attrs(VSBuf *b,const char *obj,const char *obj_end,int *has_task){
+    const char *m=obj?obj+1:0;
+    if(has_task)*has_task=0;
+    while(m&&m<obj_end){
+        char *key;
+        while(m<obj_end&&(*m==' '||*m=='\t'||*m=='\r'||*m=='\n'||*m==','))m++;
+        if(m>=obj_end||*m=='}')break;
+        if(*m!='"'){m++;continue;}
+        key=json_unescape_string(m+1);
+        if(!key){m++;continue;}
+        m++;while(m<obj_end){if(*m=='\\'&&m+1<obj_end){m+=2;continue;}if(*m=='"'){m++;break;}m++;}
+        while(m<obj_end&&(*m==' '||*m=='\t'||*m=='\r'||*m=='\n'))m++;
+        if(m>=obj_end||*m!=':'){free(key);continue;}
+        m++;while(m<obj_end&&(*m==' '||*m=='\t'||*m=='\r'||*m=='\n'))m++;
+        if(m<obj_end&&*m=='"'){
+            char *val=json_unescape_string(m+1);
+            m++;while(m<obj_end){if(*m=='\\'&&m+1<obj_end){m+=2;continue;}if(*m=='"'){m++;break;}m++;}
+            if(val){if(has_task&&!strcmp(key,"task_id"))*has_task=1;append_escaped_attr(b,key,val);free(val);}
+        } else {
+            const char *ve=m;
+            if(m<obj_end&&(*m=='{'||*m=='[')){const char *mb=match_braced(m,obj_end);ve=mb?mb:obj_end;}
+            else while(ve<obj_end&&*ve!=','&&*ve!='}'&&*ve!=']')ve++;
+            {size_t n=(size_t)(ve-m);char *val=(char*)malloc(n+1);
+             if(val){memcpy(val,m,n);val[n]=0;if(has_task&&!strcmp(key,"task_id"))*has_task=1;append_escaped_attr(b,key,val);free(val);}
+             m=ve;}
+        }
+        free(key);
+    }
+}
+static void trace_converted_directive(VSContext *c,VSBuf *b,size_t dstart){
+    char tb[384];size_t n=strlen(b->p+dstart);char *nl;
+    if(n>sizeof(tb)-1)n=sizeof(tb)-1;memcpy(tb,b->p+dstart,n);tb[n]=0;
+    if((nl=strchr(tb,'\n'))!=NULL)*nl=0;
+    vs_trace(c,"tool-use-convert",tb);
+}
+static int append_escaped_attr(VSBuf *b,const char *key,const char *val){
+    const char *p;char t[2];
+    if(badd(b," ")||badd(b,key)||badd(b,"=\""))return -1;
+    for(p=val;p&&*p;p++){if(*p=='"'||*p=='\\'){if(badd(b,"\\"))return -1;}t[0]=*p;t[1]=0;if(badd(b,t))return -1;}
+    return badd(b,"\"");
+}
+static int append_tool_use_directives(VSContext *c,const char *json,VSBuf *b){
+    const char *p=json;int count=0;
+    if(!json||!b||!b->p)return 0;
+    while((p=strstr(p,"\"type\":\"tool_use\""))!=NULL){
+        const char *be=strstr(p+17,"\"type\":"),*ns,*is,*ie=0,*ip=0,*nv;char *name;size_t dstart;int has_task=0;
+        if(!be)be=json+strlen(json);
+        ns=strstr(p,"\"name\"");is=strstr(p,"\"input\"");
+        if(!ns||ns>=be){p+=17;continue;}
+        if(is&&is<be){
+            const char *c1=strchr(is,':');
+            if(!c1){p+=17;continue;}
+            c1++;while(*c1==' '||*c1=='\t'||*c1=='\r'||*c1=='\n')c1++;
+            if(*c1!='{'){p+=17;continue;}
+            ie=match_braced(c1,be);if(!ie){p+=17;continue;}
+            ip=c1;
+        }
+        nv=strchr(ns,':');if(!nv){p+=17;continue;}
+        nv++;while(*nv==' '||*nv=='\t'||*nv=='\r'||*nv=='\n')nv++;
+        if(*nv!='"'){p+=17;continue;}
+        name=json_unescape_string(nv+1);if(!name){p+=17;continue;}
+        dstart=b->len;
+        badd(b,"[[VS_TOOL ");badd(b,name);
+        if(ip)append_json_object_attrs(b,ip,ie,&has_task);
+        if(!has_task&&c&&c->workflow.current_task_id>0&&!tool_use_readonly_op(name)){
+            char tid[24];snprintf(tid,sizeof(tid),"%d",c->workflow.current_task_id);append_escaped_attr(b,"task_id",tid);
+        }
+        badd(b,"]]\n");
+        trace_converted_directive(c,b,dstart);
+        count++;free(name);
+        p=ie?ie:(is?be:p+17);
+    }
+    return count;
+}
+static char *extract_anthropic_answer(VSContext *c,const char *resp){
+    /* With tool_use blocks but no text blocks, extract_anthropic_text would
+       fall back to extract_text() and leak raw JSON into the answer; start
+       from an empty text part in that case. */
+    int has_tu=resp&&strstr(resp,"\"type\":\"tool_use\"")!=NULL;
+    int has_text=resp&&strstr(resp,"\"type\":\"text\"")!=NULL;
+    char *out=(has_tu&&!has_text)?NULL:extract_anthropic_text(resp);
+    if(has_tu){
+        VSBuf b;
+        if(binit(&b,(out?strlen(out):0)+512)==0){
+            int n=0;
+            if(out)badd(&b,out);
+            n=append_tool_use_directives(c,resp,&b);
+            if(n>0){
+                char tb[96];snprintf(tb,sizeof(tb),"converted %d native tool_use block(s) into VS_TOOL directives",n);
+                vs_trace(c,"tool-use-convert",tb);
+                free(out);out=bfinish(c,&b);
+            } else free(b.p);
+        }
+    }
+    return out;
+}
 static char *extract_string_field(const char *json,const char *key){
     const char *p;if(!json||!key)return NULL;p=strstr(json,key);if(!p)return NULL;p+=strlen(key);while(*p==' '||*p=='\t'||*p=='\r'||*p=='\n')p++;if(*p!=':')return NULL;p++;while(*p==' '||*p=='\t'||*p=='\r'||*p=='\n')p++;if(*p!='\"')return NULL;return json_unescape_string(p+1);
 }
@@ -632,7 +751,7 @@ char *vs_chat(VSContext *c,const char *user){
         if(resp)vs_trace(c,"http-result","provider response received");
         free(u);free(body);free(sys);
         if(!resp)return dupstr(vs_cancel_requested(c)?"Stopped by user.":"HTTP request failed");
-        capture_usage(c,resp);out=c->provider.protocol==VS_PROTOCOL_ANTHROPIC?extract_anthropic_text(resp):extract_text(resp);trace_output_reasoning(c,resp,out);free(resp);return out;
+        capture_usage(c,resp);out=c->provider.protocol==VS_PROTOCOL_ANTHROPIC?extract_anthropic_answer(c,resp):extract_text(resp);trace_output_reasoning(c,resp,out);free(resp);return out;
     }
 
     credential=c->provider.api_key;
@@ -706,7 +825,7 @@ char *vs_chat(VSContext *c,const char *user){
     }
     free(endpoint);free(body);free(sys);
     if(!resp)return dupstr(vs_cancel_requested(c)?"Stopped by user.":"HTTP request failed");
-    capture_usage(c,resp);out=c->provider.protocol==VS_PROTOCOL_ANTHROPIC?extract_anthropic_text(resp):extract_text(resp);
+    capture_usage(c,resp);out=c->provider.protocol==VS_PROTOCOL_ANTHROPIC?extract_anthropic_answer(c,resp):extract_text(resp);
     if(out&&*out){const char *q=out;while(*q==' '||*q=='\t'||*q=='\n'||*q=='\r')q++;if(!*q){free(out);out=NULL;}}
     if(!out||!*out){free(out);vs_trace(c,"stream-empty","provider returned an empty completion (no text content); check the model/gateway configuration if this repeats");out=dupstr("The provider returned an empty response with no text content. If this repeats, check the model and gateway configuration.");return out;}
     trace_output_reasoning(c,resp,out);free(resp);return out;

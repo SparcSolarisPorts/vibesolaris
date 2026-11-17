@@ -13,7 +13,7 @@
 
 /* ---------------- state owned by the streaming stub ---------------- */
 static char last_url[1024],last_body[16384],last_headers[4096];
-static const char *plain_response="{\"content\":[{\"type\":\"text\",\"text\":\"plain\"}]}";
+static char plain_response[8192]="{\"content\":[{\"type\":\"text\",\"text\":\"plain\"}]}";
 static int stream_calls=0,plain_calls=0;
 static int stream_result=0;              /* 0 => deliver, <0 => transport failure */
 static const char *feed_sse=NULL;
@@ -83,6 +83,7 @@ static void setup(VSProviderKind kind,VSProtocolKind protocol,const char *base){
     snprintf(ctx.provider.model,sizeof(ctx.provider.model),"claude-sonnet-5");
     snprintf(ctx.provider.api_key,sizeof(ctx.provider.api_key),"sk-test-key");
     stream_calls=plain_calls=0;stream_result=0;feed_slice=0;feed_sse=NULL;feed_len=0;
+    snprintf(plain_response,sizeof(plain_response),"%s","{\"content\":[{\"type\":\"text\",\"text\":\"plain\"}]}");
     emitted_len=0;emitted[0]=0;
     ctx.stream_callback=collect_stream;ctx.stream_callback_data=NULL;
 }
@@ -266,6 +267,42 @@ int main(void){
     feed("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hmm\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");feed_slice=1;
     out=vs_chat(&ctx,"hi");
     if(!out||strcmp(out,"plain")!=0){fprintf(stderr,"FAIL: a thinking-only stream should fall back, got [%s]\n",out?out:"(null)");fails++;}else printf("ok: a thinking-only stream falls back to the non-streaming call\n");
+    free(out);
+
+    /* Native tool_use blocks from an aggregating gateway must be converted
+       back into [[VS_TOOL ...]] directives.  A thinking-only stream forces the
+       non-streaming fallback, which carries the tool_use payload. */
+    setup(VS_PROVIDER_CUSTOM,VS_PROTOCOL_ANTHROPIC,"https://gateway.example.test/v1/messages");
+    ctx.workflow.current_task_id=7;
+    feed("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hmm\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":40}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");feed_slice=1;
+    snprintf(plain_response,sizeof(plain_response),"%s",
+        "{\"content\":["
+        "{\"type\":\"thinking\",\"thinking\":\"let me look\"},"
+        "{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"read\",\"input\":{\"path\":\"/tmp/x.c\",\"start_line\":12}},"
+        "{\"type\":\"tool_use\",\"id\":\"tu_2\",\"name\":\"write\",\"input\":{\"path\":\"/tmp/y.c\",\"content\":\"int main(void){return 0;}\\n\",\"task_id\":\"9\"}}"
+        "],\"stop_reason\":\"tool_use\",\"usage\":{\"input_tokens\":100,\"output_tokens\":50}}");
+    out=vs_chat(&ctx,"hi");
+    if(!out){fprintf(stderr,"FAIL: tool_use conversion returned NULL\n");fails++;}
+    else {
+        if(!strstr(out,"[[VS_TOOL read path=\"/tmp/x.c\" start_line=\"12\"]]")){fprintf(stderr,"FAIL: read tool_use block not converted, got [%s]\n",out);fails++;}
+        else if(strstr(out,"read ")&&strstr(out,"task_id=\"7\"")&&strstr(out,"[[VS_TOOL read")){/* read-only op must not inherit task_id */fprintf(stderr,"FAIL: read-only op inherited task_id: [%s]\n",out);fails++;}
+        else printf("ok: native tool_use blocks convert to VS_TOOL directives\n");
+        if(!strstr(out,"[[VS_TOOL write ")||!strstr(out,"task_id=\"9\"")){fprintf(stderr,"FAIL: write tool_use block lost its explicit task_id: [%s]\n",out);fails++;}
+        else if(!strstr(out,"content=\"int main(void){return 0;}\n\"")){fprintf(stderr,"FAIL: write content attribute mangled: [%s]\n",out);fails++;}
+        else printf("ok: explicit task_id and escaped content survive conversion\n");
+    }
+    free(out);
+
+    /* text_blocks=0 + tool_use blocks: no raw JSON may leak into the answer. */
+    setup(VS_PROVIDER_CUSTOM,VS_PROTOCOL_ANTHROPIC,"https://gateway.example.test/v1/messages");
+    ctx.workflow.current_task_id=4;
+    feed("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");feed_slice=1;
+    snprintf(plain_response,sizeof(plain_response),"%s",
+        "{\"content\":[{\"type\":\"thinking\",\"thinking\":\"x\"},{\"type\":\"tool_use\",\"id\":\"tu_9\",\"name\":\"run\",\"input\":{\"cmd\":\"ls -la\"}}],\"stop_reason\":\"tool_use\",\"usage\":{\"output_tokens\":30}}");
+    out=vs_chat(&ctx,"hi");
+    if(!out||!strstr(out,"[[VS_TOOL run cmd=\"ls -la\" task_id=\"4\"]]")){fprintf(stderr,"FAIL: tool_use-only response should convert cleanly, got [%s]\n",out?out:"(null)");fails++;}
+    else if(strstr(out,"\"type\"")||strstr(out,"stop_reason")){fprintf(stderr,"FAIL: raw JSON leaked into answer: [%s]\n",out);fails++;}
+    else printf("ok: tool_use-only response converts without leaking raw JSON\n");
     free(out);
 
     /* Long answer split across many small chunks: every byte delivered once. */
