@@ -15,6 +15,7 @@
 static char last_url[1024],last_body[16384],last_headers[4096];
 static char plain_response[8192]="{\"content\":[{\"type\":\"text\",\"text\":\"plain\"}]}";
 static int stream_calls=0,plain_calls=0;
+static int recover_with_text=1;          /* 0 => gateway ignores disabled-thinking */
 static int stream_result=0;              /* 0 => deliver, <0 => transport failure */
 static const char *feed_sse=NULL;
 static size_t feed_len=0,feed_slice=0;   /* 0 => deliver the whole document at once */
@@ -30,7 +31,7 @@ char *vs_http_post_ctx(VSContext *c,const char *u,const char *h[],int n,const ch
     for(i=0;i<n;i++){strcat(last_headers,h[i]);strcat(last_headers,"\n");}
     /* Simulate a gateway whose thinking-default exhausts budgets: a request
        with thinking explicitly disabled recovers a real text block. */
-    if(b&&strstr(b,"\"thinking\":{\"type\":\"disabled\"}"))return dupstr_test("{\"content\":[{\"type\":\"text\",\"text\":\"recovered\"}],\"stop_reason\":\"end_turn\",\"usage\":{\"output_tokens\":9}}");
+    if(recover_with_text&&b&&strstr(b,"\"thinking\":{\"type\":\"disabled\"}"))return dupstr_test("{\"content\":[{\"type\":\"text\",\"text\":\"recovered\"}],\"stop_reason\":\"end_turn\",\"usage\":{\"output_tokens\":9}}");
     return dupstr_test(plain_response);
 }
 int vs_http_post_stream_ctx(VSContext *ctx,const char *url,const char *headers[],int nheaders,const char *body,long *status,VSHTTPChunkCallback callback,void *userdata){
@@ -85,7 +86,7 @@ static void setup(VSProviderKind kind,VSProtocolKind protocol,const char *base){
     snprintf(ctx.provider.base_url,sizeof(ctx.provider.base_url),"%s",base);
     snprintf(ctx.provider.model,sizeof(ctx.provider.model),"claude-sonnet-5");
     snprintf(ctx.provider.api_key,sizeof(ctx.provider.api_key),"sk-test-key");
-    stream_calls=plain_calls=0;stream_result=0;feed_slice=0;feed_sse=NULL;feed_len=0;
+    stream_calls=plain_calls=0;stream_result=0;feed_slice=0;feed_sse=NULL;feed_len=0;recover_with_text=1;
     snprintf(plain_response,sizeof(plain_response),"%s","{\"content\":[{\"type\":\"text\",\"text\":\"plain\"}]}");
     emitted_len=0;emitted[0]=0;
     ctx.stream_callback=collect_stream;ctx.stream_callback_data=NULL;
@@ -373,6 +374,19 @@ int main(void){
     if(!out||strcmp(out,"recovered")!=0){fprintf(stderr,"FAIL: empty-content response should retry with thinking disabled, got [%s]\n",out?out:"(null)");fails++;}
     else if(plain_calls!=2){fprintf(stderr,"FAIL: expected original + one disabled-thinking retry, got %d calls\n",plain_calls);fails++;}
     else printf("ok: responses without thinking blocks still retry with thinking disabled\n");
+    free(out);
+
+    /* A gateway that IGNORES the disabled-thinking parameter and keeps
+       returning thinking-only: the thinking content becomes the answer so
+       the agent loop can execute directives embedded in it. */
+    setup(VS_PROVIDER_CUSTOM,VS_PROTOCOL_ANTHROPIC,"https://gateway.example.test/v1/messages");
+    recover_with_text=0;
+    feed("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");feed_slice=1;
+    snprintf(plain_response,sizeof(plain_response),"%s",
+        "{\"content\":[{\"type\":\"thinking\",\"thinking\":\"plan: issue [[VS_TOOL read path=\\\"/tmp\\\"]] now\"}],\"stop_reason\":\"end_turn\",\"usage\":{\"output_tokens\":30}}");
+    out=vs_chat(&ctx,"hi");
+    if(!out||!strstr(out,"[[VS_TOOL read path=\"/tmp\"]]")){fprintf(stderr,"FAIL: thinking content should become the answer with directives intact, got [%s]\n",out?out:"(null)");fails++;}
+    else printf("ok: thinking content becomes the answer when the gateway ignores the retry\n");
     free(out);
 
     /* Long answer split across many small chunks: every byte delivered once. */

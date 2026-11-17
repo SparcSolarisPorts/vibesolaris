@@ -51,7 +51,7 @@ static char *extract_text(const char *json){char *r;
     if((r=extract_after(json,"\"content\":")))return r;
     return dupstr(json);
 }
-static char *extract_anthropic_text(const char *json){
+static char *extract_anthropic_text(VSContext *c,const char *json){
     const char *p,*end;VSBuf b;int found=0;
     char *message;
     if(!json)return NULL;
@@ -74,11 +74,30 @@ static char *extract_anthropic_text(const char *json){
         if(found)badd(&b,"\n");badd(&b,part);free(part);found=1;
         p=t+1;while(p<end){if(*p=='\\'&&p+1<end){p+=2;continue;}if(*p=='\"'){p++;break;}p++;}
     }
-    /* The content array existed but held no text blocks (e.g. thinking-only,
-       or tool_use handled by the caller).  extract_text() would grab the
-       first quoted string after "content" — the word "type" from
-       [{"type":"thinking"}] — so report "no text" instead of that garbage. */
-    if(found)return bfinish(NULL,&b);free(b.p);return NULL;
+    /* The content array existed but held no text blocks (thinking-only, or
+       tool_use handled by the caller).  extract_text() would grab the first
+       quoted string after "content" — the word "type" from
+       [{"type":"thinking"}] — so never fall back to it.  Instead, surface
+       the thinking content itself as the answer: gateways that exhaust the
+       thinking budget often keep the model's planned [[VS_TOOL ...]]
+       directives in there, and the agent loop can execute those; pure
+       reasoning is handled by the no-marker nudge.  A guaranteed empty turn
+       is the only worse outcome. */
+    if(found)return bfinish(NULL,&b);
+    free(b.p);
+    {const char *q=json;int got=0;
+     if(binit(&b,256)==0){
+        while((q=strstr(q,"\"thinking\":\""))!=NULL){
+            char *part=json_unescape_string(q+12);
+            if(!part)break;
+            if(*part){if(got)badd(&b,"\n");badd(&b,part);got=1;}
+            free(part);
+            q+=12;
+        }
+        if(got){if(c)vs_trace(c,"thinking-as-answer","no text blocks; using thinking block content as the answer");return bfinish(NULL,&b);}
+        free(b.p);
+     }}
+    return NULL;
 }
 /* Aggregating gateways sometimes translate the text-marker protocol into
    native Anthropic tool_use blocks (stop_reason=tool_use).  The agent loop
@@ -183,7 +202,7 @@ static char *extract_anthropic_answer(VSContext *c,const char *resp){
        from an empty text part in that case. */
     int has_tu=resp&&strstr(resp,"\"type\":\"tool_use\"")!=NULL;
     int has_text=resp&&strstr(resp,"\"type\":\"text\"")!=NULL;
-    char *out=(has_tu&&!has_text)?NULL:extract_anthropic_text(resp);
+    char *out=(has_tu&&!has_text)?NULL:extract_anthropic_text(c,resp);
     if(has_tu){
         VSBuf b;
         if(binit(&b,(out?strlen(out):0)+512)==0){
