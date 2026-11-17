@@ -1103,11 +1103,13 @@ char *vs_agent_turn(VSContext *c,const char *user){
                     if(c->workflow.mode==VS_MODE_MANUAL){c->workflow.action_approved=0;c->workflow.pending_request[0]=0;}
                     vs_trace(c,"directive-rejected",why);if(why_detail[0])vs_trace(c,"directive-detail",why_detail);
                     if(gate==-1){
-                        fixmsg=(char*)malloc(strlen(why)+strlen(detail)+512);
+                        static const char quoting[]=
+                            "\nATTRIBUTE QUOTING RULES (the usual cause of unterminated values): attribute values are delimited by double quotes. A literal double quote inside a value must be written as \\\" and a literal backslash as \\\\. Example: [[VS_TOOL run task_id=\"1\" cmd=\"echo \\\"hello world\\\"\"]] — or prefer single quotes inside shell commands: [[VS_TOOL run task_id=\"1\" cmd=\"echo 'hello world'\"]]. Newlines inside write content are written as \\n and are unescaped by the host. XML entities such as &quot; are NOT supported. For long or quote-heavy file content, base64-encode it: [[VS_TOOL run task_id=\"1\" cmd=\"printf %s 'BASE64' | base64 -d > FILE\"]].";
+                        fixmsg=(char*)malloc(strlen(why)+strlen(detail)+sizeof(quoting)+512);
                         if(!fixmsg){free(ans);ans=dupstr(why);break;}
-                        snprintf(fixmsg,strlen(why)+strlen(detail)+512,
-                            "ERROR: %s%s Supported operations: read, list, search, glob, grep, graph, web_search, web_fetch, run, write, edit, multi_edit, image, notebook_read, notebook_edit, monitor, monitor_output, monitor_kill, subagent, todo, plan_task_complete, task_create, task_update, task_list, task_search, task_delete, checkpoint, lsp, permission, auto_mode, team_message, team_read, team_broadcast, code_review, plugin, init, skill, slash_command, tool_search, enter_worktree, exit_worktree, computer_use_screenshot, computer_use_click, computer_use_move, computer_use_type. Fix the directive(s) and re-emit them in full.",
-                            why,detail);
+                        snprintf(fixmsg,strlen(why)+strlen(detail)+sizeof(quoting)+512,
+                            "ERROR: %s%s Supported operations: read, list, search, glob, grep, graph, web_search, web_fetch, run, write, edit, multi_edit, image, notebook_read, notebook_edit, monitor, monitor_output, monitor_kill, subagent, todo, plan_task_complete, task_create, task_update, task_list, task_search, task_delete, checkpoint, lsp, permission, auto_mode, team_message, team_read, team_broadcast, code_review, plugin, init, skill, slash_command, tool_search, enter_worktree, exit_worktree, computer_use_screenshot, computer_use_click, computer_use_move, computer_use_type.%s Re-emit the directive(s) in full with every inner quote escaped.",
+                            why,detail,quoting);
                     }else{
                         char tasks[1024];size_t tp=0;int ti;
                         for(ti=0;ti<c->workflow.task_count&&tp<sizeof(tasks)-192;ti++){
