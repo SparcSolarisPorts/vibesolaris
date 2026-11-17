@@ -12,7 +12,10 @@
 #define VS_MAX_PATH 1024
 #define VS_MAX_TEXT (1024*1024)
 #define VS_MAX_TOOL_ROUNDS 64
+#define VS_MAX_MALFORMED_RECOVERIES 2 /* malformed-batch re-emit attempts per agent turn */
 #define VS_MAX_PLAN_CONTINUES 16
+#define VS_MIN_PLAN_EXPLORE_ROUNDS 2 /* read-only exploration rounds expected before an Auto-mode plan is adopted */
+#define VS_MAX_PLAN_DEFERRALS 3      /* times an under-researched Auto-mode plan is sent back for verification */
 #define VS_MAX_TOOL_RECOVERIES 12
 #define VS_ACTIVE_TASK_MAX (16U*1024U)
 #define VS_LONG_TASK_CHECKPOINT 8
@@ -1427,6 +1430,8 @@ int  vs_lsp_spawn_server(VSLSPServer *srv, const char *cmd, const char *root_pat
 int  vs_lsp_initialize(VSLSPServer *srv);
 char *vs_lsp_diagnostics(VSLSPServer *servers, int *count, const char *file_path);
 char *vs_lsp_definition(VSLSPServer *servers, int *count, const char *file_path, int line, int col);
+char *vs_lsp_diagnostics_compat(const char *file_path);
+char *vs_lsp_definition_compat(const char *file_path, int line, int col);
 char *vs_lsp_hover(VSLSPServer *servers, int *count, const char *file_path, int line, int col);
 char *vs_lsp_rename(VSLSPServer *servers, int *count, const char *file_path, int line, int col, const char *new_name);
 void vs_lsp_shutdown_all(VSLSPServer *servers, int *count);
@@ -1516,7 +1521,7 @@ void vs_slash_init(VSSlashStore *store, const char *path);
 int  vs_slash_register(VSSlashStore *store, const char *name, const char *command, const char *description);
 int  vs_slash_remove(VSSlashStore *store, const char *name);
 VSSlashCommand *vs_slash_find(VSSlashStore *store, const char *name);
-char *vs_slash_execute(const char *name, const char *args);
+char *vs_slash_execute(VSSlashStore *store, const char *name, const char *args);
 char *vs_slash_list(VSSlashStore *store, int max_lines);
 void vs_slash_load(VSSlashStore *store);
 int  vs_slash_persist(VSSlashStore *store);

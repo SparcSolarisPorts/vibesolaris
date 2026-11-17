@@ -34,3 +34,6 @@ char *vs_graph_summary(const VSGraph*g,int n){(void)g;(void)n;return optional_to
 void vs_history_clear(VSContext *c){(void)c;}
 void vs_cache_clear(VSContext *c){(void)c;}
 int main(void){VSContext c;char *out;VSTaskRecord task;memset(&c,0,sizeof(c));vs_workflow_init(&c.workflow);memset(&task,0,sizeof(task));task.id=1;strcpy(task.title,"Compaction actions");if(vs_workflow_set_plan(&c.workflow,"Compaction test",&task,1)!=0||vs_workflow_accept(&c.workflow)!=0)return 1;putenv("VIBESOLARIS_AGENT_COMPACT_ROUNDS=4");out=vs_agent_turn(&c,"please implement and test all of it");printf("out=%s normal=%d compact=%d runs=%d persisted=%d checkpoint=%d\n",out?out:"(null)",normal_chats,compact_chats,runs,persisted,saw_checkpoint);if(!out||strcmp(out,"complete")||normal_chats!=7||compact_chats<1||runs!=5||persisted!=2||!saw_checkpoint){free(out);return 1;}free(out);return 0;}
+
+/* Stub for util.c (agent tests do not link it). */
+char *vs_shell_quote(const char *s){const char *p;size_t n=2;char *o,*w;if(!s)s="";for(p=s;*p;p++)n+=(*p=='\'')?4:1;o=(char*)malloc(n+1);if(!o)return NULL;w=o;*w++='\'';for(p=s;*p;p++){if(*p=='\''){memcpy(w,"'\\''",4);w+=4;}else *w++=*p;}*w++='\'';*w=0;return o;}

@@ -199,6 +199,8 @@ char *vs_build_system_prompt(const VSContext *c){
         "  [[VS_TOOL multi_edit task_id=\"ID\" path=\"FILE\" edits=\"search1|replace1;search2|replace2\"]]\n"
         "  [[VS_TOOL lsp task_id=\"ID\" command=\"diagnostics\" path=\"FILE\"]]\n"
          "  [[VS_TOOL lsp task_id=\"ID\" command=\"definition\" path=\"FILE\" line=\"1\" col=\"1\"]]\n"
+         "  [[VS_TOOL lsp task_id=\"ID\" command=\"hover\" path=\"FILE\" line=\"1\" col=\"1\"]]\n"
+         "  [[VS_TOOL lsp task_id=\"ID\" command=\"rename\" path=\"FILE\" line=\"1\" col=\"1\" new_name=\"new_symbol\"]]\n"
          "  [[VS_TOOL permission task_id=\"ID\" action=\"allow\" tool=\"Bash\"]]\n"
          "  [[VS_TOOL permission task_id=\"ID\" action=\"deny\" tool=\"Write\" path=\"production.*\"]]\n"
          "  [[VS_TOOL task_create task_id=\"ID\" title=\"Task title\" description=\"Details\" priority=\"high\"]]\n"

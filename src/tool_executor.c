@@ -37,7 +37,16 @@ int vs_tool_executor_is_readonly(const char *directive, int is_mcp)
            !strncmp(directive, "[[VS_TOOL web_search ", 21) ||
            !strncmp(directive, "[[VS_TOOL web_fetch ", 20) ||
            !strncmp(directive, "[[VS_TOOL glob ", 15) ||
-           !strncmp(directive, "[[VS_TOOL grep ", 15);
+           !strncmp(directive, "[[VS_TOOL grep ", 15) ||
+           !strncmp(directive, "[[VS_TOOL notebook_read ", 21) ||
+           !strncmp(directive, "[[VS_TOOL monitor_output ", 24) ||
+           !strncmp(directive, "[[VS_TOOL task_list ", 19) ||
+           !strncmp(directive, "[[VS_TOOL task_search ", 21) ||
+           !strncmp(directive, "[[VS_TOOL lsp ", 14) ||
+           !strncmp(directive, "[[VS_TOOL tool_search ", 21) ||
+           !strncmp(directive, "[[VS_TOOL list_mcp_resources ", 28) ||
+           !strncmp(directive, "[[VS_TOOL read_mcp_resource ", 29) ||
+           !strncmp(directive, "[[VS_TOOL computer_use_screenshot ", 33);
 }
 
 /* Thread entry for parallel tool execution */

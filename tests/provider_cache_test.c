@@ -93,3 +93,7 @@ int main(void){
     if(c.provider_cached_tokens!=90||c.provider_cache_write_tokens!=9){fprintf(stderr,"last provider cache read/write=%ld/%ld, want 90/9\n",c.provider_cached_tokens,c.provider_cache_write_tokens);return 10;}
     puts("provider cache accounting test passed");return 0;
 }
+
+/* Minimal POSIX single-quote escaping stub: hooks.c/slash.c reference
+ * vs_shell_quote (defined in util.c, not linked by this test). */
+char *vs_shell_quote(const char *s){const char *p;size_t n=2;char *o,*w;if(!s)s="";for(p=s;*p;p++)n+=(*p=='\'')?4:1;o=(char*)malloc(n+1);if(!o)return NULL;w=o;*w++='\'';for(p=s;*p;p++){if(*p=='\''){memcpy(w,"'\\''",4);w+=4;}else *w++=*p;}*w++='\'';*w=0;return o;}

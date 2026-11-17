@@ -153,38 +153,63 @@ VSSlashCommand *vs_slash_find(VSSlashStore *store, const char *name)
     return NULL;
 }
 
-char *vs_slash_execute(const char *name, const char *args)
+char *vs_slash_execute(VSSlashStore *store, const char *name, const char *args)
 {
-    /* Execute a slash command by running its command template with args substituted.
-     * This is a simple implementation that runs the command via popen. */
+    /* Execute a registered slash command: look the template up in the store,
+     * substitute $ARGS (or append the args), and run it via popen. */
     VSSlashCommand *cmd;
-    char full_cmd[1024];
+    char *full_cmd, *sub = NULL, *result;
+    const char *placeholder;
     FILE *f;
     char buf[4096];
-    char *result;
+    int len;
 
-    /* Find the command in a temporary store — in practice this would use the context store */
-    /* For now, we just return a placeholder */
-    if (!name || !name[0]) return dupstr("ERROR: no slash command name");
+    if (!store || !name || !name[0]) return dupstr("ERROR: no slash command name");
+    cmd = vs_slash_find(store, name);
+    if (!cmd) { size_t z = strlen(name) + 64; char *e = (char *)malloc(z); if (e) snprintf(e, z, "ERROR: unknown slash command \"%s\" (use /slash list)", name); return e ? e : dupstr("ERROR: unknown slash command"); }
 
-    /* Build command with args substitution */
-    if (args && args[0]) {
-        snprintf(full_cmd, sizeof(full_cmd), "%s %s", name, args);
+    /* Build the command line with args substitution.  The template runs
+     * through the shell as-is (it is user-authored configuration, same trust
+     * model as hooks); only the substituted args are quoted. */
+    placeholder = strstr(cmd->command, "$ARGS");
+    if (placeholder) {
+        char *qargs = vs_shell_quote(args && *args ? args : "");
+        size_t head, tail, z;
+        if (!qargs) return dupstr("ERROR: out of memory");
+        head = (size_t)(placeholder - cmd->command);
+        tail = strlen(placeholder + 5);
+        z = head + strlen(qargs) + tail + 1;
+        sub = (char *)malloc(z);
+        if (!sub) { free(qargs); return dupstr("ERROR: out of memory"); }
+        memcpy(sub, cmd->command, head);
+        memcpy(sub + head, qargs, strlen(qargs));
+        memcpy(sub + head + strlen(qargs), placeholder + 5, tail + 1);
+        free(qargs);
+    } else if (args && *args) {
+        char *qargs = vs_shell_quote(args);
+        size_t z;
+        if (!qargs) return dupstr("ERROR: out of memory");
+        z = strlen(cmd->command) + strlen(qargs) + 2;
+        sub = (char *)malloc(z);
+        if (!sub) { free(qargs); return dupstr("ERROR: out of memory"); }
+        snprintf(sub, z, "%s %s", cmd->command, qargs);
+        free(qargs);
     } else {
-        strncpy(full_cmd, name, sizeof(full_cmd) - 1);
-        full_cmd[sizeof(full_cmd) - 1] = 0;
+        sub = dupstr(cmd->command);
+        if (!sub) return dupstr("ERROR: out of memory");
     }
+    full_cmd = sub;
 
     f = popen(full_cmd, "r");
+    free(full_cmd);
     if (!f) return dupstr("ERROR: failed to execute slash command");
-
     result = (char *)malloc(4096);
     if (!result) {
         pclose(f);
         return dupstr("ERROR: out of memory");
     }
     result[0] = 0;
-    int len = 0;
+    len = 0;
     while (fgets(buf, sizeof(buf), f) && len < 4092) {
         int blen = (int)strlen(buf);
         if (len + blen >= 4092) blen = 4092 - len;
@@ -234,7 +259,6 @@ void vs_slash_load(VSSlashStore *store)
 {
     FILE *f;
     char line[2048];
-    char val[512];
 
     if (!store) return;
     f = fopen(store->store_path, "r");

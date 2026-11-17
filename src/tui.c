@@ -635,6 +635,10 @@ static void tui_stream_render_final_locked(const char *answer,int cancelled)
 {
     answer=vs_tui_stream_select_answer(&tui_stream,answer,cancelled);
     if(tui_stream_answer_rendered)return;
+    /* MessageDisplay hooks observe the completed answer text once per
+       message (mirrors Claude Code's PostMessageDisplay; running a shell
+       command per streamed token would be unusable). */
+    if(tui_active_ctx&&tui_active_ctx->hooks.hook_count)vs_hooks_run_message_display(&tui_active_ctx->hooks,answer?answer:"");
     if(!tui_stream_heading_shown){
         cprintf(T_BOLD T_GREEN,"\n%s\n",tui_stream_heading);
         tui_stream_heading_shown=1;
@@ -832,6 +836,9 @@ static void help(void)
     cprintf(T_CYAN,"  /graph files|fields [PATH]    ");printf("inspect project relationships; add dot MODE PATH OUT.dot to export\n");
     cprintf(T_CYAN,"  /cache on|off|status|clear\n");
     cprintf(T_CYAN,"  /history status|clear\n");
+    cprintf(T_CYAN,"  /hooks list|add [pre|post] PATTERN CMD|remove INDEX|clear\n");
+    cprintf(T_CYAN,"  /slash list|add NAME CMD|remove NAME|clear\n");
+    cprintf(T_DIM,"  Custom slash commands may use $ARGS in their command template.\n");
     cprintf(T_CYAN,"  /usage                        ");printf("show provider-reported token usage for the current conversation\n");
     cprintf(T_CYAN,"  /trace                        ");printf("show compact activity trace; /trace full shows the bounded stored trace\n");
     cprintf(T_CYAN,"  Ctrl+C during agent work      ");printf("stop the active provider/MCP/command operation without exiting VibeSolaris\n");
@@ -1546,8 +1553,48 @@ int main(int argc, char **argv)
                 } else {
                     errorf("Invalid hook index\n");
                 }
+            } else if (!strcmp(arg,"clear")) {
+                if (vs_hooks_clear(&c.hooks) == 0) {
+                    vs_hooks_persist(&c.hooks);
+                    successf("All hooks cleared\n");
+                } else {
+                    errorf("Could not clear hooks\n");
+                }
             } else {
-                errorf("usage: /hooks list|add [pre|post] TOOL CMD|remove INDEX\n");
+                errorf("usage: /hooks list|add [pre|post] TOOL CMD|remove INDEX|clear\n");
+            }
+        } else if (!strncmp(line,"/slash ",7) || !strcmp(line,"/slash")) {
+            const char *arg = strlen(line) > 6 ? line + 7 : "";
+            if (!strcmp(arg,"list") || !strcmp(arg,"")) {
+                char *r = vs_slash_list(&c.slashes, 64);
+                if (r) { cprintf(T_BOLD T_BLUE, "Slash commands\n"); printf("%s", r); free(r); }
+            } else if (!strncmp(arg,"add ",4)) {
+                char *rest = arg + 4;
+                char *sp = strchr(rest, ' ');
+                if (!sp) { errorf("usage: /slash add NAME COMMAND_TEMPLATE\n"); continue; }
+                *sp = 0;
+                if (vs_slash_register(&c.slashes, rest, sp+1, "") == 0) {
+                    vs_slash_persist(&c.slashes);
+                    successf("Slash command added\n");
+                } else {
+                    errorf("Slash command limit reached or invalid name\n");
+                }
+            } else if (!strncmp(arg,"remove ",7)) {
+                if (vs_slash_remove(&c.slashes, arg + 7) == 0) {
+                    vs_slash_persist(&c.slashes);
+                    successf("Slash command removed\n");
+                } else {
+                    errorf("Unknown slash command\n");
+                }
+            } else if (!strcmp(arg,"clear")) {
+                if (vs_slash_clear(&c.slashes) == 0) {
+                    vs_slash_persist(&c.slashes);
+                    successf("All slash commands cleared\n");
+                } else {
+                    errorf("Could not clear slash commands\n");
+                }
+            } else {
+                errorf("usage: /slash list|add NAME CMD|remove NAME|clear\n");
             }
         } else if (!strncmp(line,"/rename ",8)) {
             const char *new_name = line + 8;

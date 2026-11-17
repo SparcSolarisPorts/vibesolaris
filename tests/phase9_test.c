@@ -331,3 +331,7 @@ int main(void) {
     printf("\nResult: %d/%d tests passed\n", passed, tests);
     return (passed == tests) ? 0 : 1;
 }
+
+/* Minimal POSIX single-quote escaping stub: hooks.c references vs_shell_quote
+ * (defined in util.c, not linked by this test). */
+char *vs_shell_quote(const char *s){const char *p;size_t n=2;char *o,*w;if(!s)s="";for(p=s;*p;p++)n+=(*p=='\'')?4:1;o=(char*)malloc(n+1);if(!o)return NULL;w=o;*w++='\'';for(p=s;*p;p++){if(*p=='\''){memcpy(w,"'\\''",4);w+=4;}else *w++=*p;}*w++='\'';*w=0;return o;}

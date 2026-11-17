@@ -138,6 +138,24 @@ int vs_hooks_remove(VSHooksStore *store, int index)
     return 0;
 }
 
+/* Build "command 'arg1' ['arg2']" with proper shell quoting.  Caller frees. */
+static char *hook_build_cmd(const char *command, const char *arg1, const char *arg2)
+{
+    char *q1 = NULL, *q2 = NULL, *out;
+    size_t n;
+    if (!command) return NULL;
+    if (arg1) { q1 = vs_shell_quote(arg1); if (!q1) return NULL; }
+    if (arg2) { q2 = vs_shell_quote(arg2); if (!q2) { free(q1); return NULL; } }
+    n = strlen(command) + (q1 ? strlen(q1) : 0) + (q2 ? strlen(q2) : 0) + 4;
+    out = (char *)malloc(n);
+    if (!out) { free(q1); free(q2); return NULL; }
+    if (q1 && q2) snprintf(out, n, "%s %s %s", command, q1, q2);
+    else if (q1) snprintf(out, n, "%s %s", command, q1);
+    else snprintf(out, n, "%s", command);
+    free(q1); free(q2);
+    return out;
+}
+
 /* Run all pre-hooks matching a tool name. Returns 0 on success. */
 int vs_hooks_run_pre(VSHooksStore *store, const char *tool_name)
 {
@@ -149,12 +167,8 @@ int vs_hooks_run_pre(VSHooksStore *store, const char *tool_name)
         VSHook *h = &store->hooks[i];
         if (!h->is_pre) continue;
         if (!hook_matches(h->matcher, tool_name)) continue;
-
-        /* Run the hook command */
-        char full_cmd[1024];
-        snprintf(full_cmd, sizeof(full_cmd), "%s \"%s\"", h->command, tool_name);
-        int rc = system(full_cmd);
-        (void)rc; /* Ignore exit code for hooks */
+        { char *full_cmd = hook_build_cmd(h->command, tool_name, NULL);
+          if (full_cmd) { int rc = system(full_cmd); (void)rc; free(full_cmd); } }
     }
     return 0;
 }
@@ -170,15 +184,12 @@ int vs_hooks_run_post(VSHooksStore *store, const char *tool_name, const char *re
         VSHook *h = &store->hooks[i];
         if (h->is_pre) continue;
         if (!hook_matches(h->matcher, tool_name)) continue;
-
-        /* Run the hook command with result as argument */
-        char full_cmd[1024];
-        const char *result_preview = result ? result : "";
-        size_t rlen = strlen(result_preview);
-        if (rlen > 100) rlen = 100;
-        snprintf(full_cmd, sizeof(full_cmd), "%s \"%s\" \"%.*s\"", h->command, tool_name, (int)rlen, result_preview);
-        int rc = system(full_cmd);
-        (void)rc;
+        { char preview[101]; const char *rp = result ? result : "";
+          size_t rlen = strlen(rp);
+          if (rlen > 100) rlen = 100;
+          memcpy(preview, rp, rlen); preview[rlen] = 0;
+          { char *full_cmd = hook_build_cmd(h->command, tool_name, preview);
+            if (full_cmd) { int rc = system(full_cmd); (void)rc; free(full_cmd); } } }
     }
     return 0;
 }
@@ -291,7 +302,8 @@ int vs_hooks_clear(VSHooksStore *store)
     return 0;
 }
 
-/* Run MessageDisplay hooks — triggered as streaming tokens arrive */
+/* Run MessageDisplay hooks — fired once per completed assistant message by
+   the TUI (per-token invocation would shell out on every streamed chunk). */
 int vs_hooks_run_message_display(VSHooksStore *store, const char *text)
 {
     int i;
@@ -301,13 +313,11 @@ int vs_hooks_run_message_display(VSHooksStore *store, const char *text)
     for (i = 0; i < store->hook_count; i++) {
         VSHook *h = &store->hooks[i];
         if (h->hook_type != VS_HOOK_MESSAGE_DISPLAY) continue;
-
-        char full_cmd[1024];
-        size_t tlen = strlen(text);
-        if (tlen > 200) tlen = 200;
-        snprintf(full_cmd, sizeof(full_cmd), "%s \"%.*s\"", h->command, (int)tlen, text);
-        int rc = system(full_cmd);
-        (void)rc;
+        { char preview[201]; size_t tlen = strlen(text);
+          if (tlen > 200) tlen = 200;
+          memcpy(preview, text, tlen); preview[tlen] = 0;
+          { char *full_cmd = hook_build_cmd(h->command, preview, NULL);
+            if (full_cmd) { int rc = system(full_cmd); (void)rc; free(full_cmd); } } }
     }
     return 0;
 }
@@ -330,12 +340,12 @@ int vs_hooks_run_prompt(VSHooksStore *store, const char *prompt, char *modified,
         if (h->hook_type != VS_HOOK_PROMPT) continue;
 
         /* Run hook, capture output to modify prompt */
-        char full_cmd[1024];
-        snprintf(full_cmd, sizeof(full_cmd), "%s \"%s\"", h->command, prompt);
+        char *full_cmd = hook_build_cmd(h->command, prompt, NULL);
+        if (!full_cmd) continue;
 
         FILE *fp = popen(full_cmd, "r");
+        free(full_cmd);
         if (fp && modified && cap > 0) {
-            char hook_output[VS_MAX_TEXT];
             size_t olen = 0;
             char line[512];
             while (fgets(line, sizeof(line), fp) && olen < cap - 1) {

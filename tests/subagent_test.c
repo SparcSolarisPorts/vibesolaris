@@ -190,3 +190,6 @@ int main(void){
     if(fails){fprintf(stderr,"%d failure(s)\n",fails);return 1;}
     printf("all subagent tests passed\n");return 0;
 }
+
+/* Stub for util.c (agent tests do not link it). */
+char *vs_shell_quote(const char *s){const char *p;size_t n=2;char *o,*w;if(!s)s="";for(p=s;*p;p++)n+=(*p=='\'')?4:1;o=(char*)malloc(n+1);if(!o)return NULL;w=o;*w++='\'';for(p=s;*p;p++){if(*p=='\''){memcpy(w,"'\\''",4);w+=4;}else *w++=*p;}*w++='\'';*w=0;return o;}

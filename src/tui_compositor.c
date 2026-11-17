@@ -111,11 +111,9 @@ int vs_tui_compositor_enter(VSTUICompositor *comp)
         return -1;
     }
     fputs(ALT_ENTER CLEAR_SCREEN CURSOR_HIDE, stdout);
-    /* Enable mouse tracking (XTerm button event + any event mode) */
-    fputs(CSI "?1000h" CSI "?1002h" CSI "?1006h", stdout);
     fflush(stdout);
     comp->mode = VS_TUI_MODE_FULLSCREEN;
-    comp->mouse_enabled = 1;
+    vs_tui_compositor_enable_mouse(comp);
     vs_tui_compositor_resize(comp);
     return 0;
 }
@@ -123,12 +121,10 @@ int vs_tui_compositor_enter(VSTUICompositor *comp)
 void vs_tui_compositor_exit(VSTUICompositor *comp)
 {
     if (comp->mode != VS_TUI_MODE_FULLSCREEN) return;
-    /* Disable mouse tracking */
-    fputs(CSI "?1006l" CSI "?1002l" CSI "?1000l", stdout);
+    vs_tui_compositor_disable_mouse(comp);
     fputs(CURSOR_SHOW ALT_EXIT, stdout);
     fflush(stdout);
     comp->mode = VS_TUI_MODE_PROMPT;
-    comp->mouse_enabled = 0;
 }
 
 void vs_tui_compositor_resize(VSTUICompositor *comp)
@@ -427,7 +423,7 @@ void vs_tui_compositor_end_streaming(VSTUICompositor *comp)
 {
     if (comp->streaming && comp->stream_pos > 0) {
         comp->stream_buf[comp->stream_pos] = 0;
-        vs_tui_compositor_add_line(comp, comp->stream_buf);
+        vs_tui_compositor_add_lines(comp, comp->stream_buf);
     }
     comp->streaming = 0;
     comp->stream_pos = 0;
@@ -497,6 +493,31 @@ int vs_tui_compositor_read_input(VSTUICompositor *comp, char *out, size_t cap)
                             comp->input_cursor++;
                         } else if (seq[1] == 'D' && comp->input_cursor > 0) {
                             comp->input_cursor--;
+                        }
+                    } else if (seq[1] == '<') {
+                        /* SGR mouse event: ESC [ < B ; COL ; ROW M/m */
+                        unsigned char mbuf[32];
+                        int mi = 0, mrow, mcol, mbtn;
+                        mbuf[mi++] = '<';
+                        while (mi < (int)sizeof(mbuf) - 1) {
+                            unsigned char mc;
+                            if (read(STDIN_FILENO, &mc, 1) != 1) break;
+                            mbuf[mi++] = mc;
+                            if (mc == 'M' || mc == 'm') break;
+                        }
+                        mbuf[mi] = 0;
+                        if (vs_tui_compositor_parse_mouse(mbuf, &mrow, &mcol, &mbtn)) {
+                            if (mbtn == 64) {
+                                vs_tui_compositor_scroll_page_up(comp);
+                            } else if (mbtn == 65) {
+                                vs_tui_compositor_scroll_page_down(comp);
+                            } else if (mbtn == 0 && mrow == comp->term_rows - 1) {
+                                /* Left click on the input bar: place the cursor. */
+                                int pos = mcol - 1;
+                                if (pos < 0) pos = 0;
+                                if (pos > comp->input_len) pos = comp->input_len;
+                                comp->input_cursor = pos;
+                            }
                         }
                     } else if (seq[1] == '~') {
                         /* ESC [ ~ — some terminals use this for Home/End */
@@ -594,39 +615,36 @@ void vs_tui_compositor_disable_mouse(VSTUICompositor *comp)
     comp->mouse_enabled = 0;
 }
 
-/* Parse X11 mouse escape sequence: ESC [ < C ; R ; M m/M
+/* Parse X11 mouse escape sequence in SGR mode: ESC [ < B ; COL ; ROW M/m
+   (seq points at the '<' and must be NUL-terminated).
    Returns 1 on success, 0 on failure.
-   button: 0=release, 1=left, 2=middle, 3=right, 5=scroll-up, 6=scroll-down */
+   button: 0=left, 1=middle, 2=right, 3=release, 64=scroll-up, 65=scroll-down */
 int vs_tui_compositor_parse_mouse(unsigned char *seq, int *row, int *col, int *button)
 {
-    /* seq should contain: < C ; R ; M (after the initial ESC [ M) */
-    /* Format: ESC [ M < col+32 ; row+32 ; button */
     if (!seq || !row || !col || !button) return 0;
 
     int b = 0, c = 0, r = 0;
-    /* Parse the button event: first byte is 32+button, then <, then coords */
-    /* SGR mode: ESC [ < button ; col ; row ; M/m */
+    /* SGR mode only: ESC [ < button ; col ; row M/m (plain decimal values) */
     if (seq[0] == '<') {
-        /* SGR extended mode */
         int i = 1;
-        /* Parse button */
-        while (seq[i] && seq[i] != ';') {
+        while (seq[i] >= '0' && seq[i] <= '9') {
             b = b * 10 + (seq[i] - '0');
             i++;
         }
-        if (seq[i] == ';') i++;
-        /* Parse col */
-        while (seq[i] && seq[i] != ';') {
+        if (seq[i] != ';') return 0;
+        i++;
+        while (seq[i] >= '0' && seq[i] <= '9') {
             c = c * 10 + (seq[i] - '0');
             i++;
         }
-        if (seq[i] == ';') i++;
-        /* Parse row */
-        while (seq[i] && seq[i] != ' ' && seq[i] != 'M' && seq[i] != 'm') {
+        if (seq[i] != ';') return 0;
+        i++;
+        while (seq[i] >= '0' && seq[i] <= '9') {
             r = r * 10 + (seq[i] - '0');
             i++;
         }
-        *button = b - 32; /* Normalize button number */
+        if (seq[i] != 'M' && seq[i] != 'm') return 0;
+        *button = b;
         *col = c;
         *row = r;
         return 1;

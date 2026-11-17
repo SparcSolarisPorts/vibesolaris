@@ -221,6 +221,14 @@ test-agent:
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/web_test.c src/web.c -o /tmp/vibesolaris-web-test
 	/tmp/vibesolaris-web-test
 
+test-agent-extended-tools:
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/agent_extended_tools_test.c $(AGENT_SRCS) $(AGENT_MCP_STUB) $(CURL_LIBS) $(CRYPTO_LIBS) $(THREAD_LIBS) -o /tmp/vibesolaris-agent-extended-tools-test
+	/tmp/vibesolaris-agent-extended-tools-test
+
+test-agent-plan-deferral:
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/agent_plan_deferral_test.c $(AGENT_SRCS) $(AGENT_MCP_STUB) $(CURL_LIBS) $(CRYPTO_LIBS) $(THREAD_LIBS) -o /tmp/vibesolaris-agent-plan-deferral-test
+	/tmp/vibesolaris-agent-plan-deferral-test
+
 test-subagent:
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/subagent_test.c $(AGENT_SRCS) $(AGENT_MCP_STUB) $(CURL_LIBS) $(CRYPTO_LIBS) $(THREAD_LIBS) -o /tmp/vibesolaris-subagent-test
 	/tmp/vibesolaris-subagent-test
@@ -429,7 +437,7 @@ test-phase9:
 test-basic: test-keybindings test-provider-stream test-tui-stream test-todo test-edit test-memory test-skill test-coordinator test-tool-executor test-glob test-grep test-notebook test-monitor test-multi-edit test-lsp test-permission test-task test-checkpoint test-dream test-auto-mode test-agent-team test-plugin test-code-review test-init-cmd test-settings test-hooks-extended test-project-index test-tui-theme test-tui-suggestions test-tui-slash test-tui-editor test-reasoning test-rewind test-security-review test-loop test-workflow-engine test-cross-session test-phase9 test-computer-use-macos
 
 # No X11, but these targets link libcurl and libcrypto.
-test-headless-deps: test-goal test-agent test-subagent test-workflow test-claude-oauth test-provider-cache
+test-headless-deps: test-goal test-agent test-agent-extended-tools test-agent-plan-deferral test-subagent test-workflow test-claude-oauth test-provider-cache
 
 test-headless: test-basic test-headless-deps
 

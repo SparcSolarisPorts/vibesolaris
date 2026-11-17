@@ -354,7 +354,7 @@ void vs_history_clear(VSContext *ctx) {
     vs_usage_clear(ctx);
 }
 
-void vs_shutdown(VSContext *ctx) { if(!ctx)return;(void)vs_persist_settings(ctx);vs_mcp_shutdown(ctx);vs_trace_clear(ctx);vs_history_clear(ctx);vs_cache_clear(ctx);vs_computer_use_shutdown();vs_fork_cleanup(ctx);vs_lsp_shutdown_all(ctx->lsp_servers,&ctx->lsp_server_count); }
+void vs_shutdown(VSContext *ctx) { if(!ctx)return;(void)vs_persist_settings(ctx);vs_mcp_shutdown(ctx);vs_trace_clear(ctx);vs_history_clear(ctx);vs_cache_clear(ctx);vs_computer_use_shutdown();vs_fork_cleanup(ctx);vs_lsp_shutdown_all(ctx->lsp_servers,&ctx->lsp_server_count);vs_subagent_cache_clear(ctx); }
 
 int vs_write_file(const char *path, const char *text) {
     FILE *f=fopen(path,"wb"); size_t n=strlen(text);

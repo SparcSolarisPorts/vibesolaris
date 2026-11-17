@@ -47,3 +47,6 @@ void vs_cache_clear(VSContext *c){(void)c;}
 int main(void){VSContext c;char *out;memset(&c,0,sizeof(c));vs_workflow_init(&c.workflow);out=vs_agent_turn(&c,"ok that all sounds good, do all that");if(!out||c.workflow.phase!=VS_WORKFLOW_AWAITING_ACCEPT||runs!=0){free(out);return 1;}free(out);if(vs_workflow_accept(&c.workflow)!=0)return 1;out=vs_agent_turn(&c,"continue accepted task");
     printf("answer=%s\nchats=%d runs=%d\n",out?out:"(null)",chats,runs);
     if(!out||strcmp(out,"Done after recovery.")||chats!=7||runs!=3){free(out);return 1;}free(out);return 0;}
+
+/* Stub for util.c (agent tests do not link it). */
+char *vs_shell_quote(const char *s){const char *p;size_t n=2;char *o,*w;if(!s)s="";for(p=s;*p;p++)n+=(*p=='\'')?4:1;o=(char*)malloc(n+1);if(!o)return NULL;w=o;*w++='\'';for(p=s;*p;p++){if(*p=='\''){memcpy(w,"'\\''",4);w+=4;}else *w++=*p;}*w++='\'';*w=0;return o;}

@@ -97,10 +97,10 @@ int vs_secure_config_dir(char *out, size_t cap)
 
 int vs_secure_config_path(char *out, size_t cap)
 {
-    const char *d = config_dir();
-    size_t n = strlen(d), l = strlen("config.enc");
-    if (!out || cap == 0 || n + 1 + l + 1 > cap) return -1;
-    strcpy(out, d);
+    size_t n, l = strlen("config.enc");
+    if (vs_secure_config_dir(out, cap) != 0) return -1;
+    n = strlen(out);
+    if (n + 1 + l + 1 > cap) return -1;
     if (n && out[n-1] != '/') strcat(out, "/");
     strcat(out, "config.enc");
     return 0;
