@@ -26,7 +26,6 @@
 #define T_BLUE    "\033[34m"
 #define T_MAGENTA "\033[35m"
 #define T_CYAN    "\033[36m"
-#define T_WHITE   "\033[37m"
 
 static int tui_colour = 0;
 static int tui_colour_mode = -1; /* -1 auto, 0 never, 1 always */
@@ -116,17 +115,6 @@ static int tui_editor_width(void)
     struct winsize w;
     if(ioctl(STDOUT_FILENO,TIOCGWINSZ,&w)==0&&w.ws_col>=12)return w.ws_col;
     return 80;
-}
-static void tui_editor_position(const char *buf,size_t end,size_t *row,size_t *col)
-{
-    size_t i;int width=tui_editor_width();*row=0;*col=2;
-    for(i=0;buf&&i<end&&buf[i];i++){
-        unsigned char ch=(unsigned char)buf[i];
-        if(ch=='\n'){(*row)++;*col=0;continue;}
-        if((ch&0xc0)==0x80)continue;
-        if(ch=='\t')*col+=4;else *col+=1;
-        if(*col>=(size_t)width){*row+=*col/(size_t)width;*col%=(size_t)width;}
-    }
 }
 static void tui_redraw_cursor(const char *buf,size_t cursor);
 static void complete_slash(char *buf,size_t cap,size_t *len)

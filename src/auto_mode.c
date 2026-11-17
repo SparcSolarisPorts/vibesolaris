@@ -16,7 +16,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define VS_AUTO_MODE_CONFIG "~/.vibesolaris/auto_mode.json"
 
 /* ---- Internal helpers ---- */
 

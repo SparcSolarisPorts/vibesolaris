@@ -24,19 +24,6 @@ static char *dupstr(const char *s){
     return r;
 }
 
-static char *strjoin(const char *a, const char *b){
-    if(!a && !b) return dupstr("");
-    if(!a) return dupstr(b);
-    if(!b) return dupstr(a);
-    size_t la = strlen(a), lb = strlen(b);
-    char *r = (char*)malloc(la + lb + 1);
-    if(!r) return NULL;
-    memcpy(r, a, la);
-    memcpy(r + la, b, lb);
-    r[la+lb] = 0;
-    return r;
-}
-
 /* Convert a file path to a file:// URI */
 static void path_to_uri(const char *path, char *uri, size_t cap){
     if(!path || !uri || cap < 8) return;
@@ -186,18 +173,6 @@ static const char *json_string_at(const char *json, const char *key){
     }
     result[ri] = 0;
     return result;
-}
-
-/* Extract JSON integer at key */
-static int json_int_at(const char *json, const char *key, int default_val){
-    if(!json || !key) return default_val;
-    char search[256];
-    snprintf(search, sizeof(search), "\"%s\":", key);
-    const char *p = strstr(json, search);
-    if(!p) return default_val;
-    p += strlen(search);
-    while(*p == ' ' || *p == '\t') p++;
-    return atoi(p);
 }
 
 /* Check if JSON contains a key */

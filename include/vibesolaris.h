@@ -48,20 +48,7 @@
 /* ---- Context window management ---- */
 #define VS_CONTEXT_WINDOW_DEFAULT 1000000
 #define VS_COMPACT_AT_PERCENT 75
-#define VS_TOKENS_PER_CHAR_ESTIMATE 4
-#define VS_HISTORY_SUMMARIZE_MAX 4
-#define VS_SUBAGENT_RESULT_FILE_DIR "~/.vibesolaris/subagent_results"
-#define VS_SUBAGENT_SCRATCH_DIR "~/.vibesolaris/subagent_scratch"
 #define VS_SUBAGENT_CACHE_MAX 64
-
-/* ---- Fork sessions ---- */
-#define VS_MAX_FORKS 4
-
-/* ---- Image display ---- */
-#define VS_IMAGE_DISPLAY_MAX 4
-
-/* ---- Conversation save/restore ---- */
-#define VS_MAX_CONVERSATIONS 32
 
 /* ---- Auto-memory ---- */
 #define VS_MAX_AUTO_MEMORY 32
@@ -99,7 +86,6 @@ typedef struct {
 #define VS_TEAM_ID_MAX 64
 #define VS_TEAM_AGENT_ID_MAX 64
 #define VS_TEAM_ROLE_MAX 64
-#define VS_TEAM_MESSAGE_MAX (4U*1024U)
 
 typedef struct {
     char id[VS_TEAM_AGENT_ID_MAX];
@@ -388,8 +374,6 @@ typedef struct {
 
 /* ---- Edit tool: targeted file modifications ---- */
 #define VS_EDIT_DIFF_MAX (64U*1024U)
-#define VS_EDIT_SEARCH_MAX (8U*1024U)
-#define VS_EDIT_REPLACE_MAX (8U*1024U)
 
 /* ---- Glob tool: pattern-based file discovery ---- */
 #define VS_MAX_GLOB_RESULTS 512
@@ -410,12 +394,9 @@ typedef struct {
 #define VS_MAX_MULTI_EDIT_PAIRS 16
 
 /* ---- LSP tool: Language Server Protocol ---- */
-#define VS_MAX_LSP_DIAGNOSTICS 32
 #define VS_LSP_MSG_MAX (32U*1024U)
 #define VS_MAX_LSP_SERVERS 4
 #define VS_LSP_REQUEST_TIMEOUT 10  /* seconds */
-#define VS_LSP_ID_MAX 64
-#define VS_LSP_URI_MAX VS_MAX_PATH
 
 /* ---- Multi-layer settings system ---- */
 #define VS_SETTINGS_KEY_MAX 128
@@ -748,7 +729,6 @@ typedef struct {
 #define VS_MAX_HTTP_RESPONSE (64U*1024U*1024U)
 #define VS_MAX_REQUEST_BODY (96U*1024U*1024U)
 #define VS_MAX_COMMAND_CAPTURE (1U*1024U*1024U)
-#define VS_MAX_TOOL_RESULT (2U*1024U*1024U)
 #define VS_MAX_ATTACHMENT_TEXT (4U*1024U*1024U)
 #define VS_FILE_CACHE_BLOB_MAX (2U*1024U*1024U)
 
@@ -786,8 +766,6 @@ typedef struct {
 } VSGraph;
 
 #define VS_GLOBAL_CONFIG_DIR "/etc/vibesolaris"
-#define VS_GLOBAL_CONFIG_FILE "/etc/vibesolaris/config.enc"
-#define VS_GLOBAL_KEY_FILE "/etc/vibesolaris/master.key"
 #define VS_USER_CONFIG_SUBDIR ".vibesolaris"
 
 typedef enum {
@@ -1113,11 +1091,6 @@ typedef struct {
     VSCheckpointStore checkpoints;
     int checkpoint_enabled;
     long last_escape_time;      /* for Escape x2 detection */
-    pthread_t fork_threads[VS_MAX_FORKS];
-    int fork_active[VS_MAX_FORKS];
-    char fork_output_file[VS_MAX_FORKS][VS_MAX_PATH];
-    long fork_started_at[VS_MAX_FORKS];
-    int fork_count;
 
     /* Phase 4: Advanced features */
     VSAutoModeStore auto_mode;
@@ -1593,13 +1566,6 @@ int  vs_conversation_delete(const char *id);
 
 /* ---- Image display (continued) ---- */
 void vs_display_image(const char *base64_data, size_t base64_len, const char *description);
-
-/* ---- Fork sessions (continued) ---- */
-void vs_fork_init(VSContext *ctx);
-int  vs_fork_start(VSContext *ctx);
-void vs_fork_kill(VSContext *ctx, int id);
-char *vs_fork_list(VSContext *ctx, int max_lines);
-void vs_fork_cleanup(VSContext *ctx);
 
 /* ---- Checkpoints (git snapshots) ---- */
 void vs_checkpoint_init(VSCheckpointStore *store);

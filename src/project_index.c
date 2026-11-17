@@ -54,16 +54,6 @@ static char *dupstr(const char *s)
     return p;
 }
 
-static int is_source_file(const char *path)
-{
-    const char *ext = strrchr(path, '.');
-    if (!ext) return 0;
-    return !strcmp(ext, ".c") || !strcmp(ext, ".h") || !strcmp(ext, ".cpp") ||
-           !strcmp(ext, ".java") || !strcmp(ext, ".py") || !strcmp(ext, ".rs") ||
-           !strcmp(ext, ".go") || !strcmp(ext, ".ts") || !strcmp(ext, ".js") ||
-           !strcmp(ext, ".kt") || !strcmp(ext, ".rb");
-}
-
 static void compute_project_hash(const char *root, char *hash, size_t cap)
 {
     /* Simple hash: just use the path itself truncated */

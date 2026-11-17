@@ -172,34 +172,6 @@ __attribute__((weak)) void vs_display_image(const char *base64_data, size_t base
     (void)base64_data; (void)base64_len; (void)description;
 }
 
-/* ---- Fork session stubs ---- */
-__attribute__((weak)) void vs_fork_init(VSContext *ctx)
-{
-    (void)ctx;
-}
-
-__attribute__((weak)) int vs_fork_start(VSContext *ctx)
-{
-    (void)ctx;
-    return -1;
-}
-
-__attribute__((weak)) void vs_fork_kill(VSContext *ctx, int id)
-{
-    (void)ctx; (void)id;
-}
-
-__attribute__((weak)) char *vs_fork_list(VSContext *ctx, int max_lines)
-{
-    (void)ctx; (void)max_lines;
-    return mdup("(no active forks)");
-}
-
-__attribute__((weak)) void vs_fork_cleanup(VSContext *ctx)
-{
-    (void)ctx;
-}
-
 /* ---- CLAUDE.md stub ---- */
 __attribute__((weak)) int vs_load_claude_md(VSContext *ctx)
 {

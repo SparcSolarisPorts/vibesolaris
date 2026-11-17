@@ -354,7 +354,7 @@ void vs_history_clear(VSContext *ctx) {
     vs_usage_clear(ctx);
 }
 
-void vs_shutdown(VSContext *ctx) { if(!ctx)return;(void)vs_persist_settings(ctx);vs_mcp_shutdown(ctx);vs_trace_clear(ctx);vs_history_clear(ctx);vs_cache_clear(ctx);vs_computer_use_shutdown();vs_fork_cleanup(ctx);vs_lsp_shutdown_all(ctx->lsp_servers,&ctx->lsp_server_count);vs_subagent_cache_clear(ctx); }
+void vs_shutdown(VSContext *ctx) { if(!ctx)return;(void)vs_persist_settings(ctx);vs_mcp_shutdown(ctx);vs_trace_clear(ctx);vs_history_clear(ctx);vs_cache_clear(ctx);vs_computer_use_shutdown();vs_lsp_shutdown_all(ctx->lsp_servers,&ctx->lsp_server_count);vs_subagent_cache_clear(ctx); }
 
 int vs_write_file(const char *path, const char *text) {
     FILE *f=fopen(path,"wb"); size_t n=strlen(text);
@@ -835,91 +835,6 @@ void vs_display_image(const char *base64_data, size_t base64_len, const char *de
         /* SSH fallback: text placeholder */
         printf("[image: %s, %zu bytes]\n", description ? description : "unknown", base64_len);
     }
-}
-
-/* ---- Fork sessions ---- */
-static void *fork_worker(void *v)
-{
-    VSContext *ctx = (VSContext *)v;
-    char line[4096];
-    /* Fork runs independently — output goes to the log file */
-    while (fgets(line, sizeof(line), stdin)) {
-        char *result = vs_agent_turn(ctx, line);
-        if (result) {
-            printf("%s\n", result);
-            fflush(stdout);
-            free(result);
-        }
-    }
-    return NULL;
-}
-
-void vs_fork_init(VSContext *ctx)
-{
-    if (!ctx) return;
-    memset(ctx->fork_threads, 0, sizeof(ctx->fork_threads));
-    memset(ctx->fork_active, 0, sizeof(ctx->fork_active));
-    memset(ctx->fork_output_file, 0, sizeof(ctx->fork_output_file));
-    memset(ctx->fork_started_at, 0, sizeof(ctx->fork_started_at));
-    ctx->fork_count = 0;
-}
-
-int vs_fork_start(VSContext *ctx)
-{
-    if (!ctx || ctx->fork_count >= VS_MAX_FORKS) return -1;
-    char dir[VS_MAX_PATH], path[VS_MAX_PATH];
-    const char *home = getenv("HOME");
-    int id = ctx->fork_count;
-    if (home) snprintf(dir, sizeof(dir), "%s/.vibesolaris/forks", home);
-    else snprintf(dir, sizeof(dir), "/tmp/vibesolaris_forks");
-    mkdir(dir, 0700);
-    snprintf(path, sizeof(path), "%s/%d.log", dir, id);
-    strncpy(ctx->fork_output_file[id], path, VS_MAX_PATH - 1);
-    ctx->fork_started_at[id] = time(NULL);
-    /* Simple fork: spawn a thread that reads from a pipe */
-    ctx->fork_active[id] = 1;
-    ctx->fork_count++;
-    return id;
-}
-
-void vs_fork_kill(VSContext *ctx, int id)
-{
-    if (!ctx || id < 0 || id >= VS_MAX_FORKS) return;
-    ctx->fork_active[id] = 0;
-    if (ctx->fork_threads[id]) {
-        pthread_cancel(ctx->fork_threads[id]);
-        pthread_join(ctx->fork_threads[id], NULL);
-        ctx->fork_threads[id] = 0;
-    }
-}
-
-char *vs_fork_list(VSContext *ctx, int max_lines)
-{
-    char buf[4096];
-    int pos = 0, i;
-    if (!ctx || ctx->fork_count == 0) return dupstr("(no active forks)");
-    for (i = 0; i < ctx->fork_count && pos < 4000; i++) {
-        pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
-            "Fork #%d: %s (started %ld)\n", i,
-            ctx->fork_active[i] ? "active" : "stopped",
-            ctx->fork_started_at[i]);
-    }
-    buf[pos] = 0;
-    return dupstr(buf);
-}
-
-void vs_fork_cleanup(VSContext *ctx)
-{
-    int i;
-    if (!ctx) return;
-    for (i = 0; i < ctx->fork_count; i++) {
-        if (ctx->fork_active[i] && ctx->fork_threads[i]) {
-            pthread_cancel(ctx->fork_threads[i]);
-            pthread_join(ctx->fork_threads[i], NULL);
-        }
-    }
-    ctx->fork_count = 0;
-    memset(ctx->fork_active, 0, sizeof(ctx->fork_active));
 }
 
 /* Computer Use (X11) is now in src/computer_use.c */

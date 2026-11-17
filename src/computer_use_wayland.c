@@ -18,14 +18,6 @@ static int has_grim(void)
     return status == 0;
 }
 
-static int has_slurp(void)
-{
-    int status;
-    char *out = vs_run_command("which slurp 2>/dev/null", &status);
-    free(out);
-    return status == 0;
-}
-
 static int has_swaymsg(void)
 {
     int status;

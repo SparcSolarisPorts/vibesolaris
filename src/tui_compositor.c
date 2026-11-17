@@ -30,7 +30,6 @@
 #define CLEAR_SCREEN CSI "2J" CSI "H"
 #define CURSOR_HIDE CSI "?25l"
 #define CURSOR_SHOW CSI "?25h"
-#define CURSOR_MOVE CSI "%d;%dH"
 #define ERASE_LINE CSI "2K"
 #define ERASE_RESET CSI "2K" RESET
 #define BOLD CSI "1m"
@@ -39,8 +38,6 @@
 #define COLOR_CYAN CSI "36m"
 #define COLOR_GREEN CSI "32m"
 #define COLOR_YELLOW CSI "33m"
-#define COLOR_MAGENTA CSI "35m"
-#define COLOR_BLUE CSI "34m"
 #define COLOR_RED CSI "31m"
 #define COLOR_WHITE CSI "37m"
 #define COLOR_BG CSI "40m"

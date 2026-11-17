@@ -23,9 +23,7 @@
 
 #define VS_WORKFLOW_MAX_STEPS 32
 #define VS_WORKFLOW_MAX_PARALLEL 8
-#define VS_WORKFLOW_NAME_MAX 256
 #define VS_WORKFLOW_PROMPT_MAX 2048
-#define VS_WORKFLOW_RESULT_MAX (16U*1024U)
 
 /* ---- Internal helpers ---- */
 
@@ -57,17 +55,6 @@ static const char *wf_json_string(const char *json, const char *key, const char 
     if (end[0] != '"') return NULL;
     if (out_end) *out_end = end;
     return pos;
-}
-
-static int wf_json_int(const char *json, const char *key, int default_val)
-{
-    char search[256];
-    snprintf(search, sizeof(search), "\"%s\":", key);
-    const char *pos = strstr(json, search);
-    if (!pos) return default_val;
-    pos += strlen(search);
-    while (*pos == ' ' || *pos == '\t' || *pos == '\n') pos++;
-    return atoi(pos);
 }
 
 /* Find a JSON array: "key":[...], return pointer to '[' and end ']' */

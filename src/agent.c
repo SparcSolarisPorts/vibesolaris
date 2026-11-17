@@ -591,7 +591,6 @@ static int preflight_batch_ex(VSContext *c,const char *answer,int *count_out,cha
     if(c&&authorized&&n>0)c->workflow.current_task_id=staged_task;
     return 0;
 }
-static int preflight_batch(VSContext *c,const char *answer,int *count_out){return preflight_batch_ex(c,answer,count_out,NULL,0);}
 static int parse_plan_marker(VSContext *c,const char *answer)
 {
     const char *mark=strstr(answer?answer:"","[[VS_PLAN ");
