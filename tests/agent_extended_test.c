@@ -11,7 +11,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static int scenario=0,chats=0,runs=0,compact_chats=0;
+static int scenario=0,chats=0,runs=0,compact_chats=0,empty_nudges_seen=0;
 static int parallel_seen=0,mixed_seen=0,prior_state_seen=0;
 static char root[512],file1[640];
 static char *d(const char*s){size_t n=strlen(s);char*p=(char*)malloc(n+1);memcpy(p,s,n+1);return p;}
@@ -21,6 +21,7 @@ char *vs_chat(VSContext *c,const char *p){
     if(c->subagent_depth==1)return d("[[VS_FINAL]]research complete");
     if(strstr(p,"INTERNAL_CONTEXT_COMPACTION")){compact_chats++;return d("FORCED_STATE: investigated the failure thoroughly");}
     chats++;
+    if(strstr(p,"arrived EMPTY"))empty_nudges_seen++;
     if(scenario==1)return d("[[VS_TOOL run task_id=\"2\" cmd=\"printf early\"]]");
     if(scenario==2){
         if(chats==1)return d("[[VS_TOOL plan_task_complete task_id=\"99\" summary=\"ghost\"]]");
@@ -63,6 +64,17 @@ char *vs_chat(VSContext *c,const char *p){
            the batch executes instead of deadlocking behind /plan accept. */
         if(chats==1)return d("[[VS_TOOL run cmd=\"printf implicit\"]]\n[[VS_TOOL read path=\"/tmp\"]]");
         return d("[[VS_FINAL]]final11");}
+    if(scenario==12){
+        /* Empty provider completions are transport failures: three in a row
+           stop with the transport report, never the no-marker narration
+           report, and the model is nudged to re-issue between retries. */
+        return d("The provider returned an empty response with no text content. If this repeats, check the model and gateway configuration.");}
+    if(scenario==13){
+        /* A single empty completion must not consume the no-marker strike
+           budget: the turn continues and the next directive executes. */
+        if(chats==1)return d("The provider returned an empty response with no text content. If this repeats, check the model and gateway configuration.");
+        if(chats==2)return d("[[VS_TOOL run cmd=\"printf back\"]]");
+        return d("[[VS_FINAL]]final13");}
     return d("[[VS_FINAL]]unexpected");
 }
 void vs_trace(VSContext*c,const char*k,const char*x){(void)c;(void)k;(void)x;}
@@ -201,6 +213,25 @@ int main(void)
     out=vs_agent_turn(&c,"just do it");
     if(!out||!strstr(out,"final11")||runs!=1||!vs_workflow_authorized(&c.workflow)){fprintf(stderr,"scenario 11 (implicit auto plan) failed: %s runs=%d authorized=%d\n",out?out:"(null)",runs,vs_workflow_authorized(&c.workflow));free(out);return 11;}
     free(out);puts("ok: Auto mode synthesizes and auto-accepts an implicit plan instead of deadlocking");
+
+    /* 12: three consecutive empty provider completions stop with the
+       transport-flavored report (and nudges between retries), not the
+       no-marker narration report. */
+    memset(&c.workflow,0,sizeof(c.workflow));
+    c.workflow.mode=VS_MODE_AUTO;
+    scenario=12;chats=runs=empty_nudges_seen=0;
+    out=vs_agent_turn(&c,"keep going");
+    if(!out||!strstr(out,"repeatedly returned empty responses")||strstr(out,"stopped after 3 consecutive")||chats!=3){fprintf(stderr,"scenario 12 (empty completion transport stop) failed: %s chats=%d nudges=%d\n",out?out:"(null)",chats,empty_nudges_seen);free(out);return 12;}
+    free(out);puts("ok: repeated empty completions stop with a transport report, not a narration strikeout");
+
+    /* 13: a single empty completion is retried with a nudge and the turn
+       continues executing; it never counts against the no-marker budget. */
+    memset(&c.workflow,0,sizeof(c.workflow));
+    c.workflow.mode=VS_MODE_AUTO;
+    scenario=13;chats=runs=empty_nudges_seen=0;
+    out=vs_agent_turn(&c,"keep going");
+    if(!out||!strstr(out,"final13")||runs!=1||empty_nudges_seen<1){fprintf(stderr,"scenario 13 (empty completion recovery) failed: %s runs=%d\n",out?out:"(null)",runs);free(out);return 13;}
+    free(out);puts("ok: a single empty completion is nudged and retried without stalling the turn");
 
     puts("extended agent scenarios passed");
     return 0;

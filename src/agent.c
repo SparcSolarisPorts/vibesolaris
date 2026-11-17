@@ -83,7 +83,7 @@ static char *fallback_checkpoint(VSContext *c,const char *task){size_t cap=VS_AG
     q=vs_compact_text_limit(o,VS_AGENT_CHECKPOINT_MAX,"autonomous working-state checkpoint");free(o);return q;
 }
 
-static int bad_checkpoint(const char *s){if(!s||!*s)return 1;if(strstr(s,"[[VS_TOOL")||strstr(s,"[[VS_MCP")||strstr(s,"[[VS_FINAL")||strstr(s,"[[VS_NEED_USER"))return 1;if(!strncmp(s,"HTTP request failed",19)||!strncmp(s,"provider error",14)||!strncmp(s,"No API",6))return 1;return 0;}
+static int bad_checkpoint(const char *s){if(!s||!*s)return 1;if(strstr(s,"[[VS_TOOL")||strstr(s,"[[VS_MCP")||strstr(s,"[[VS_FINAL")||strstr(s,"[[VS_NEED_USER"))return 1;if(!strncmp(s,"HTTP request failed",19)||!strncmp(s,"provider error",14)||!strncmp(s,"No API",6)||!strncmp(s,"The provider returned an empty response",39))return 1;return 0;}
 
 static void append_plan_state(VSContext *c,char **pstr);
 static void agent_compact_impl(VSContext *c,const char *task,int completed_rounds,int force){
@@ -951,7 +951,7 @@ static char *stamp_task_ids(VSContext *c,char *ans){
     return b.p;
 }
 char *vs_agent_turn(VSContext *c,const char *user){
-    char *prompt=dupstr(user),*ans=0,*original=dupstr(user),*task_anchor=0,*last_tool_result=0,*last_directives=0;int round,plan_continues=0,no_progress=0,tool_recoveries=0,malformed_recoveries=0,task_gate_recoveries=0,command_runner_confirmed=0,actual_tool_seen=0,execution_mode=0,cancelled=0,max_rounds=VS_MAX_TOOL_ROUNDS,explore_rounds=0,plan_deferrals=0;char step[512];
+    char *prompt=dupstr(user),*ans=0,*original=dupstr(user),*task_anchor=0,*last_tool_result=0,*last_directives=0;int round,plan_continues=0,no_progress=0,tool_recoveries=0,malformed_recoveries=0,task_gate_recoveries=0,command_runner_confirmed=0,actual_tool_seen=0,execution_mode=0,cancelled=0,max_rounds=VS_MAX_TOOL_ROUNDS,explore_rounds=0,plan_deferrals=0,empty_completions=0;char step[512];
     {const char *mr=getenv("VIBESOLARIS_MAX_AGENT_ROUNDS");if(mr&&*mr){char *ep=0;long v=strtol(mr,&ep,10);if(ep&&*ep==0&&v>=8&&v<=256)max_rounds=(int)v;}}
     if(!prompt||!original){free(prompt);free(original);return dupstr("out of memory");}
     task_anchor=build_task_anchor(c,original);if(!task_anchor)task_anchor=dupstr(original);if(!task_anchor){free(prompt);free(original);return dupstr("out of memory");}
@@ -1194,6 +1194,28 @@ char *vs_agent_turn(VSContext *c,const char *user){
                     agent_history_add(c,"user",prompt);agent_history_add(c,"assistant",ans);
                     free(prompt);prompt=retry;continue;
                 }
+            }
+            /* An empty provider completion is a transport-level failure, not
+               model narration: it must never burn no-marker recovery
+               budget or be quoted back as if the model had said it.  Nudge
+               and retry a bounded number of times, then stop with a
+               transport-flavored report. */
+            if(!strncmp(ans,"The provider returned an empty response",39)){
+                if(empty_completions<VS_MAX_EMPTY_COMPLETION_RETRIES){
+                    char *next;
+                    empty_completions++;
+                    snprintf(step,sizeof(step),"empty provider completion; retrying with a nudge (%d/%d)",empty_completions,VS_MAX_EMPTY_COMPLETION_RETRIES);
+                    vs_trace(c,"empty-completion",step);
+                    agent_history_add(c,"user",prompt);
+                    next=dupstr("Your previous response arrived EMPTY: the gateway delivered thinking with no text content, so nothing could execute. Re-issue your intended action as concrete [[VS_TOOL ...]] directives now (each naming task_id from the accepted plan where required), or [[VS_FINAL]] only if the task is genuinely complete.");
+                    free(prompt);prompt=next;
+                    if(!prompt){vs_trace(c,"memory-error","could not allocate empty-completion retry prompt");break;}
+                    continue;
+                }
+                vs_trace(c,"empty-completion-limit","provider kept returning empty completions; stopping the turn");
+                free(ans);ans=dupstr("The provider repeatedly returned empty responses (thinking-only content with no text), so this turn made no progress. This is a model/gateway-side issue rather than an agent error: check the gateway's thinking/streaming configuration, or switch model or provider, then re-issue the request.");
+                if(!ans){vs_trace(c,"memory-error","could not allocate empty-completion failure report");break;}
+                break;
             }
             if(execution_mode||actual_tool_seen||(c->workflow.mode==VS_MODE_AUTO&&prospective_language(ans))){
                 plan_continues++;no_progress++;
