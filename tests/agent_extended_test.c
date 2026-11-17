@@ -57,6 +57,12 @@ char *vs_chat(VSContext *c,const char *p){
            host must run the completion first, not reject the batch. */
         if(chats==1)return d("[[VS_TOOL plan_task_complete task_id=\"1\" summary=\"done\"]]\n[[VS_TOOL run task_id=\"2\" cmd=\"printf two\"]]");
         return d("[[VS_FINAL]]final10");}
+    if(scenario==11){
+        /* No plan was ever proposed, yet a side-effecting batch arrives in
+           Auto mode: an implicit plan is synthesized, task_ids stamped, and
+           the batch executes instead of deadlocking behind /plan accept. */
+        if(chats==1)return d("[[VS_TOOL run cmd=\"printf implicit\"]]\n[[VS_TOOL read path=\"/tmp\"]]");
+        return d("[[VS_FINAL]]final11");}
     return d("[[VS_FINAL]]unexpected");
 }
 void vs_trace(VSContext*c,const char*k,const char*x){(void)c;(void)k;(void)x;}
@@ -185,6 +191,16 @@ int main(void)
     out=vs_agent_turn(&c,"do all the tasks");
     if(!out||!strstr(out,"final10")||runs!=1||c.workflow.tasks[0].status!=VS_TASK_COMPLETED){fprintf(stderr,"scenario 10 (split-phase completion) failed: %s runs=%d status=%d\n",out?out:"(null)",runs,c.workflow.tasks[0].status);free(out);return 10;}
     free(out);puts("ok: batch completing a task and continuing with its dependent runs split-phase");
+
+    /* 11: Auto mode with no plan proposed must not deadlock on a
+       side-effecting batch (there is nothing /plan accept could accept):
+       an implicit plan is synthesized and the batch's task_ids stamped. */
+    memset(&c.workflow,0,sizeof(c.workflow));
+    c.workflow.mode=VS_MODE_AUTO;
+    scenario=11;chats=runs=0;
+    out=vs_agent_turn(&c,"just do it");
+    if(!out||!strstr(out,"final11")||runs!=1||!vs_workflow_authorized(&c.workflow)){fprintf(stderr,"scenario 11 (implicit auto plan) failed: %s runs=%d authorized=%d\n",out?out:"(null)",runs,vs_workflow_authorized(&c.workflow));free(out);return 11;}
+    free(out);puts("ok: Auto mode synthesizes and auto-accepts an implicit plan instead of deadlocking");
 
     puts("extended agent scenarios passed");
     return 0;

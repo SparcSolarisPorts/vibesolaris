@@ -895,6 +895,61 @@ static int split_phase_completions(VSContext *c,char *ans,int *batch_count,char 
 }
 
 
+/* Auto mode: a side-effecting batch arrived with no accepted plan (the model
+   skipped the [[VS_PLAN]] proposal).  Deadlocking the user behind an approval
+   that can never be granted helps nobody, so adopt a minimal implicit plan
+   and auto-accept it, the same way an explicitly proposed plan would be. */
+static int synthesize_implicit_plan(VSContext *c){
+    VSTaskRecord t;char title[VS_PLAN_TITLE_MAX];
+    if(!c)return 0;
+    memset(&t,0,sizeof t);
+    t.id=1;t.status=VS_TASK_READY;
+    snprintf(t.title,sizeof t.title,"%s","Execute the proposed actions");
+    snprintf(title,sizeof title,"%s","Auto plan: proposed actions");
+    if(vs_workflow_set_plan(&c->workflow,title,&t,1)!=0)return 0;
+    if(vs_workflow_accept(&c->workflow)!=0)return 0;
+    return 1;
+}
+/* Side-effecting VS_TOOL directives that lack task_id get the current plan
+   task stamped in, so a batch admitted via an implicit plan (or a model
+   that just forgot) passes preflight instead of bouncing into recovery. */
+static char *stamp_task_ids(VSContext *c,char *ans){
+    const char *p=ans;char *d;int is_mcp,need=0;ABuffer b;
+    if(!c||!ans||c->workflow.current_task_id<=0)return ans;
+    {const char *scan=ans;
+     while((d=next_directive(&scan,&is_mcp))!=NULL){char *td=NULL;
+         if(!is_mcp&&!directive_read_only(d,is_mcp)&&(td=attr(d,"task_id"))==NULL)need=1;
+         if(td)free(td);
+         free(d);}}
+    if(!need)return ans;
+    if(ab_init(&b,strlen(ans)+256)!=0)return ans;
+    while(1){
+        const char *t=strstr(p,"[[VS_TOOL "),*e;char *dd,*have;
+        size_t pre;
+        if(!t){ab_add(&b,p);break;}
+        pre=(size_t)(t-p);
+        ab_addn(&b,p,pre);
+        e=strstr(t,"]]" );
+        if(!e){ab_add(&b,t);break;}
+        {size_t dn=(size_t)(e+2-t);dd=(char*)malloc(dn+1);
+         if(!dd){ab_add(&b,t);break;}
+         memcpy(dd,t,dn);dd[dn]=0;
+         ab_add(&b,dd);
+         have=attr(dd,"task_id");
+         if(!directive_read_only(dd,0)&&!have){
+             char tid[24];
+             b.n-=2;b.p[b.n]=0;
+             snprintf(tid,sizeof(tid),"%d",c->workflow.current_task_id);
+             ab_add(&b," task_id=\"");ab_add(&b,tid);ab_add(&b,"\"]]");
+         }
+         if(have)free(have);
+         free(dd);
+         p=e+2;}
+    }
+    if(b.truncated){free(b.p);return ans;}
+    free(ans);
+    return b.p;
+}
 char *vs_agent_turn(VSContext *c,const char *user){
     char *prompt=dupstr(user),*ans=0,*original=dupstr(user),*task_anchor=0,*last_tool_result=0,*last_directives=0;int round,plan_continues=0,no_progress=0,tool_recoveries=0,malformed_recoveries=0,task_gate_recoveries=0,command_runner_confirmed=0,actual_tool_seen=0,execution_mode=0,cancelled=0,max_rounds=VS_MAX_TOOL_ROUNDS,explore_rounds=0,plan_deferrals=0;char step[512];
     {const char *mr=getenv("VIBESOLARIS_MAX_AGENT_ROUNDS");if(mr&&*mr){char *ep=0;long v=strtol(mr,&ep,10);if(ep&&*ep==0&&v>=8&&v<=256)max_rounds=(int)v;}}
@@ -1097,9 +1152,20 @@ char *vs_agent_turn(VSContext *c,const char *user){
             int read_only=1,check_mcp;const char *check=ans;char *item;
             while((item=next_directive(&check,&check_mcp))!=NULL){if(!directive_read_only(item,check_mcp))read_only=0;free(item);}
             if(!read_only){
-                vs_trace(c,"approval-blocked","side-effecting directive withheld until the user accepts a proposed plan");
-                free(ans);ans=dupstr("Plan approval is required before side-effecting tools can run. Review the proposal with /plan, then use /plan accept.");
-                break;
+                /* Auto mode must never deadlock here: with no plan proposed
+                   there is nothing /plan accept could accept, so adopt a
+                   minimal implicit plan, stamp the batch's task_ids, and let
+                   it execute — the same outcome an accepted proposal gives. */
+                if(c->workflow.mode==VS_MODE_AUTO&&synthesize_implicit_plan(c)){
+                    vs_trace(c,"plan-auto-accepted","implicit plan auto-accepted for side-effecting batch without a proposal");
+                    ans=stamp_task_ids(c,ans);
+                    tool=ans?strstr(ans,"[[VS_TOOL "):NULL;
+                    mcp=ans?strstr(ans,"[[VS_MCP "):NULL;
+                } else {
+                    vs_trace(c,"approval-blocked","side-effecting directive withheld until the user accepts a proposed plan");
+                    free(ans);ans=dupstr("Plan approval is required before side-effecting tools can run, but no plan is pending. Re-issue the request so the agent proposes one with [[VS_PLAN ...]], review it with /plan, then use /plan accept; or switch to Auto mode to have plans accepted automatically.");
+                    break;
+                }
             }
         }
         if((tool||mcp)&&vs_workflow_needs_action_approval(&c->workflow)){
