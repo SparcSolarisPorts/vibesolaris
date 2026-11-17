@@ -514,6 +514,7 @@ static const char *trace_colour(const char *kind)
     if(!kind)return T_DIM;
     if(strstr(kind,"reasoning"))return T_MAGENTA;
     if(strstr(kind,"mcp"))return T_MAGENTA;
+    if(strstr(kind,"narration"))return T_GREEN;
     if(strstr(kind,"model"))return T_CYAN;
     if(strstr(kind,"tool")||strstr(kind,"command"))return T_YELLOW;
     if(strstr(kind,"result")||strstr(kind,"output"))return T_GREEN;

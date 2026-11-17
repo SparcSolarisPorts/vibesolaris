@@ -51,6 +51,24 @@ void vs_workflow_init(VSWorkflow *w)
     w->phase = VS_WORKFLOW_IDLE;
 }
 
+/* True when the proposal matches the current plan content exactly (task
+   order, ids, parents, dependencies, titles).  Statuses are progress, not
+   plan content, and are deliberately excluded. */
+static int plan_content_equal(const VSWorkflow *w, const char *title, const VSTaskRecord *tasks, int count)
+{
+    int i,j;
+    if(!w||!title||!tasks)return 0;
+    if(w->task_count!=count||strcmp(w->title,title))return 0;
+    for(i=0;i<count;i++){
+        if(w->tasks[i].id!=tasks[i].id||w->tasks[i].parent_id!=tasks[i].parent_id)return 0;
+        if(w->tasks[i].dependency_count!=tasks[i].dependency_count)return 0;
+        if(strcmp(w->tasks[i].title,tasks[i].title))return 0;
+        for(j=0;j<w->tasks[i].dependency_count;j++)
+            if(w->tasks[i].dependencies[j]!=tasks[i].dependencies[j])return 0;
+    }
+    return 1;
+}
+
 int vs_workflow_set_plan(VSWorkflow *w, const char *title, const VSTaskRecord *tasks, int count)
 {
     int i,j,found;
@@ -71,6 +89,9 @@ int vs_workflow_set_plan(VSWorkflow *w, const char *title, const VSTaskRecord *t
     }
     /* Plans are untrusted input: reject dependency and parent cycles. */
     if (plan_has_cycles(tasks,count)) return -1;
+    /* Defense in depth: an identical re-proposal of the accepted plan must
+       not wipe task progress.  Report "unchanged" and keep all state. */
+    if (w->revision && w->accepted_revision==w->revision && plan_content_equal(w,title,tasks,count)) return 1;
     memset(w->tasks,0,sizeof(w->tasks));
     memcpy(w->tasks,tasks,(size_t)count*sizeof(tasks[0]));
     w->task_count=count;

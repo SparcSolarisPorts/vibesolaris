@@ -12,7 +12,7 @@
 #define VS_MAX_PATH 1024
 #define VS_MAX_TEXT (1024*1024)
 #define VS_MAX_TOOL_ROUNDS 64
-#define VS_MAX_MALFORMED_RECOVERIES 2 /* malformed-batch re-emit attempts per agent turn */
+#define VS_MAX_MALFORMED_RECOVERIES 3 /* malformed-batch / missing-task_id re-emit attempts per agent turn */
 #define VS_MAX_PLAN_CONTINUES 16
 #define VS_MIN_PLAN_EXPLORE_ROUNDS 2 /* read-only exploration rounds expected before an Auto-mode plan is adopted */
 #define VS_MAX_PLAN_DEFERRALS 3      /* times an under-researched Auto-mode plan is sent back for verification */
@@ -1176,6 +1176,8 @@ typedef struct {
 } VSContext;
 
 void vs_workflow_init(VSWorkflow *workflow);
+/* Returns 0 when adopted, 1 when the proposal is identical to the accepted
+   plan (state untouched, acceptance retained), -1 when invalid. */
 int  vs_workflow_set_plan(VSWorkflow *workflow, const char *title, const VSTaskRecord *tasks, int count);
 int  vs_workflow_accept(VSWorkflow *workflow);
 void vs_workflow_reject(VSWorkflow *workflow);

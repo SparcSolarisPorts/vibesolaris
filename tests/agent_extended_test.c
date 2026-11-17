@@ -47,6 +47,11 @@ char *vs_chat(VSContext *c,const char *p){
         if(strstr(p,"WORKING STATE FROM EARLIER TURN")&&strstr(p,"FORCED_STATE"))prior_state_seen=1;
         return d("[[VS_FINAL]]noted");}
     if(scenario==8)return d("[[VS_TOOL run task_id=\"1\" cmd=\"printf a\"]]\n[[VS_TOOL run task_id=\"1\" cmd=\"printf b\"]]");
+    if(scenario==9){
+        /* Re-propose the already-accepted plan verbatim, plus directives in
+           the same response: the marker must be a no-op, not a state reset. */
+        if(chats==1)return d("[[VS_PLAN title=\"Idem\" tasks=\"1|0|-|First;2|0|-|Second\"]]\n[[VS_TOOL plan_task_complete task_id=\"1\" summary=\"done\"]]\n[[VS_TOOL run task_id=\"2\" cmd=\"printf two\"]]");
+        return d("[[VS_FINAL]]final9");}
     return d("[[VS_FINAL]]unexpected");
 }
 void vs_trace(VSContext*c,const char*k,const char*x){(void)c;(void)k;(void)x;}
@@ -90,7 +95,7 @@ int main(void)
     if(setup_plan(&c,tasks,2,"Dependency gate")!=0)return 1;
     scenario=1;chats=runs=0;
     out=vs_agent_turn(&c,"do all the tasks");
-    if(!out||!strstr(out,"blocked")||chats!=1||runs!=0){fprintf(stderr,"scenario 1 (dependency gate) failed: %s chats=%d runs=%d\n",out?out:"(null)",chats,runs);free(out);return 1;}
+    if(!out||!strstr(out,"blocked")||runs!=0||chats<2){fprintf(stderr,"scenario 1 (dependency gate) failed: %s chats=%d runs=%d\n",out?out:"(null)",chats,runs);free(out);return 1;}
     free(out);puts("ok: blocked dependency is gated, not executed");
 
     /* 2: completing an unknown plan task reports an error and the turn recovers. */
@@ -151,6 +156,18 @@ int main(void)
     out=vs_agent_turn(&c,"do both steps");
     if(!out||!strstr(out,"one action at a time")||runs!=0){fprintf(stderr,"scenario 8 (manual gate) failed: %s runs=%d\n",out?out:"(null)",runs);free(out);return 8;}
     free(out);puts("ok: manual mode rejects multi-directive batches atomically");
+
+    /* 9: re-emitting the accepted plan verbatim must not reset workflow state;
+       the marker is discarded and the response's directives still execute. */
+    memset(tasks,0,sizeof(tasks));
+    tasks[0].id=1;strcpy(tasks[0].title,"First");
+    tasks[1].id=2;strcpy(tasks[1].title,"Second");
+    if(setup_plan(&c,tasks,2,"Idem")!=0)return 9;
+    c.workflow.mode=VS_MODE_AUTO;
+    scenario=9;chats=runs=0;
+    out=vs_agent_turn(&c,"do all the tasks");
+    if(!out||!strstr(out,"final9")||runs!=1||c.workflow.tasks[0].status!=VS_TASK_COMPLETED){fprintf(stderr,"scenario 9 (plan idempotency) failed: %s runs=%d status=%d\n",out?out:"(null)",runs,c.workflow.tasks[0].status);free(out);return 9;}
+    free(out);puts("ok: identical plan re-proposal is a no-op, directives still run");
 
     puts("extended agent scenarios passed");
     return 0;

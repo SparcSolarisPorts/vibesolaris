@@ -253,6 +253,11 @@ test-provider-cache:
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/provider_cache_test.c src/provider.c $(AGENT_SRCS) $(AGENT_MCP_STUB) src/oauth.c src/sha256.c $(CURL_LIBS) $(CRYPTO_LIBS) $(THREAD_LIBS) -o /tmp/vibesolaris-provider-cache-test
 	/tmp/vibesolaris-provider-cache-test
 
+# Synthetic streaming benchmark; opt-in only, never part of `make test`.
+bench-stream:
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/stream_benchmark.c src/provider.c $(AGENT_SRCS) $(AGENT_MCP_STUB) src/tui_stream.c src/oauth.c src/sha256.c $(CURL_LIBS) $(CRYPTO_LIBS) $(THREAD_LIBS) -o /tmp/vibesolaris-stream-bench
+	/tmp/vibesolaris-stream-bench
+
 test-provider-stream:
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/provider_stream_sse_test.c src/provider.c src/reasoning.c src/oauth.c src/sha256.c -o /tmp/vibesolaris-provider-stream-sse-test
 	/tmp/vibesolaris-provider-stream-sse-test

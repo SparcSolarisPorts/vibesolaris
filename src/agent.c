@@ -163,20 +163,69 @@ static char *tool_channel_recovery_prompt(const char *task,const char *last_resu
 typedef struct {char *p;size_t n,cap;int truncated;} ABuffer;
 static int ab_init(ABuffer *b,size_t cap){b->p=(char*)malloc(cap);if(!b->p)return -1;b->p[0]=0;b->n=0;b->cap=cap;b->truncated=0;return 0;}
 static void ab_add(ABuffer *b,const char *s){size_t m,room;if(!b||!b->p||!s||b->truncated)return;m=strlen(s);room=b->cap-b->n;if(room<=96){b->truncated=1;return;}if(m>=room-96){m=room-96;b->truncated=1;}memcpy(b->p+b->n,s,m);b->n+=m;b->p[b->n]=0;}
+static void ab_addn(ABuffer *b,const char *s,size_t m){size_t room;if(!b||!b->p||!s||b->truncated)return;room=b->cap-b->n;if(room<=96){b->truncated=1;return;}if(m>=room-96){m=room-96;b->truncated=1;}memcpy(b->p+b->n,s,m);b->n+=m;b->p[b->n]=0;}
 static void ab_addf(ABuffer *b,const char *fmt,...){char t[2048];va_list ap;va_start(ap,fmt);vsnprintf(t,sizeof(t),fmt,ap);va_end(ap);ab_add(b,t);}
 static char *ab_finish(ABuffer *b){if(b->truncated&&b->p&&b->cap>b->n+48){const char *m="\n...[native tool output truncated]...\n";size_t z=strlen(m);if(z<b->cap-b->n){memcpy(b->p+b->n,m,z+1);b->n+=z;}}return b->p;}
 static int skip_meta_dir(const char *n){return !strcmp(n,".git")||!strcmp(n,".hg")||!strcmp(n,".svn");}
 static int join_path(char *out,size_t cap,const char *a,const char *b){size_t na=strlen(a);if(na+strlen(b)+2>cap)return -1;strcpy(out,a);if(na&&a[na-1]!='/')strcat(out,"/");strcat(out,b);return 0;}
 static long long_attr(const char *d,const char *name,long def,long lo,long hi){char *s=attr(d,name),*ep=0;long v;int ok;if(!s)return def;v=strtol(s,&ep,10);ok=(ep&&*ep==0);free(s);if(!ok)return def;if(v<lo)v=lo;if(v>hi)v=hi;return v;}
 
-static char *native_read(VSContext *c,const char *d){char *p=attr(d,"path"),*raw,*start_s,*max_s,*out;long start=1,max_lines=240,total=0,line=1,last;const char *r,*ls,*le;ABuffer b;if(!p)return dupstr("ERROR: read requires path=\"FILE\"");unesc(p);raw=vs_cached_read_file(c,p);if(!raw){free(p);return dupstr("ERROR: unable to read file");}start_s=attr(d,"start_line");max_s=attr(d,"max_lines");if(!start_s&&!max_s){out=vs_compact_text_limit(raw,VS_AGENT_READ_RESULT_MAX,"file read compacted; use start_line/max_lines for a precise range");free(raw);free(p);return out;}if(start_s){start=strtol(start_s,0,10);if(start<1)start=1;}if(max_s){max_lines=strtol(max_s,0,10);if(max_lines<1)max_lines=1;if(max_lines>4000)max_lines=4000;}free(start_s);free(max_s);
+/* Plain-text prose outside directives/markers, surfaced to the user as a live
+   narration trace so the agent visibly says what it is doing each round. */
+static int line_has(const char *p,size_t n,const char *lit){size_t ln=strlen(lit),i;if(ln>n)return 0;for(i=0;i+ln<=n;i++)if(!memcmp(p+i,lit,ln))return 1;return 0;}
+static char *narration_extract(const char *ans){
+    ABuffer b;const char *p=ans;
+    if(!ans||!*ans)return NULL;
+    if(ab_init(&b,512)!=0)return NULL;
+    while(*p){
+        const char *e=strchr(p,'\n');size_t n=e?(size_t)(e-p):strlen(p);
+        int is_marker=(n&&memchr(p,'[',n)&&(line_has(p,n,"[[VS_TOOL ")||line_has(p,n,"[[VS_MCP ")||line_has(p,n,"[[VS_PLAN")||line_has(p,n,"[[VS_FINAL")||line_has(p,n,"[[VS_NEED_USER")));
+        if(n&&!is_marker){
+            const char *s=p,*t=p+n;
+            while(s<t&&(*s==' '||*s=='\t'||*s=='\r'))s++;
+            while(t>s&&(t[-1]==' '||t[-1]=='\t'||t[-1]=='\r'))t--;
+            if(t>s){
+                if(b.n)ab_add(&b," ");
+                ab_addn(&b,s,(size_t)(t-s));
+                if(b.truncated)break;
+            }
+        }
+        if(!e)break;
+        p=e+1;
+    }
+    if(b.truncated||b.n==0){free(b.p);return NULL;}
+    return b.p;
+}
+
+static const char *task_status_label(int status){return status==VS_TASK_COMPLETED?"completed":status==VS_TASK_RUNNING?"running":status==VS_TASK_FAILED?"failed":status==VS_TASK_BLOCKED?"blocked":status==VS_TASK_CANCELLED?"cancelled":"ready";}
+
+static char *native_read(VSContext *c,const char *d){char *p=attr(d,"path"),*raw,*start_s,*max_s,*out,*prefixed;long start=1,max_lines=1000,total=0,line=1,last;const char *r,*ls,*le;ABuffer b;if(!p)return dupstr("ERROR: read requires path=\"FILE\"");unesc(p);raw=vs_cached_read_file(c,p);if(!raw){free(p);return dupstr("ERROR: unable to read file");}start_s=attr(d,"start_line");max_s=attr(d,"max_lines");
     for(r=raw;*r;r++)if(*r=='\n')total++;
     if(raw[0]&&r>raw&&r[-1]!='\n')total++;
+    if(!start_s&&!max_s){
+        /* No range requested: report the file's scale up front, then return as
+           much as fits the result budget (head+tail) so the model can plan
+           targeted follow-up reads instead of paging blind. */
+        if(strlen(raw)<=VS_AGENT_READ_RESULT_MAX){out=dupstr(raw);free(raw);free(p);return out;}
+        out=vs_compact_text_limit(raw,VS_AGENT_READ_RESULT_MAX,"file read compacted; use start_line/max_lines for a precise range");
+        {char hdr[256];ABuffer b2;
+         if(ab_init(&b2,VS_AGENT_READ_RESULT_MAX+512)==0){
+             ab_addf(&b2,"[read %s: %ld lines, %zu bytes; head+tail shown within %uKB result budget. Continue with start_line=N, or locate regions with search/grep first.]\n",p,total,strlen(raw),(unsigned)(VS_AGENT_READ_RESULT_MAX/1024));
+             ab_add(&b2,out);
+             free(out);out=ab_finish(&b2);
+         }else{
+             prefixed=(char*)malloc(strlen(out)+256);
+             if(prefixed){snprintf(prefixed,strlen(out)+256,"[read %s: %ld lines, %zu bytes; compacted head+tail. Continue with start_line=N or search/grep first.]\n%s",p,total,strlen(raw),out);free(out);out=prefixed;}
+         }}
+        free(raw);free(p);return out;
+    }
+    if(start_s){start=strtol(start_s,0,10);if(start<1)start=1;}if(max_s){max_lines=strtol(max_s,0,10);if(max_lines<1)max_lines=1;if(max_lines>4000)max_lines=4000;}free(start_s);free(max_s);
     last=start+max_lines-1;
     if(ab_init(&b,VS_AGENT_READ_RESULT_MAX+512)!=0){free(raw);free(p);return 0;}
     ab_addf(&b,"[read %s lines %ld-%ld of %ld]\n",p,start,last<total?last:total,total);ls=raw;line=1;
     while(*ls&&line<start){le=strchr(ls,'\n');if(!le){ls+=strlen(ls);break;}ls=le+1;line++;}
-    while(*ls&&line<=last&&!b.truncated){size_t m;le=strchr(ls,'\n');if(!le)le=ls+strlen(ls);m=(size_t)(le-ls);if(m>0){char *tmp=(char*)malloc(m+2);if(!tmp)break;memcpy(tmp,ls,m);tmp[m]='\n';tmp[m+1]=0;ab_add(&b,tmp);free(tmp);}else ab_add(&b,"\n");if(!*le)break;ls=le+1;line++;}
+    while(*ls&&line<=last&&!b.truncated){size_t m;le=strchr(ls,'\n');if(!le)le=ls+strlen(ls);m=(size_t)(le-ls);ab_addn(&b,ls,m);if(!b.truncated)ab_add(&b,"\n");if(!*le)break;ls=le+1;line++;}
+    if(!b.truncated&&last<total)ab_addf(&b,"[... %ld more lines; continue with start_line=%ld ...]\n",total-last,last+1);
     out=ab_finish(&b);free(raw);free(p);return out;
 }
 
@@ -591,33 +640,69 @@ static int preflight_batch_ex(VSContext *c,const char *answer,int *count_out,cha
     if(c&&authorized&&n>0)c->workflow.current_task_id=staged_task;
     return 0;
 }
+/* Parse a [[VS_PLAN ...]] marker into a task array without touching workflow
+   state, so the caller can compare against the accepted plan first. */
+static int parse_plan_tasks(const char *mark,VSTaskRecord *tasks,int max,int *count,char *title,size_t title_cap)
+{
+    char *t=NULL,*raw=NULL,*item,*bar,*dep,*end;int n=0,ok=-1;
+    if(count)*count=0;
+    if(!mark||!tasks||!title||!title_cap||max<1)return -1;
+    mark=strstr(mark,"[[VS_PLAN ");
+    if(!mark)return -1;
+    t=attr(mark,"title");raw=attr(mark,"tasks");
+    if(!t||!raw||!*t||!*raw)goto done;
+    strncpy(title,t,title_cap-1);title[title_cap-1]=0;
+    item=raw;
+    while(item&&*item){
+        VSTaskRecord *task;long id,parent;char *ep;
+        if(n>=max)goto done;
+        task=&tasks[n];
+        id=strtol(item,&ep,10);if(ep==item||*ep!='|')goto done;task->id=(int)id;item=ep+1;
+        parent=strtol(item,&ep,10);if(ep==item||*ep!='|')goto done;task->parent_id=(int)parent;item=ep+1;
+        bar=strchr(item,'|');if(!bar)goto done;*bar=0;dep=item;item=bar+1;
+        if(strcmp(dep,"-")){char *p=dep;while(*p){long d;if(task->dependency_count>=VS_MAX_TASK_DEPS)goto done;d=strtol(p,&ep,10);if(ep==p||d<=0)goto done;task->dependencies[task->dependency_count++]=(int)d;if(*ep==','){p=ep+1;if(!*p)goto done;}else if(!*ep)break;else goto done;}}
+        end=strchr(item,';');if(end)*end=0;
+        if(!*item||strlen(item)>=sizeof(task->title))goto done;
+        strcpy(task->title,item);task->status=VS_TASK_PLANNED;n++;
+        if(!end)item=NULL;else item=end+1;
+    }
+    if(item!=NULL||n<=0)goto done;
+    if(count)*count=n;
+    ok=0;
+done:
+    free(t);free(raw);return ok;
+}
+
+/* True when the proposal is byte-for-byte the plan already accepted (task
+   order, ids, parents, dependencies, titles).  Statuses are progress, not
+   plan content, and are deliberately excluded. */
+static int plan_matches_accepted(const VSContext *c,const VSTaskRecord *tasks,int count,const char *title)
+{
+    const VSWorkflow *w;int i,j;
+    if(!c||!tasks||!title)return 0;
+    w=&c->workflow;
+    if(!w->revision||w->accepted_revision!=w->revision)return 0;
+    if(w->task_count!=count||strcmp(w->title,title))return 0;
+    for(i=0;i<count;i++){
+        const VSTaskRecord *a=&w->tasks[i],*b=&tasks[i];
+        if(a->id!=b->id||a->parent_id!=b->parent_id||a->dependency_count!=b->dependency_count)return 0;
+        if(strcmp(a->title,b->title))return 0;
+        for(j=0;j<a->dependency_count;j++)if(a->dependencies[j]!=b->dependencies[j])return 0;
+    }
+    return 1;
+}
+
 static int parse_plan_marker(VSContext *c,const char *answer)
 {
     const char *mark=strstr(answer?answer:"","[[VS_PLAN ");
-    char *title=NULL,*raw=NULL,*item,*bar,*dep,*end;
-    VSTaskRecord tasks[VS_MAX_PLAN_TASKS];int count=0,rc=-1;
+    VSTaskRecord tasks[VS_MAX_PLAN_TASKS];int count=0,rc;char title[VS_PLAN_TITLE_MAX];
     if(!mark)return 0;
-    title=attr(mark,"title");raw=attr(mark,"tasks");
-    if(!title||!raw||!*title||!*raw)goto done;
     memset(tasks,0,sizeof(tasks));
-    item=raw;
-    while(item&&*item){
-        VSTaskRecord *t;long id,parent;char *ep;
-        if(count>=VS_MAX_PLAN_TASKS)goto done;
-        t=&tasks[count];
-        id=strtol(item,&ep,10);if(ep==item||*ep!='|')goto done;t->id=(int)id;item=ep+1;
-        parent=strtol(item,&ep,10);if(ep==item||*ep!='|')goto done;t->parent_id=(int)parent;item=ep+1;
-        bar=strchr(item,'|');if(!bar)goto done;*bar=0;dep=item;item=bar+1;
-        if(strcmp(dep,"-")){char *p=dep;while(*p){long d;if(t->dependency_count>=VS_MAX_TASK_DEPS)goto done;d=strtol(p,&ep,10);if(ep==p||d<=0)goto done;t->dependencies[t->dependency_count++]=(int)d;if(*ep==','){p=ep+1;if(!*p)goto done;}else if(!*ep)break;else goto done;}}
-        end=strchr(item,';');if(end)*end=0;
-        if(!*item||strlen(item)>=sizeof(t->title))goto done;
-        strcpy(t->title,item);t->status=VS_TASK_PLANNED;count++;
-        if(!end)item=NULL;else item=end+1;
-    }
-    if(item!=NULL||count<=0)goto done;
-    rc=vs_workflow_set_plan(&c->workflow,title,tasks,count)==0?1:-1;
-done:
-    free(title);free(raw);return rc;
+    if(parse_plan_tasks(mark,tasks,VS_MAX_PLAN_TASKS,&count,title,sizeof(title))!=0)return -1;
+    rc=vs_workflow_set_plan(&c->workflow,title,tasks,count);
+    if(rc==0)return 1;   /* adopted; awaiting acceptance */
+    if(rc==1)return 2;   /* identical to the accepted plan; state untouched */
+    return -1;           /* invalid proposal */
 }
 
 /* Run independent delegated tasks at once. Non-subagent batches retain
@@ -771,7 +856,9 @@ char *vs_agent_turn(VSContext *c,const char *user){
         if(round>0&&(round%VS_LONG_TASK_CHECKPOINT)==0){snprintf(step,sizeof(step),"long-task checkpoint: %d rounds completed; working context=%lu bytes, checkpoint=%lu bytes",round,(unsigned long)c->agent_history_bytes,(unsigned long)c->agent_checkpoint_bytes);vs_trace(c,"checkpoint",step);}
         snprintf(step,sizeof(step),"model round %d",round+1);vs_trace(c,"model",step);vs_trace(c,"model-input",prompt);vs_trace(c,"model-wait","requesting provider response");
         if(c->hooks.hook_count){size_t hz=strlen(prompt)+65536;char *mod=(char*)malloc(hz);if(mod){vs_hooks_run_prompt(&c->hooks,prompt,mod,hz);if(*mod){free(prompt);prompt=mod;}else free(mod);}}
-        free(ans);ans=vs_chat(c,prompt);c->attachment_send_from=c->attachment_count;if(!ans){
+        free(ans);ans=vs_chat(c,prompt);c->attachment_send_from=c->attachment_count;
+        if(ans&&*ans){char *nar=narration_extract(ans);if(nar){vs_trace(c,"narration",nar);free(nar);}}
+        if(!ans){
             free(prompt);free(task_anchor);free(last_tool_result);free(last_directives);agent_context_clear(c);
             free(original);return dupstr("provider error");
         }
@@ -787,8 +874,25 @@ char *vs_agent_turn(VSContext *c,const char *user){
                 if(clean){free(ans);ans=clean;clean=NULL;}
                 vs_trace(c,"plan-suppressed","read-only response did not require plan approval");
             } else {
-                plan_rc=parse_plan_marker(c,ans);
-                if(plan_rc!=0){
+                /* An identical re-proposal of the already-accepted plan must
+                   not reset workflow state (vs_workflow_set_plan memsets all
+                   tasks back to PLANNED and clears acceptance).  Detect the
+                   no-op, strip the marker, and continue directive execution. */
+                VSTaskRecord pt[VS_MAX_PLAN_TASKS];int pcount=0;char ptitle[VS_PLAN_TITLE_MAX];
+                memset(pt,0,sizeof(pt));
+                if(parse_plan_tasks(marker_end,pt,VS_MAX_PLAN_TASKS,&pcount,ptitle,sizeof ptitle)==0
+                   &&plan_matches_accepted(c,pt,pcount,ptitle)){
+                    if(clean){free(ans);ans=clean;clean=NULL;}
+                    vs_trace(c,"plan-unchanged","identical re-proposal of the accepted plan ignored; continuing execution");
+                    plan_rc=0;
+                } else plan_rc=parse_plan_marker(c,ans);
+                if(plan_rc==2){
+                    /* Workflow-layer backstop agreed: identical to the
+                       accepted plan.  Strip the marker and keep executing
+                       the directives in this response. */
+                    if(clean){free(ans);ans=clean;clean=NULL;}
+                    vs_trace(c,"plan-unchanged","identical re-proposal of the accepted plan ignored; continuing execution");
+                } else if(plan_rc!=0){
                     if(plan_rc>0){
                         if(c->workflow.mode==VS_MODE_AUTO){
                             if(explore_rounds<VS_MIN_PLAN_EXPLORE_ROUNDS&&plan_deferrals<VS_MAX_PLAN_DEFERRALS){
@@ -836,20 +940,37 @@ char *vs_agent_turn(VSContext *c,const char *user){
                 char detail[1024];detail[0]=0;
                 if(why_detail[0])snprintf(detail,sizeof(detail)," Details: %s",why_detail);else if(gate==-1)snprintf(detail,sizeof(detail)," Details: no directive in the batch passed validation.");
                 /* A malformed batch (-1) is usually a recoverable model slip
-                   (bad attribute, oversize batch, unparseable marker).  Give
-                   the model the precise error and a chance to re-emit, like
-                   the truncation recovery above, but cap the retries so a
-                   provider that keeps producing garbage still ends the turn. */
-                if(gate==-1&&malformed_recoveries<VS_MAX_MALFORMED_RECOVERIES){
+                   (bad attribute, oversize batch, unparseable marker).  Gate
+                   -6/-7 (missing/not-ready task_id) is equally recoverable:
+                   enumerate the accepted plan so the model can re-emit with a
+                   valid task_id instead of ending the turn with a raw gate
+                   error.  Cap retries so a provider that keeps producing
+                   garbage still ends the turn. */
+                if((gate==-1||gate==-6||gate==-7)&&malformed_recoveries<VS_MAX_MALFORMED_RECOVERIES){
                     char *fixmsg;
                     malformed_recoveries++;
                     if(c->workflow.mode==VS_MODE_MANUAL){c->workflow.action_approved=0;c->workflow.pending_request[0]=0;}
                     vs_trace(c,"directive-rejected",why);if(why_detail[0])vs_trace(c,"directive-detail",why_detail);
-                    fixmsg=(char*)malloc(strlen(why)+strlen(detail)+512);
-                    if(!fixmsg){free(ans);ans=dupstr(why);break;}
-                    snprintf(fixmsg,strlen(why)+strlen(detail)+512,
-                        "ERROR: %s%s Supported operations: read, list, search, glob, grep, graph, web_search, web_fetch, run, write, edit, multi_edit, image, notebook_read, notebook_edit, monitor, monitor_output, monitor_kill, subagent, todo, plan_task_complete, task_create, task_update, task_list, task_search, task_delete, checkpoint, lsp, permission, auto_mode, team_message, team_read, team_broadcast, code_review, plugin, init, skill, slash_command, tool_search, enter_worktree, exit_worktree, computer_use_screenshot, computer_use_click, computer_use_move, computer_use_type. Fix the directive(s) and re-emit them in full.",
-                        why,detail);
+                    if(gate==-1){
+                        fixmsg=(char*)malloc(strlen(why)+strlen(detail)+512);
+                        if(!fixmsg){free(ans);ans=dupstr(why);break;}
+                        snprintf(fixmsg,strlen(why)+strlen(detail)+512,
+                            "ERROR: %s%s Supported operations: read, list, search, glob, grep, graph, web_search, web_fetch, run, write, edit, multi_edit, image, notebook_read, notebook_edit, monitor, monitor_output, monitor_kill, subagent, todo, plan_task_complete, task_create, task_update, task_list, task_search, task_delete, checkpoint, lsp, permission, auto_mode, team_message, team_read, team_broadcast, code_review, plugin, init, skill, slash_command, tool_search, enter_worktree, exit_worktree, computer_use_screenshot, computer_use_click, computer_use_move, computer_use_type. Fix the directive(s) and re-emit them in full.",
+                            why,detail);
+                    }else{
+                        char tasks[1024];size_t tp=0;int ti;
+                        for(ti=0;ti<c->workflow.task_count&&tp<sizeof(tasks)-192;ti++){
+                            const VSTaskRecord *tr=&c->workflow.tasks[ti];
+                            int nn=snprintf(tasks+tp,sizeof(tasks)-tp,"  task_id=\"%d\" [%s] %s\n",tr->id,task_status_label(tr->status),tr->title[0]?tr->title:"(untitled)");
+                            if(nn>0)tp+=(size_t)nn;
+                        }
+                        if(!c->workflow.task_count)snprintf(tasks,sizeof(tasks),"  (no accepted plan tasks — propose [[VS_PLAN ...]] again or run read-only inspection)\n");
+                        fixmsg=(char*)malloc(strlen(why)+strlen(detail)+strlen(tasks)+640);
+                        if(!fixmsg){free(ans);ans=dupstr(why);break;}
+                        snprintf(fixmsg,strlen(why)+strlen(detail)+strlen(tasks)+640,
+                            "ERROR: %s%s\nAccepted plan tasks:\n%s%s Re-emit the directive(s) in full, each with task_id=\"<id>\" naming one of the accepted tasks above.",
+                            why,detail,tasks,gate==-7?"Only tasks whose dependencies are completed are ready.":"");
+                    }
                     agent_history_add(c,"user",prompt);agent_history_add(c,"assistant",ans);
                     next=continuation_prompt(task_anchor,fixmsg,1,c->agent_checkpoint);
                     free(fixmsg);free(ans);ans=NULL;free(prompt);prompt=next;

@@ -39,6 +39,17 @@ int main(void)
     CHECK(vs_workflow_set_plan(&w,"Revised plan",t,3)==0);
     CHECK(!vs_workflow_authorized(&w)&&w.phase==VS_WORKFLOW_AWAITING_ACCEPT);
     CHECK(vs_workflow_accept(&w)==0&&vs_workflow_authorized(&w));
+    /* An identical re-proposal of the accepted plan is a no-op: it must not
+       reset task progress or demand re-acceptance. */
+    CHECK(vs_workflow_set_task_status(&w,1,VS_TASK_COMPLETED,"done")==0);
+    CHECK(vs_workflow_set_plan(&w,"Revised plan",t,3)==1);
+    CHECK(vs_workflow_authorized(&w)&&w.phase==VS_WORKFLOW_DOING);
+    CHECK(w.tasks[0].status==VS_TASK_COMPLETED&&w.tasks[1].status==VS_TASK_PLANNED);
+    /* A material change still resets and requires renewed acceptance. */
+    CHECK(vs_workflow_set_plan(&w,"Changed plan",t,3)==0);
+    CHECK(!vs_workflow_authorized(&w)&&w.phase==VS_WORKFLOW_AWAITING_ACCEPT);
+    CHECK(w.tasks[0].status==VS_TASK_PLANNED);
+    CHECK(vs_workflow_accept(&w)==0&&vs_workflow_authorized(&w));
     w.mode=VS_MODE_MANUAL;w.phase=VS_WORKFLOW_AWAITING_ACTION;
     CHECK(vs_workflow_approve_action(&w)==0&&vs_workflow_authorized(&w));
     CHECK(vs_workflow_consume_action_approval(&w)==0&&!w.action_approved&&w.pending_request[0]==0);
