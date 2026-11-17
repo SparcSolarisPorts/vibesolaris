@@ -28,6 +28,9 @@ char *vs_http_post_ctx(VSContext *c,const char *u,const char *h[],int n,const ch
     snprintf(last_body,sizeof(last_body),"%s",b?b:"");
     last_headers[0]=0;
     for(i=0;i<n;i++){strcat(last_headers,h[i]);strcat(last_headers,"\n");}
+    /* Simulate a gateway whose thinking-default exhausts budgets: a request
+       with thinking explicitly disabled recovers a real text block. */
+    if(b&&strstr(b,"\"thinking\":{\"type\":\"disabled\"}"))return dupstr_test("{\"content\":[{\"type\":\"text\",\"text\":\"recovered\"}],\"stop_reason\":\"end_turn\",\"usage\":{\"output_tokens\":9}}");
     return dupstr_test(plain_response);
 }
 int vs_http_post_stream_ctx(VSContext *ctx,const char *url,const char *headers[],int nheaders,const char *body,long *status,VSHTTPChunkCallback callback,void *userdata){
@@ -334,15 +337,42 @@ int main(void){
     free(out);
 
     /* A thinking-only non-streaming response (content array with no text
-       blocks) must yield the descriptive empty-response message, not a
-       mangled fragment like "type" grabbed from [{"type":"thinking"}]. */
+       blocks) must never surface a mangled fragment like "type" grabbed
+       from [{"type":"thinking"}]; the disabled-thinking retry recovers it. */
     setup(VS_PROVIDER_CUSTOM,VS_PROTOCOL_ANTHROPIC,"https://gateway.example.test/v1/messages");
     feed("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");feed_slice=1;
     snprintf(plain_response,sizeof(plain_response),"%s",
         "{\"content\":[{\"type\":\"thinking\",\"thinking\":\"hmm\"}],\"stop_reason\":\"end_turn\",\"usage\":{\"output_tokens\":30}}");
     out=vs_chat(&ctx,"hi");
-    if(!out||strcmp(out,"The provider returned an empty response with no text content. If this repeats, check the model and gateway configuration.")!=0){fprintf(stderr,"FAIL: thinking-only response should give the empty-response message, got [%s]\n",out?out:"(null)");fails++;}
-    else printf("ok: thinking-only non-streaming response yields the empty-response message\n");
+    if(!out||strcmp(out,"recovered")!=0){fprintf(stderr,"FAIL: thinking-only response should be recovered without a mangled fragment, got [%s]\n",out?out:"(null)");fails++;}
+    else if(strstr(out,"\"type\"")){fprintf(stderr,"FAIL: raw JSON leaked into thinking-only answer: [%s]\n",out);fails++;}
+    else printf("ok: thinking-only non-streaming response never surfaces a mangled 'type' fragment\n");
+    free(out);
+
+    /* A thinking-only non-streaming completion (thinking budget exhausted at
+       the gateway) is retried once with thinking disabled; the retry's text
+       becomes the answer instead of the empty-response message. */
+    setup(VS_PROVIDER_CUSTOM,VS_PROTOCOL_ANTHROPIC,"https://gateway.example.test/v1/messages");
+    feed("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");feed_slice=1;
+    snprintf(plain_response,sizeof(plain_response),"%s",
+        "{\"content\":[{\"type\":\"thinking\",\"thinking\":\"hmm\"}],\"stop_reason\":\"end_turn\",\"usage\":{\"output_tokens\":30}}");
+    out=vs_chat(&ctx,"hi");
+    if(!out||strcmp(out,"recovered")!=0){fprintf(stderr,"FAIL: thinking-only completion should retry with thinking disabled, got [%s]\n",out?out:"(null)");fails++;}
+    else if(plain_calls!=2){fprintf(stderr,"FAIL: expected original + one disabled-thinking retry, got %d calls\n",plain_calls);fails++;}
+    else printf("ok: thinking-only completion retries once with thinking disabled\n");
+    free(out);
+
+    /* Providers that think internally but return NO thinking block at all
+       (Claude often omits the thinking text) still get the disabled-thinking
+       retry: an empty content array is enough to trigger it. */
+    setup(VS_PROVIDER_CUSTOM,VS_PROTOCOL_ANTHROPIC,"https://gateway.example.test/v1/messages");
+    feed("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");feed_slice=1;
+    snprintf(plain_response,sizeof(plain_response),"%s",
+        "{\"content\":[],\"stop_reason\":\"end_turn\",\"usage\":{\"output_tokens\":12}}");
+    out=vs_chat(&ctx,"hi");
+    if(!out||strcmp(out,"recovered")!=0){fprintf(stderr,"FAIL: empty-content response should retry with thinking disabled, got [%s]\n",out?out:"(null)");fails++;}
+    else if(plain_calls!=2){fprintf(stderr,"FAIL: expected original + one disabled-thinking retry, got %d calls\n",plain_calls);fails++;}
+    else printf("ok: responses without thinking blocks still retry with thinking disabled\n");
     free(out);
 
     /* Long answer split across many small chunks: every byte delivered once. */

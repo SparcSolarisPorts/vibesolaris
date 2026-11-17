@@ -623,11 +623,16 @@ static char *build_openai_body(VSContext *c,const char *sys,const char *user,int
     return bfinish(c,&b);
 }
 
-static char *build_claude_body(VSContext *c,const char *sys,const char *user,int streaming){
+static char *build_claude_body(VSContext *c,const char *sys,const char *user,int streaming,int no_thinking){
     VSBuf b;int i,first=1,astart;char *x,*t;const char *mime;
     if(binit(&b,8192)!=0)return NULL;
     if(vs_cancel_requested(c)){free(b.p);return NULL;}
     badd(&b,"{\"model\":");bquoted(&b,c->provider.model);badd(&b,",\"max_tokens\":8192");
+    /* Gateways that default claude-haiku-5-5 to extended thinking sometimes
+       exhaust the thinking budget and surface no text at all.  A thinking-
+       disabled retry recovers those; providers without the problem never
+       send thinking-only completions, so this field stays unset for them. */
+    if(no_thinking)badd(&b,",\"thinking\":{\"type\":\"disabled\"}");
     badd(&b,",\"system\":[{\"type\":\"text\",\"text\":");bquoted(&b,sys);if(c->cache_enabled)badd(&b,",\"cache_control\":{\"type\":\"ephemeral\"}");badd(&b,"}],\"messages\":[");
     {int total_hist=c->history_count+c->agent_history_count,hist_idx=0;
     for(i=0;i<c->history_count;i++){if(vs_cancel_requested(c)){free(b.p);return NULL;}if(!first)badd(&b,",");first=0;hist_idx++;badd(&b,"{\"role\":");bquoted(&b,!strcmp(c->history[i].role,"assistant")?"assistant":"user");if(c->cache_enabled&&hist_idx==total_hist){badd(&b,",\"content\":[{\"type\":\"text\",\"text\":");bquoted(&b,c->history[i].content);badd(&b,",\"cache_control\":{\"type\":\"ephemeral\"}}]}");}else{badd(&b,",\"content\":");bquoted(&b,c->history[i].content);badd(&b,"}");}}
@@ -930,7 +935,7 @@ static char *vs_chat_impl(VSContext *c,const char *user){
     if(!endpoint||!endpoint[0]){free(endpoint);free(sys);return dupstr("No API URL configured for the selected provider/protocol.");}
 
     if(c->provider.protocol==VS_PROTOCOL_ANTHROPIC){
-        body=build_claude_body(c,sys,user,1);
+        body=build_claude_body(c,sys,user,1,0);
         if(!body){free(endpoint);free(sys);return dupstr(vs_cancel_requested(c)?"Stopped by user.":"Request is too large or memory is exhausted; reduce attachments/context and retry.");}
         h[nh++]="Content-Type: application/json";h[nh++]="Accept: text/event-stream";
         if((c->provider.kind==VS_PROVIDER_CLAUDE && !use_claude_oauth) || c->provider.kind==VS_PROVIDER_DEEPSEEK || (c->provider.kind!=VS_PROVIDER_CLAUDE&&c->provider.kind>=0&&c->provider.kind<VS_PROVIDER_SLOT_COUNT&&c->provider_anthropic_auth[(int)c->provider.kind])){
@@ -944,7 +949,7 @@ static char *vs_chat_impl(VSContext *c,const char *user){
             ProviderStream ps;memset(&ps,0,sizeof(ps));ps.ctx=c;ps.protocol=VS_PROTOCOL_ANTHROPIC;
             if(binit(&ps.answer,256)==0){int src=vs_http_post_stream_ctx(c,endpoint,h,nh,body,&status,provider_stream_chunk,&ps);provider_stream_finish(&ps);if(src==0&&provider_stream_success(&ps)){stream_capture_usage(&ps);free(body);free(endpoint);free(sys);out=ps.error?dupstr(vs_cancel_requested(c)?"Stopped by user.":"Streaming provider response failed."):ps.answer.p;free(ps.line);if(out&&*out)vs_trace(c,"http-result","streaming provider response received");return out?out:dupstr("HTTP request failed");}if(ps.error&&ps.answer.len>0&&!ps.callback_failed){free(body);free(endpoint);free(sys);out=dupstr(vs_cancel_requested(c)?"Stopped by user.":"Streaming provider response failed.");free(ps.answer.p);free(ps.line);return out;}stream_empty_note(&ps,c);stream_capture_usage(&ps);free(ps.answer.p);free(ps.line);}
         }
-        free(body);body=build_claude_body(c,sys,user,0);if(!body){free(endpoint);free(sys);return dupstr("Request is too large or memory is exhausted");}
+        free(body);body=build_claude_body(c,sys,user,0,0);if(!body){free(endpoint);free(sys);return dupstr("Request is too large or memory is exhausted");}
         h[0]="Content-Type: application/json";
         if((c->provider.kind==VS_PROVIDER_CLAUDE && !use_claude_oauth) || c->provider.kind==VS_PROVIDER_DEEPSEEK || (c->provider.kind!=VS_PROVIDER_CLAUDE&&c->provider.kind>=0&&c->provider.kind<VS_PROVIDER_SLOT_COUNT&&c->provider_anthropic_auth[(int)c->provider.kind])){
             snprintf(apiheader,sizeof(apiheader),"x-api-key: %s",credential);h[1]=apiheader;h[2]="anthropic-version: 2023-06-01";resp=vs_http_post_ctx(c,endpoint,h,3,body,&status);
@@ -959,6 +964,18 @@ static char *vs_chat_impl(VSContext *c,const char *user){
                 q=resp;while((q=strstr(q,"\"type\":\"text\""))!=NULL){nt++;q+=12;}
                 snprintf(sb,sizeof(sb),"anthropic response shape: stop_reason=%s text_blocks=%d thinking_blocks=%d tool_use_blocks=%d",sr,nt,nk,nb);
                 vs_trace(c,"provider-shape",sb);free(sr);}}
+        /* Empty completion with nothing actionable in it: thinking-budget
+           exhaustion at the gateway, or a provider that thinks internally but
+           returns neither thinking blocks nor text (Claude often omits the
+           thinking text).  Retry once with thinking explicitly disabled
+           before giving up; responses that carry text or tool calls never
+           take this path.  Error/refusal bodies are left alone. */
+        if(resp&&!strstr(resp,"\"type\":\"text\"")&&!strstr(resp,"\"type\":\"tool_use\"")
+           &&!strstr(resp,"\"type\":\"error\"")&&!strstr(resp,"\"stop_reason\":\"refusal\"")){
+            char *resp2=0;long st2=0;
+            free(body);body=build_claude_body(c,sys,user,0,1);
+            if(body){resp2=vs_http_post_ctx(c,endpoint,h,3,body,&st2);
+                if(resp2&&*resp2){char tb[160];snprintf(tb,sizeof(tb),"empty completion; retried with thinking disabled (status %ld)",st2);vs_trace(c,"thinking-disabled-retry",tb);free(resp);resp=resp2;}}}
     }else{
         body=build_openai_body(c,sys,user,1);
         if(!body){free(endpoint);free(sys);return dupstr(vs_cancel_requested(c)?"Stopped by user.":"Request is too large or memory is exhausted; reduce attachments/context and retry.");}
