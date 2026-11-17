@@ -421,6 +421,11 @@ static void stream_event(ProviderStream *s,const char *data)
                 s->stream_output=extract_long(data,"\"output_tokens\"");s->usage_seen=1;
             }
         }
+        if(strstr(data,"\"content_block_start\"")){
+            /* Non-compliant aggregating gateways deliver the full block text
+               here and send no deltas; compliant servers send "" (a no-op). */
+            part=extract_string_field(data,"\"text\"");if(part){if(*part)stream_emit(s,part);free(part);}
+        }
         if(strstr(data,"content_block_delta")&&strstr(data,"thinking_delta"))s->saw_thinking=1;
         if(strstr(data,"content_block_delta")&&strstr(data,"text_delta")){
             part=extract_string_field(data,"\"text\"");if(part){stream_emit(s,part);free(part);}
@@ -677,6 +682,13 @@ char *vs_chat(VSContext *c,const char *user){
             snprintf(auth,sizeof(auth),"Authorization: Bearer %s",credential);h[1]=auth;h[2]="anthropic-version: 2023-06-01";resp=vs_http_post_ctx(c,endpoint,h,3,body,&status);
         }
         if(resp)vs_trace(c,"http-result","provider response received");
+        if(resp&&strstr(resp,"\"stop_reason\"")){char *sr=extract_string_field(resp,"\"stop_reason\"");
+            if(sr){char sb[200];int nb=0,nt=0,nk=0;const char *q=resp;
+                while((q=strstr(q,"\"type\":\"tool_use\""))!=NULL){nb++;q+=16;}
+                q=resp;while((q=strstr(q,"\"type\":\"thinking\""))!=NULL){nk++;q+=17;}
+                q=resp;while((q=strstr(q,"\"type\":\"text\""))!=NULL){nt++;q+=12;}
+                snprintf(sb,sizeof(sb),"anthropic response shape: stop_reason=%s text_blocks=%d thinking_blocks=%d tool_use_blocks=%d",sr,nt,nk,nb);
+                vs_trace(c,"provider-shape",sb);free(sr);}}
     }else{
         body=build_openai_body(c,sys,user,1);
         if(!body){free(endpoint);free(sys);return dupstr(vs_cancel_requested(c)?"Stopped by user.":"Request is too large or memory is exhausted; reduce attachments/context and retry.");}
