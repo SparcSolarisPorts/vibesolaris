@@ -305,6 +305,34 @@ int main(void){
     else printf("ok: tool_use-only response converts without leaking raw JSON\n");
     free(out);
 
+    /* MiniMax-style native tool_calls (OpenAI dialect, finish_reason=tool_calls,
+       arguments an encoded JSON object) must convert to VS_TOOL directives. */
+    setup(VS_PROVIDER_CUSTOM,VS_PROTOCOL_OPENAI,"https://gateway.example.test/v1");
+    ctx.workflow.current_task_id=3;
+    feed("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n");feed_slice=1;
+    snprintf(plain_response,sizeof(plain_response),"%s",
+        "{\"choices\":[{\"index\":0,\"finish_reason\":\"tool_calls\",\"tool_calls\":["
+        "{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"run\",\"arguments\":\"{\\\"cmd\\\": \\\"make test\\\", \\\"timeout\\\": 120}\"}},"
+        "{\"id\":\"c2\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\": \\\"/tmp/z.c\\\"}\"}}"
+        "]}],\"usage\":{\"prompt_tokens\":50,\"completion_tokens\":20,\"total_tokens\":70}}");
+    out=vs_chat(&ctx,"hi");
+    if(!out||!strstr(out,"[[VS_TOOL run cmd=\"make test\" timeout=\"120\" task_id=\"3\"]]")){fprintf(stderr,"FAIL: MiniMax run tool_call not converted, got [%s]\n",out?out:"(null)");fails++;}
+    else if(!strstr(out,"[[VS_TOOL read path=\"/tmp/z.c\"]]")){fprintf(stderr,"FAIL: MiniMax read tool_call not converted, got [%s]\n",out);fails++;}
+    else if(strstr(out,"\"choices\"")||strstr(out,"finish_reason")){fprintf(stderr,"FAIL: raw JSON leaked into MiniMax answer: [%s]\n",out);fails++;}
+    else printf("ok: MiniMax native tool_calls convert to VS_TOOL directives\n");
+    free(out);
+
+    /* MiniMax raw XML tool calls embedded in the answer text must convert and
+       be stripped from the prose. */
+    setup(VS_PROVIDER_CUSTOM,VS_PROTOCOL_OPENAI,"https://gateway.example.test/v1");
+    ctx.workflow.current_task_id=5;
+    feed("data: {\"choices\":[{\"delta\":{\"content\":\"Let me check.\\n<minimax:tool_call>\\n<invoke name=\\\"run\\\">\\n<parameter name=\\\"cmd\\\">make -j4</parameter>\\n<parameter name=\\\"timeout\\\">120</parameter>\\n</invoke>\\n</minimax:tool_call>\"}}]}\n\ndata: [DONE]\n\n");feed_slice=1;
+    out=vs_chat(&ctx,"hi");
+    if(!out||!strstr(out,"[[VS_TOOL run cmd=\"make -j4\" timeout=\"120\" task_id=\"5\"]]")){fprintf(stderr,"FAIL: MiniMax XML tool call not converted, got [%s]\n",out?out:"(null)");fails++;}
+    else if(strstr(out,"<minimax:tool_call>")||strstr(out,"<invoke")){fprintf(stderr,"FAIL: MiniMax XML leaked into answer: [%s]\n",out);fails++;}
+    else printf("ok: MiniMax raw XML tool calls convert to VS_TOOL directives\n");
+    free(out);
+
     /* Long answer split across many small chunks: every byte delivered once. */
     {
         static char big[65536];size_t i;char *w=big;

@@ -97,6 +97,12 @@ static int tool_use_readonly_op(const char *name){
     static const char *ro[]={"read","list","search","graph","web_search","web_fetch","glob","grep","notebook_read","monitor_output","task_list","task_search","lsp","tool_search","list_mcp_resources","read_mcp_resource","computer_use_screenshot",0};
     int i;for(i=0;ro[i];i++)if(!strcmp(name,ro[i]))return 1;return 0;
 }
+static int append_escaped_attr(VSBuf *b,const char *key,const char *val){
+    const char *p;char t[2];
+    if(badd(b," ")||badd(b,key)||badd(b,"=\""))return -1;
+    for(p=val;p&&*p;p++){if(*p=='"'||*p=='\\'){if(badd(b,"\\"))return -1;}t[0]=*p;t[1]=0;if(badd(b,t))return -1;}
+    return badd(b,"\"");
+}
 /* Walk a JSON object ([obj,obj_end), obj at '{') and append each member as a
    key="value" attribute.  Sets *has_task when a task_id member was seen. */
 static void append_json_object_attrs(VSBuf *b,const char *obj,const char *obj_end,int *has_task){
@@ -133,12 +139,6 @@ static void trace_converted_directive(VSContext *c,VSBuf *b,size_t dstart){
     if(n>sizeof(tb)-1)n=sizeof(tb)-1;memcpy(tb,b->p+dstart,n);tb[n]=0;
     if((nl=strchr(tb,'\n'))!=NULL)*nl=0;
     vs_trace(c,"tool-use-convert",tb);
-}
-static int append_escaped_attr(VSBuf *b,const char *key,const char *val){
-    const char *p;char t[2];
-    if(badd(b," ")||badd(b,key)||badd(b,"=\""))return -1;
-    for(p=val;p&&*p;p++){if(*p=='"'||*p=='\\'){if(badd(b,"\\"))return -1;}t[0]=*p;t[1]=0;if(badd(b,t))return -1;}
-    return badd(b,"\"");
 }
 static int append_tool_use_directives(VSContext *c,const char *json,VSBuf *b){
     const char *p=json;int count=0;
@@ -193,6 +193,153 @@ static char *extract_anthropic_answer(VSContext *c,const char *resp){
             } else free(b.p);
         }
     }
+    return out;
+}
+/* MiniMax and other OpenAI-compatible providers deliver native tool calls as
+   choices[].tool_calls[].function.{name,arguments}, where arguments is itself
+   an encoded JSON object.  Convert each back into a [[VS_TOOL ...]] directive
+   exactly like the Anthropic tool_use shim above. */
+static int append_openai_tool_call_directives(VSContext *c,const char *json,VSBuf *b){
+    const char *p=json;int count=0;
+    if(!json||!b||!b->p)return 0;
+    while((p=strstr(p,"\"function\""))!=NULL){
+        const char *ob=strchr(p,':'),*oe,*ns,*as;char *name=0,*args=0;size_t dstart;int has_task=0;
+        if(!ob){p+=10;continue;}
+        ob++;while(*ob==' '||*ob=='\t'||*ob=='\r'||*ob=='\n')ob++;
+        if(*ob!='{'){p+=10;continue;}
+        oe=match_braced(ob,json+strlen(json));if(!oe){p+=10;continue;}
+        ns=strstr(ob,"\"name\"");as=strstr(ob,"\"arguments\"");
+        if(!ns||ns>=oe){p=oe;continue;}
+        {const char *nv=strchr(ns,':');
+         if(!nv){p=oe;continue;}
+         nv++;while(*nv==' '||*nv=='\t'||*nv=='\r'||*nv=='\n')nv++;
+         if(*nv!='"'){p=oe;continue;}
+         name=json_unescape_string(nv+1);}
+        if(!name){p=oe;continue;}
+        dstart=b->len;
+        badd(b,"[[VS_TOOL ");badd(b,name);
+        if(as&&as<oe){
+            const char *av=strchr(as,':'),*mb;
+            if(!av){p=oe;free(name);continue;}
+            av++;while(*av==' '||*av=='\t'||*av=='\r'||*av=='\n')av++;
+            if(*av!='"'){p=oe;free(name);continue;}
+            args=json_unescape_string(av+1);
+            if(!args){p=oe;free(name);continue;}
+            mb=match_braced(args,args+strlen(args));
+            if(mb)append_json_object_attrs(b,args,args+strlen(args),&has_task);
+        }
+        if(!has_task&&c&&c->workflow.current_task_id>0&&!tool_use_readonly_op(name)){
+            char tid[24];snprintf(tid,sizeof(tid),"%d",c->workflow.current_task_id);append_escaped_attr(b,"task_id",tid);
+        }
+        badd(b,"]]\n");
+        trace_converted_directive(c,b,dstart);
+        count++;free(name);if(args)free(args);
+        p=oe;
+    }
+    return count;
+}
+static char *extract_openai_answer(VSContext *c,const char *resp){
+    /* With tool_calls but no message content, extract_text() would leak raw
+       JSON into the answer; start from an empty text part in that case. */
+    int has_tc=resp&&strstr(resp,"\"tool_calls\"")!=NULL;
+    char *out=(has_tc&&!strstr(resp,"\"content\":\"")&&!strstr(resp,"\"content\": \""))?NULL:extract_text(resp);
+    if(has_tc){
+        VSBuf b;
+        if(binit(&b,(out?strlen(out):0)+512)==0){
+            int n=0;
+            if(out)badd(&b,out);
+            n=append_openai_tool_call_directives(c,resp,&b);
+            if(n>0){
+                char tb[96];snprintf(tb,sizeof(tb),"converted %d native tool_call(s) into VS_TOOL directives",n);
+                vs_trace(c,"tool-use-convert",tb);
+                free(out);out=bfinish(c,&b);
+            } else free(b.p);
+        }
+    }
+    return out;
+}
+/* Extract an attribute value from an XML open tag within [t,end).  Handles
+   quoted ("x" or 'x') and bare values; the search is bounded by the tag's
+   closing '>' so nested content cannot match. */
+static char *xml_tag_attr(const char *t,const char *end,const char *key){
+    char pat[64];const char *a,*v,*ve,*gt;size_t n;char *o,qch;
+    if(!t||!end||!key||end<=t)return 0;
+    gt=strchr(t,'>');if(!gt||gt>end)gt=(char*)end;
+    snprintf(pat,sizeof(pat),"%s=",key);
+    a=strstr(t,pat);
+    if(!a||a>=gt)return 0;
+    v=a+strlen(pat);
+    while(v<gt&&*v==' ')v++;
+    if(v>=gt)return 0;
+    if(*v=='"'||*v=='\''){qch=*v++;ve=v;while(ve<gt&&*ve!=qch)ve++;}
+    else {ve=v;while(ve<gt&&*ve!=' '&&*ve!='\t'&&*ve!='\r'&&*ve!='\n')ve++;}
+    n=(size_t)(ve-v);o=(char*)malloc(n+1);if(!o)return 0;memcpy(o,v,n);o[n]=0;return o;
+}
+static int range_has_attr(const VSBuf *b,size_t dstart,const char *key){
+    char pat[48];const char *s=b->p+dstart,*e=strstr(s,"]]"),*f;
+    snprintf(pat,sizeof(pat)," %s=\"",key);
+    if(!e)e=s+strlen(s);
+    f=strstr(s,pat);
+    return f!=NULL&&f<e;
+}
+/* MiniMax-M2.1 raw output embeds tool calls as XML:
+     <minimax:tool_call><invoke name="fn"><parameter name="k">v</parameter>
+     </invoke></minimax:tool_call>
+   Convert them into [[VS_TOOL ...]] directives and strip the XML from the
+   prose answer.  Replaces *out when anything was converted. */
+static char *convert_minimax_xml_tool_calls(VSContext *c,char *out){
+    const char *p;VSBuf b;int count=0;
+    if(!out||!strstr(out,"<minimax:tool_call>"))return out;
+    if(binit(&b,strlen(out)+512)!=0)return out;
+    p=out;
+    while(1){
+        const char *ts=strstr(p,"<minimax:tool_call>"),*be,*q;
+        size_t pre;
+        if(!ts){badd(&b,p);break;}
+        pre=(size_t)(ts-p);
+        if(bgrow(&b,pre+1)==0&&pre){memcpy(b.p+b.len,p,pre);b.len+=pre;b.p[b.len]=0;}
+        be=strstr(ts,"</minimax:tool_call>");if(!be)be=out+strlen(out);
+        q=ts+19;
+        while((q=strstr(q,"<invoke"))!=NULL&&q<be){
+            const char *ie=strstr(q,"</invoke>"),*gt,*pa;char *nm;size_t dstart;
+            if(!ie||ie>be)break;
+            nm=xml_tag_attr(q,ie,"name");
+            gt=strchr(q,'>');
+            if(!nm||!gt||gt>ie){if(nm)free(nm);q=ie+9;continue;}
+            pa=gt+1;
+            dstart=b.len;
+            badd(&b,"[[VS_TOOL ");badd(&b,nm);
+            while((pa=strstr(pa,"<parameter"))!=NULL&&pa<ie){
+                const char *pe=strstr(pa,"</parameter>"),*pgt,*pvs,*pve;char *pk;
+                if(!pe||pe>ie)break;
+                pk=xml_tag_attr(pa,pe,"name");
+                pgt=strchr(pa,'>');
+                if(!pk||!pgt||pgt>pe){if(pk)free(pk);pa=pe+12;continue;}
+                pvs=pgt+1;pve=pe;
+                while(pvs<pve&&(*pvs==' '||*pvs=='\t'||*pvs=='\r'||*pvs=='\n'))pvs++;
+                while(pve>pvs&&(pve[-1]==' '||pve[-1]=='\t'||pve[-1]=='\r'||pve[-1]=='\n'))pve--;
+                if(pve>pvs){
+                    size_t vn=(size_t)(pve-pvs);char *pv=(char*)malloc(vn+1);
+                    if(pv){memcpy(pv,pvs,vn);pv[vn]=0;append_escaped_attr(&b,pk,pv);free(pv);}
+                }
+                free(pk);
+                pa=pe+12;
+            }
+            if(c&&c->workflow.current_task_id>0&&!tool_use_readonly_op(nm)&&!range_has_attr(&b,dstart,"task_id")){
+                char tid[24];snprintf(tid,sizeof(tid),"%d",c->workflow.current_task_id);append_escaped_attr(&b,"task_id",tid);
+            }
+            badd(&b,"]]\n");
+            trace_converted_directive(c,&b,dstart);
+            count++;free(nm);
+            q=ie+9;
+        }
+        p=be+((be[0]&&strstr(be,"</minimax:tool_call>")==be)?21:0);
+    }
+    if(count>0){
+        char tb[96];snprintf(tb,sizeof(tb),"converted %d MiniMax XML tool call(s) into VS_TOOL directives",count);
+        vs_trace(c,"tool-use-convert",tb);
+        free(out);out=bfinish(c,&b);
+    } else free(b.p);
     return out;
 }
 static char *extract_string_field(const char *json,const char *key){
@@ -730,7 +877,7 @@ int vs_should_compact(const VSContext *ctx)
     return (int)(ctx->estimated_request_tokens >= (unsigned long)threshold);
 }
 
-char *vs_chat(VSContext *c,const char *user){
+static char *vs_chat_impl(VSContext *c,const char *user){
     char *sys=vs_build_system_prompt(c),*body,*resp,*out,*u,*endpoint;
     const char *h[5];
     char auth[VS_OAUTH_TOKEN_MAX+64],apiheader[VS_OAUTH_TOKEN_MAX+64],oauth_err[512];
@@ -751,7 +898,7 @@ char *vs_chat(VSContext *c,const char *user){
         if(resp)vs_trace(c,"http-result","provider response received");
         free(u);free(body);free(sys);
         if(!resp)return dupstr(vs_cancel_requested(c)?"Stopped by user.":"HTTP request failed");
-        capture_usage(c,resp);out=c->provider.protocol==VS_PROTOCOL_ANTHROPIC?extract_anthropic_answer(c,resp):extract_text(resp);trace_output_reasoning(c,resp,out);free(resp);return out;
+        capture_usage(c,resp);out=c->provider.protocol==VS_PROTOCOL_ANTHROPIC?extract_anthropic_answer(c,resp):extract_openai_answer(c,resp);trace_output_reasoning(c,resp,out);free(resp);return out;
     }
 
     credential=c->provider.api_key;
@@ -825,8 +972,14 @@ char *vs_chat(VSContext *c,const char *user){
     }
     free(endpoint);free(body);free(sys);
     if(!resp)return dupstr(vs_cancel_requested(c)?"Stopped by user.":"HTTP request failed");
-    capture_usage(c,resp);out=c->provider.protocol==VS_PROTOCOL_ANTHROPIC?extract_anthropic_answer(c,resp):extract_text(resp);
+    capture_usage(c,resp);out=c->provider.protocol==VS_PROTOCOL_ANTHROPIC?extract_anthropic_answer(c,resp):extract_openai_answer(c,resp);
     if(out&&*out){const char *q=out;while(*q==' '||*q=='\t'||*q=='\n'||*q=='\r')q++;if(!*q){free(out);out=NULL;}}
     if(!out||!*out){free(out);vs_trace(c,"stream-empty","provider returned an empty completion (no text content); check the model/gateway configuration if this repeats");out=dupstr("The provider returned an empty response with no text content. If this repeats, check the model and gateway configuration.");return out;}
     trace_output_reasoning(c,resp,out);free(resp);return out;
+}
+
+char *vs_chat(VSContext *c,const char *user){
+    char *out=vs_chat_impl(c,user);
+    out=convert_minimax_xml_tool_calls(c,out);
+    return out;
 }
