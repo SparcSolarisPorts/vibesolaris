@@ -1171,6 +1171,10 @@ typedef struct {
        prose without any executable marker; the next turn prepends a
        one-shot reminder that directives must come first. */
     int agent_stalled_on_narration;
+    /* Set when the previous turn stopped after the malformed-directive
+       recovery budget was exhausted; the next turn gets the same
+       directive-first reminder. */
+    int agent_stalled_on_malformed;
     int suppress_history_once;
     /* Ephemeral user-choice prompt returned by the agent. Never serialized. */
     int pending_question;

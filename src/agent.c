@@ -863,16 +863,17 @@ char *vs_agent_turn(VSContext *c,const char *user){
         snprintf(np,z,"%s\n\n%s",plan_guide,prompt);
         free(prompt);prompt=np;}
     if(c->pending_question){c->pending_question=0;c->question_option_count=0;c->question[0]=0;memset(c->question_options,0,sizeof(c->question_options));}
-    /* One-shot reminder after a narration stall: the previous turn stopped
-       because the model never emitted a directive, so the next turn must
-       open with concrete tool calls, not more announcements. */
-    if(c->agent_stalled_on_narration){static const char stall_guide[]=
-        "RESUME DISCIPLINE: the previous turn stopped because responses contained narration only — no [[VS_TOOL]]/[[VS_MCP]]/[[VS_FINAL]] marker ever executed anything. Do NOT announce what you will do. Open this turn with the concrete directive(s) for the pending work, e.g. [[VS_TOOL read path=\"<file>\" start_line=\"1\" max_lines=\"200\"]] or [[VS_TOOL run task_id=\"<id>\" cmd=\"<command>\"]], and keep issuing directives until the task is done or you emit [[VS_FINAL]].";
+    /* One-shot reminder after a stall (narration-only rounds, or the
+       malformed-directive recovery budget spent): the previous turn stopped
+       without executing anything, so this turn must open with concrete,
+       well-formed tool calls rather than more announcements. */
+    if(c->agent_stalled_on_narration||c->agent_stalled_on_malformed){static const char stall_guide[]=
+        "RESUME DISCIPLINE: the previous turn stopped without completing work — responses contained narration only and/or repeatedly malformed directives, so nothing executed. Do NOT announce what you will do. Open this turn with the concrete directive(s) for the pending work, e.g. [[VS_TOOL read path=\"<file>\" start_line=\"1\" max_lines=\"200\"]] or [[VS_TOOL run task_id=\"<id>\" cmd=\"<command>\"]]; every attribute must be name=\"value\", each side-effecting directive names task_id=\"<id>\" from the accepted plan, and you keep issuing directives until the task is done or you emit [[VS_FINAL]].";
         size_t z=strlen(prompt)+sizeof(stall_guide)+8;char *np=(char*)malloc(z);
-        c->agent_stalled_on_narration=0;
+        c->agent_stalled_on_narration=0;c->agent_stalled_on_malformed=0;
         if(!np){free(prompt);free(task_anchor);free(original);return dupstr("out of memory");}
         snprintf(np,z,"%s\n\n%s",stall_guide,prompt);
-        vs_trace(c,"resume","previous turn stalled on narration-only responses; prepending directive-first reminder");
+        vs_trace(c,"resume","previous turn stalled without executing directives; prepending directive-first reminder");
         free(prompt);prompt=np;}
     /* Per-turn working history is reset, but the compacted checkpoint is
        deliberately retained (see above). */
@@ -1008,6 +1009,20 @@ char *vs_agent_turn(VSContext *c,const char *user){
                 }
                 if(c->workflow.mode==VS_MODE_MANUAL){c->workflow.action_approved=0;c->workflow.pending_request[0]=0;}
                 vs_trace(c,"directive-rejected",why);if(why_detail[0])vs_trace(c,"directive-detail",why_detail);
+                if(gate==-1||gate==-6||gate==-7){
+                    /* Recovery budget spent: stop with an actionable report
+                       instead of a bare gate error, and arm the next-turn
+                       reminder so a re-issue starts directive-first. */
+                    char report[2048];
+                    vs_trace(c,"directive-rejected-limit","malformed-directive recovery attempts exhausted; stopping the turn to avoid a silent loop");
+                    snprintf(report,sizeof(report),
+                        "The agent stopped after %d recovery attempt(s) that all produced invalid or unactionable directives, so nothing was executed. Last rejection: %s%s. The offending response was: \"%.300s\". Re-issue the request so the model re-attempts with corrected [[VS_TOOL ...]] syntax (well-formed name=\"value\" attributes, task_id from the accepted plan where required), or adjust the plan and try again.",
+                        VS_MAX_MALFORMED_RECOVERIES,why,detail,ans);
+                    free(ans);ans=dupstr(report);
+                    if(!ans)ans=dupstr(why);
+                    c->agent_stalled_on_malformed=1;
+                    break;
+                }
                 {size_t zl=strlen(why)+strlen(detail)+2;char *full=(char*)malloc(zl);if(full){snprintf(full,zl,"%s%s",why,detail);free(ans);ans=full;}else{free(ans);ans=dupstr(why);}}
                 break;}
         }
