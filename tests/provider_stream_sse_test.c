@@ -16,6 +16,8 @@ static char last_url[1024],last_body[16384],last_headers[4096];
 static char plain_response[8192]="{\"content\":[{\"type\":\"text\",\"text\":\"plain\"}]}";
 static int stream_calls=0,plain_calls=0;
 static int recover_with_text=1;          /* 0 => gateway ignores disabled-thinking */
+static char last_trace_tag[64],last_trace_msg[512];
+static int saw_shape_retry=0;
 static int stream_result=0;              /* 0 => deliver, <0 => transport failure */
 static const char *feed_sse=NULL;
 static size_t feed_len=0,feed_slice=0;   /* 0 => deliver the whole document at once */
@@ -54,7 +56,12 @@ int vs_http_post_stream_ctx(VSContext *ctx,const char *url,const char *headers[]
 const char *vs_command_shell_name(void){return "sh";}
 char *vs_mcp_prompt_fragment(const VSContext *c){(void)c;return NULL;}
 void vs_refresh_cache_key(VSContext *c){(void)c;}
-void vs_trace(VSContext *c,const char *k,const char *d){(void)c;(void)k;(void)d;}
+void vs_trace(VSContext *c,const char *k,const char *d){
+    (void)c;
+    snprintf(last_trace_tag,sizeof(last_trace_tag),"%s",k?k:"");
+    snprintf(last_trace_msg,sizeof(last_trace_msg),"%s",d?d:"");
+    if(k&&!strcmp(k,"provider-shape-retry")&&d&&strstr(d,"text_blocks=1 thinking_blocks=0"))saw_shape_retry=1;
+}
 char *vs_cached_read_file(VSContext *c,const char *p){(void)c;(void)p;return NULL;}
 char *vs_cached_base64_file(VSContext *c,const char *p,size_t *n){(void)c;(void)p;(void)n;return NULL;}
 char *vs_compact_text_limit(const char *s,size_t l,const char *r){(void)l;(void)r;return s?dupstr_test(s):NULL;}
@@ -86,7 +93,7 @@ static void setup(VSProviderKind kind,VSProtocolKind protocol,const char *base){
     snprintf(ctx.provider.base_url,sizeof(ctx.provider.base_url),"%s",base);
     snprintf(ctx.provider.model,sizeof(ctx.provider.model),"claude-sonnet-5");
     snprintf(ctx.provider.api_key,sizeof(ctx.provider.api_key),"sk-test-key");
-    stream_calls=plain_calls=0;stream_result=0;feed_slice=0;feed_sse=NULL;feed_len=0;recover_with_text=1;
+    stream_calls=plain_calls=0;stream_result=0;feed_slice=0;feed_sse=NULL;feed_len=0;recover_with_text=1;saw_shape_retry=0;
     snprintf(plain_response,sizeof(plain_response),"%s","{\"content\":[{\"type\":\"text\",\"text\":\"plain\"}]}");
     emitted_len=0;emitted[0]=0;
     ctx.stream_callback=collect_stream;ctx.stream_callback_data=NULL;
@@ -360,7 +367,8 @@ int main(void){
     out=vs_chat(&ctx,"hi");
     if(!out||strcmp(out,"recovered")!=0){fprintf(stderr,"FAIL: thinking-only completion should retry with thinking disabled, got [%s]\n",out?out:"(null)");fails++;}
     else if(plain_calls!=2){fprintf(stderr,"FAIL: expected original + one disabled-thinking retry, got %d calls\n",plain_calls);fails++;}
-    else printf("ok: thinking-only completion retries once with thinking disabled\n");
+    else if(!saw_shape_retry){fprintf(stderr,"FAIL: retried response shape not traced (tag=%s msg=%s)\n",last_trace_tag,last_trace_msg);fails++;}
+    else printf("ok: thinking-only completion retries once with thinking disabled (retry shape traced)\n");
     free(out);
 
     /* Providers that think internally but return NO thinking block at all

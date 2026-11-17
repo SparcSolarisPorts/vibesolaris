@@ -905,6 +905,22 @@ int vs_should_compact(const VSContext *ctx)
     return (int)(ctx->estimated_request_tokens >= (unsigned long)threshold);
 }
 
+/* Block inventory of an Anthropic completion: which of text / thinking /
+   tool_use the response actually carried.  This is the single most useful
+   line for diagnosing gateway translation quirks, so it runs on the
+   original response and again on any disabled-thinking retry (tagged
+   provider-shape-retry) to show exactly what the gateway did with it. */
+static void trace_anthropic_shape(VSContext *c,const char *resp,const char *tag){
+    char *sr;int nb=0,nt=0,nk=0;const char *q;
+    if(!c||!resp||!strstr(resp,"\"stop_reason\""))return;
+    sr=extract_string_field(resp,"\"stop_reason\"");if(!sr)return;
+    q=resp;while((q=strstr(q,"\"type\":\"tool_use\""))!=NULL){nb++;q+=16;}
+    q=resp;while((q=strstr(q,"\"type\":\"thinking\""))!=NULL){nk++;q+=17;}
+    q=resp;while((q=strstr(q,"\"type\":\"text\""))!=NULL){nt++;q+=12;}
+    {char sb[200];snprintf(sb,sizeof(sb),"anthropic response shape: stop_reason=%s text_blocks=%d thinking_blocks=%d tool_use_blocks=%d",sr,nt,nk,nb);
+     vs_trace(c,tag,sb);}
+    free(sr);
+}
 static char *vs_chat_impl(VSContext *c,const char *user){
     char *sys=vs_build_system_prompt(c),*body,*resp,*out,*u,*endpoint;
     const char *h[5];
@@ -976,13 +992,7 @@ static char *vs_chat_impl(VSContext *c,const char *user){
             snprintf(auth,sizeof(auth),"Authorization: Bearer %s",credential);h[1]=auth;h[2]="anthropic-version: 2023-06-01";resp=vs_http_post_ctx(c,endpoint,h,3,body,&status);
         }
         if(resp)vs_trace(c,"http-result","provider response received");
-        if(resp&&strstr(resp,"\"stop_reason\"")){char *sr=extract_string_field(resp,"\"stop_reason\"");
-            if(sr){char sb[200];int nb=0,nt=0,nk=0;const char *q=resp;
-                while((q=strstr(q,"\"type\":\"tool_use\""))!=NULL){nb++;q+=16;}
-                q=resp;while((q=strstr(q,"\"type\":\"thinking\""))!=NULL){nk++;q+=17;}
-                q=resp;while((q=strstr(q,"\"type\":\"text\""))!=NULL){nt++;q+=12;}
-                snprintf(sb,sizeof(sb),"anthropic response shape: stop_reason=%s text_blocks=%d thinking_blocks=%d tool_use_blocks=%d",sr,nt,nk,nb);
-                vs_trace(c,"provider-shape",sb);free(sr);}}
+        trace_anthropic_shape(c,resp,"provider-shape");
         /* Empty completion with nothing actionable in it: thinking-budget
            exhaustion at the gateway, or a provider that thinks internally but
            returns neither thinking blocks nor text (Claude often omits the
@@ -994,7 +1004,7 @@ static char *vs_chat_impl(VSContext *c,const char *user){
             char *resp2=0;long st2=0;
             free(body);body=build_claude_body(c,sys,user,0,1);
             if(body){resp2=vs_http_post_ctx(c,endpoint,h,3,body,&st2);
-                if(resp2&&*resp2){char tb[160];snprintf(tb,sizeof(tb),"empty completion; retried with thinking disabled (status %ld)",st2);vs_trace(c,"thinking-disabled-retry",tb);free(resp);resp=resp2;}}}
+                if(resp2&&*resp2){char tb[160];snprintf(tb,sizeof(tb),"empty completion; retried with thinking disabled (status %ld)",st2);vs_trace(c,"thinking-disabled-retry",tb);free(resp);resp=resp2;trace_anthropic_shape(c,resp,"provider-shape-retry");}}}
     }else{
         body=build_openai_body(c,sys,user,1);
         if(!body){free(endpoint);free(sys);return dupstr(vs_cancel_requested(c)?"Stopped by user.":"Request is too large or memory is exhausted; reduce attachments/context and retry.");}
