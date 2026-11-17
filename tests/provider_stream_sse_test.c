@@ -250,11 +250,22 @@ int main(void){
     if(plain_calls!=1){fprintf(stderr,"FAIL: expected a non-streaming retry after abort, got %d\n",plain_calls);fails++;}
     free(out);
 
-    /* An empty stream must not be reported as a transport failure. */
+    /* A text-less stream (usage/thinking only) must fall back to the
+       non-streaming call instead of returning an empty answer that the
+       agent loop would spin on. */
     setup(VS_PROVIDER_CUSTOM,VS_PROTOCOL_ANTHROPIC,"https://gateway.example.test/v1/messages");
     feed("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");feed_slice=1;
     out=vs_chat(&ctx,"hi");
-    if(!out){fprintf(stderr,"FAIL: a stream with no text deltas returned NULL\n");fails++;}else printf("ok: a stream with no text deltas returns an empty answer (no error)\n");
+    if(!out||strcmp(out,"plain")!=0){fprintf(stderr,"FAIL: a stream with no text deltas should fall back, got [%s]\n",out?out:"(null)");fails++;}else printf("ok: a stream with no text deltas falls back to the non-streaming call\n");
+    if(plain_calls!=1){fprintf(stderr,"FAIL: expected exactly one non-streaming fallback, got %d\n",plain_calls);fails++;}
+    free(out);
+
+    /* A thinking-only stream (output tokens but zero text deltas) must also
+       fall back, not surface an empty answer. */
+    setup(VS_PROVIDER_CUSTOM,VS_PROTOCOL_ANTHROPIC,"https://gateway.example.test/v1/messages");
+    feed("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hmm\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");feed_slice=1;
+    out=vs_chat(&ctx,"hi");
+    if(!out||strcmp(out,"plain")!=0){fprintf(stderr,"FAIL: a thinking-only stream should fall back, got [%s]\n",out?out:"(null)");fails++;}else printf("ok: a thinking-only stream falls back to the non-streaming call\n");
     free(out);
 
     /* Long answer split across many small chunks: every byte delivered once. */

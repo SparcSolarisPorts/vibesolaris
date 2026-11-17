@@ -52,6 +52,11 @@ char *vs_chat(VSContext *c,const char *p){
            the same response: the marker must be a no-op, not a state reset. */
         if(chats==1)return d("[[VS_PLAN title=\"Idem\" tasks=\"1|0|-|First;2|0|-|Second\"]]\n[[VS_TOOL plan_task_complete task_id=\"1\" summary=\"done\"]]\n[[VS_TOOL run task_id=\"2\" cmd=\"printf two\"]]");
         return d("[[VS_FINAL]]final9");}
+    if(scenario==10){
+        /* Complete task 1 and immediately start task 2 in ONE batch: the
+           host must run the completion first, not reject the batch. */
+        if(chats==1)return d("[[VS_TOOL plan_task_complete task_id=\"1\" summary=\"done\"]]\n[[VS_TOOL run task_id=\"2\" cmd=\"printf two\"]]");
+        return d("[[VS_FINAL]]final10");}
     return d("[[VS_FINAL]]unexpected");
 }
 void vs_trace(VSContext*c,const char*k,const char*x){(void)c;(void)k;(void)x;}
@@ -168,6 +173,18 @@ int main(void)
     out=vs_agent_turn(&c,"do all the tasks");
     if(!out||!strstr(out,"final9")||runs!=1||c.workflow.tasks[0].status!=VS_TASK_COMPLETED){fprintf(stderr,"scenario 9 (plan idempotency) failed: %s runs=%d status=%d\n",out?out:"(null)",runs,c.workflow.tasks[0].status);free(out);return 9;}
     free(out);puts("ok: identical plan re-proposal is a no-op, directives still run");
+
+    /* 10: a batch that completes a task and continues with the newly
+       unblocked dependent must execute split-phase, not be rejected. */
+    memset(tasks,0,sizeof(tasks));
+    tasks[0].id=1;strcpy(tasks[0].title,"First");
+    tasks[1].id=2;tasks[1].dependency_count=1;tasks[1].dependencies[0]=1;strcpy(tasks[1].title,"Second");
+    if(setup_plan(&c,tasks,2,"Split phase")!=0)return 10;
+    c.workflow.mode=VS_MODE_AUTO;
+    scenario=10;chats=runs=0;
+    out=vs_agent_turn(&c,"do all the tasks");
+    if(!out||!strstr(out,"final10")||runs!=1||c.workflow.tasks[0].status!=VS_TASK_COMPLETED){fprintf(stderr,"scenario 10 (split-phase completion) failed: %s runs=%d status=%d\n",out?out:"(null)",runs,c.workflow.tasks[0].status);free(out);return 10;}
+    free(out);puts("ok: batch completing a task and continuing with its dependent runs split-phase");
 
     puts("extended agent scenarios passed");
     return 0;

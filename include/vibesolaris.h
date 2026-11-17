@@ -13,6 +13,7 @@
 #define VS_MAX_TEXT (1024*1024)
 #define VS_MAX_TOOL_ROUNDS 64
 #define VS_MAX_MALFORMED_RECOVERIES 3 /* malformed-batch / missing-task_id re-emit attempts per agent turn */
+#define VS_MAX_TASK_GATE_RECOVERIES 6 /* blocked/not-ready-task_id re-emit attempts; ordering slips are cheap to repair */
 #define VS_MAX_NO_MARKER_RECOVERIES 3 /* prose-only responses (no VS_TOOL/VS_FINAL) before the turn stops instead of looping */
 #define VS_MAX_PLAN_CONTINUES 16
 #define VS_MIN_PLAN_EXPLORE_ROUNDS 2 /* read-only exploration rounds expected before an Auto-mode plan is adopted */

@@ -85,6 +85,7 @@ static char *fallback_checkpoint(VSContext *c,const char *task){size_t cap=VS_AG
 
 static int bad_checkpoint(const char *s){if(!s||!*s)return 1;if(strstr(s,"[[VS_TOOL")||strstr(s,"[[VS_MCP")||strstr(s,"[[VS_FINAL")||strstr(s,"[[VS_NEED_USER"))return 1;if(!strncmp(s,"HTTP request failed",19)||!strncmp(s,"provider error",14)||!strncmp(s,"No API",6))return 1;return 0;}
 
+static void append_plan_state(VSContext *c,char **pstr);
 static void agent_compact_impl(VSContext *c,const char *task,int completed_rounds,int force){
     char *p,*summary,*bounded,*fallback;size_t n;int interval=compact_interval(),saved_attachment_from;VSHTTPChunkCallback saved_stream;void *saved_stream_data;char trace[256];
     if(!c||c->agent_history_count<=0)return;
@@ -115,7 +116,7 @@ static void agent_compact_impl(VSContext *c,const char *task,int completed_round
     if(bad_checkpoint(summary)){if(summary)free(summary);fallback=fallback_checkpoint(c,task);summary=fallback;vs_trace(c,"compact","provider compaction was unusable; kept a bounded mechanical checkpoint instead");}
     if(!summary)return;
     bounded=vs_compact_text_limit(summary,VS_AGENT_CHECKPOINT_MAX,"semantic working-state checkpoint compacted");free(summary);if(!bounded)return;
-    agent_checkpoint_clear(c);c->agent_checkpoint=bounded;c->agent_checkpoint_bytes=strlen(bounded);agent_history_clear(c);
+    agent_checkpoint_clear(c);c->agent_checkpoint=bounded;append_plan_state(c,&c->agent_checkpoint);c->agent_checkpoint_bytes=strlen(c->agent_checkpoint);agent_history_clear(c);
     snprintf(trace,sizeof(trace),"working context compacted after %d rounds to %lu bytes",completed_rounds,(unsigned long)c->agent_checkpoint_bytes);vs_trace(c,"compact",trace);
     }
 }
@@ -216,6 +217,29 @@ static char *narration_extract(const char *ans){
 }
 
 static const char *task_status_label(int status){return status==VS_TASK_COMPLETED?"completed":status==VS_TASK_RUNNING?"running":status==VS_TASK_FAILED?"failed":status==VS_TASK_BLOCKED?"blocked":status==VS_TASK_CANCELLED?"cancelled":"ready";}
+
+/* Append the accepted plan's task states to a checkpoint string so the
+   compacted working state the model resumes from always includes them.
+   The model-written summary alone reliably loses "which tasks are already
+   complete", causing repeated work and stale task picks after compaction. */
+static void append_plan_state(VSContext *c,char **pstr)
+{
+    const VSWorkflow *w;size_t need,off;char *np;int i;
+    if(!c||!pstr||!*pstr)return;
+    w=&c->workflow;
+    if(!w->task_count||!vs_workflow_authorized(w))return;
+    need=strlen(*pstr)+(size_t)w->task_count*160+256;
+    np=(char*)realloc(*pstr,need);
+    if(!np)return;
+    *pstr=np;
+    off=strlen(np);
+    off+=(size_t)snprintf(np+off,need-off,"\nACCEPTED_PLAN \"%s\":\n",w->title);
+    for(i=0;i<w->task_count;i++){
+        const VSTaskRecord *t=&w->tasks[i];
+        off+=(size_t)snprintf(np+off,need-off,"  task_id=\"%d\" [%s] %s\n",t->id,task_status_label(t->status),t->title[0]?t->title:"(untitled)");
+    }
+    if(w->current_task_id)snprintf(np+off,need-off,"CURRENT_TASK: task_id=%d\n",w->current_task_id);
+}
 
 static char *native_read(VSContext *c,const char *d){char *p=attr(d,"path"),*raw,*start_s,*max_s,*out,*prefixed;long start=1,max_lines=1000,total=0,line=1,last;const char *r,*ls,*le;ABuffer b;if(!p)return dupstr("ERROR: read requires path=\"FILE\"");unesc(p);raw=vs_cached_read_file(c,p);if(!raw){free(p);return dupstr("ERROR: unable to read file");}start_s=attr(d,"start_line");max_s=attr(d,"max_lines");
     for(r=raw;*r;r++)if(*r=='\n')total++;
@@ -825,14 +849,54 @@ cleanup:
     return out;
 }
 static char *execute_batch(VSContext *c,const char *answer,int *command_runner_confirmed){int total=directive_count(answer),original_total=total,i=0,is_mcp;const char *cur=answer;char *d,*r,*server,*name,*args,*single=0;ABuffer b;if(total<=0)return 0;if(total>VS_MAX_BATCH_TOOLS)total=VS_MAX_BATCH_TOOLS;if(all_subagent_directives(answer,total)){char *parallel=parallel_subagent_batch(c,answer,total);if(parallel)return parallel;}if(all_parallel_safe_directives(answer,total)){char *parallel=parallel_readonly_batch(c,answer,total);if(parallel)return parallel;}if(total==1){d=next_directive(&cur,&is_mcp);if(!d)return dupstr("ERROR: malformed directive");if(is_mcp){server=attr(d,"server");name=attr(d,"tool");args=attr(d,"args");if(args)unesc(args);single=(server&&name)?vs_mcp_call(c,server,name,args&&*args?args:"{}"):dupstr("ERROR: malformed VS_MCP directive");free(server);free(name);free(args);}else single=execute_tool(c,d,command_runner_confirmed);free(d);return single;}
+
     if(ab_init(&b,VS_AGENT_TOOL_RESULT_MAX)!=0)return 0;
     ab_addf(&b,"BATCH_TOOL_RESULT: %d directive(s) executed in order\n",total);
     while(i<total&&(d=next_directive(&cur,&is_mcp))!=0){i++;ab_addf(&b,"\n--- directive %d: %.220s ---\n",i,d);if(is_mcp){server=attr(d,"server");name=attr(d,"tool");args=attr(d,"args");if(args)unesc(args);r=(server&&name)?vs_mcp_call(c,server,name,args&&*args?args:"{}"):dupstr("ERROR: malformed VS_MCP directive");free(server);free(name);free(args);}else r=execute_tool(c,d,command_runner_confirmed);if(r){char *q=vs_compact_text_limit(r,VS_AGENT_TOOL_RESULT_MAX/(size_t)(total?total:1),"batched tool result compacted");if(q){ab_add(&b,q);free(q);}free(r);}free(d);}
     if(original_total>VS_MAX_BATCH_TOOLS)ab_addf(&b,"\n...[only the first %d directives were executed; issue remaining dependent work next round]...\n",VS_MAX_BATCH_TOOLS);
     return ab_finish(&b);}
+/* Extract only the [[VS_TOOL plan_task_complete ...]] directives from a
+   batch, preserving line structure.  Used for split-phase execution when a
+   batch completes a plan task and immediately continues with the task that
+   completion unblocks: the readiness gate would otherwise reject the whole
+   batch atomically and send the model into a rejection spiral. */
+static char *extract_task_completions(const char *answer)
+{
+    ABuffer b;const char *p=answer;
+    if(!answer||!*answer)return NULL;
+    if(ab_init(&b,512)!=0)return NULL;
+    while(*p){
+        const char *e=strchr(p,'\n');size_t n=e?(size_t)(e-p):strlen(p);
+        if(n&&line_has(p,n,"[[VS_TOOL plan_task_complete "))ab_addn(&b,p,n);
+        if(!e)break;
+        ab_add(&b,"\n");p=e+1;
+    }
+    if(b.truncated||!b.n||!strstr(b.p,"[[VS_TOOL ")){free(b.p);return NULL;}
+    return b.p;
+}
+
+/* Run plan_task_complete directives found in a -7-gated batch first, then
+   re-validate the batch.  Returns the new gate (or the original when no
+   completion could run). */
+static int split_phase_completions(VSContext *c,char *ans,int *batch_count,char *why,size_t why_cap,int *runner_confirmed)
+{
+    char *comps,*cres,cwhy[768];int ccount=0,cgate,gate;
+    if(!c||!ans)return -7;
+    comps=extract_task_completions(ans);
+    if(!comps)return -7;
+    cgate=preflight_batch_ex(c,comps,&ccount,cwhy,sizeof cwhy);
+    if(cgate!=0||ccount<=0){free(comps);return -7;}
+    vs_trace(c,"batch-split","batch completes a plan task and continues with the newly unblocked task; running completions first, then re-validating");
+    cres=execute_batch(c,comps,runner_confirmed);
+    if(cres){char *bounded=vs_compact_text_limit(cres,VS_AGENT_TOOL_RESULT_MAX,"completion result compacted");vs_trace(c,"tool-output",bounded?bounded:cres);free(bounded);free(cres);}
+    free(comps);
+    gate=preflight_batch_ex(c,ans,batch_count,why,why_cap);
+    return gate;
+}
+
 
 char *vs_agent_turn(VSContext *c,const char *user){
-    char *prompt=dupstr(user),*ans=0,*original=dupstr(user),*task_anchor=0,*last_tool_result=0,*last_directives=0;int round,plan_continues=0,no_progress=0,tool_recoveries=0,malformed_recoveries=0,command_runner_confirmed=0,actual_tool_seen=0,execution_mode=0,cancelled=0,max_rounds=VS_MAX_TOOL_ROUNDS,explore_rounds=0,plan_deferrals=0;char step[512];
+    char *prompt=dupstr(user),*ans=0,*original=dupstr(user),*task_anchor=0,*last_tool_result=0,*last_directives=0;int round,plan_continues=0,no_progress=0,tool_recoveries=0,malformed_recoveries=0,task_gate_recoveries=0,command_runner_confirmed=0,actual_tool_seen=0,execution_mode=0,cancelled=0,max_rounds=VS_MAX_TOOL_ROUNDS,explore_rounds=0,plan_deferrals=0;char step[512];
     {const char *mr=getenv("VIBESOLARIS_MAX_AGENT_ROUNDS");if(mr&&*mr){char *ep=0;long v=strtol(mr,&ep,10);if(ep&&*ep==0&&v>=8&&v<=256)max_rounds=(int)v;}}
     if(!prompt||!original){free(prompt);free(original);return dupstr("out of memory");}
     task_anchor=build_task_anchor(c,original);if(!task_anchor)task_anchor=dupstr(original);if(!task_anchor){free(prompt);free(original);return dupstr("out of memory");}
@@ -966,6 +1030,7 @@ char *vs_agent_turn(VSContext *c,const char *user){
         tool=strstr(ans,"[[VS_TOOL ");mcp=strstr(ans,"[[VS_MCP ");
         if(tool||mcp){int batch_count=0;char why_detail[768];int gate=preflight_batch_ex(c,ans,&batch_count,why_detail,sizeof(why_detail));
             if(gate==-8){vs_trace(c,"directive-rejected","directive marker was truncated before its closing delimiter; asking the model to re-emit it");if(why_detail[0])vs_trace(c,"directive-detail",why_detail);agent_history_add(c,"user",prompt);agent_history_add(c,"assistant",ans);{char tfix[1024];snprintf(tfix,sizeof(tfix),"ERROR: the previous response contained a VS_TOOL/VS_MCP directive that was truncated before its closing ]]. Nothing was executed.%s%s Re-emit the intended directive(s) in full.",why_detail[0]?" Details: ":"",why_detail);next=continuation_prompt(task_anchor,tfix,1,c->agent_checkpoint);}free(prompt);prompt=next;if(!prompt){vs_trace(c,"memory-error","could not allocate truncation recovery prompt");break;}continue;}
+            if(gate==-7){int split=split_phase_completions(c,ans,&batch_count,why_detail,sizeof why_detail,&command_runner_confirmed);if(split!=-7){vs_trace(c,"batch-split","readiness gate cleared after running plan_task_complete first; continuing with the full batch");gate=split;}}
             if(gate<0&&gate!=-2){const char *why=gate==-4?"Manual mode approves one action at a time; request a single directive.":(gate==-3?"The requested MCP tool is not in the discovered tool catalogue.":(gate==-5?"This manual approval does not match the pending action; request approval again.":(gate==-7?"The requested task is blocked, complete, or not ready in the accepted plan.":(gate==-6?"Every action must name an accepted task_id from the reviewed plan.":"The directive batch was malformed and was rejected before any action ran."))));
                 char detail[1024];detail[0]=0;
                 if(why_detail[0])snprintf(detail,sizeof(detail)," Details: %s",why_detail);else if(gate==-1)snprintf(detail,sizeof(detail)," Details: no directive in the batch passed validation.");
@@ -976,9 +1041,10 @@ char *vs_agent_turn(VSContext *c,const char *user){
                    valid task_id instead of ending the turn with a raw gate
                    error.  Cap retries so a provider that keeps producing
                    garbage still ends the turn. */
-                if((gate==-1||gate==-6||gate==-7)&&malformed_recoveries<VS_MAX_MALFORMED_RECOVERIES){
+                {int *used=(gate==-1)?&malformed_recoveries:&task_gate_recoveries;int budget=(gate==-1)?VS_MAX_MALFORMED_RECOVERIES:VS_MAX_TASK_GATE_RECOVERIES;
+                if((gate==-1||gate==-6||gate==-7)&&*used<budget){
                     char *fixmsg;
-                    malformed_recoveries++;
+                    (*used)++;
                     if(c->workflow.mode==VS_MODE_MANUAL){c->workflow.action_approved=0;c->workflow.pending_request[0]=0;}
                     vs_trace(c,"directive-rejected",why);if(why_detail[0])vs_trace(c,"directive-detail",why_detail);
                     if(gate==-1){
@@ -1007,6 +1073,7 @@ char *vs_agent_turn(VSContext *c,const char *user){
                     if(!prompt){vs_trace(c,"memory-error","could not allocate malformed-batch recovery prompt");break;}
                     continue;
                 }
+                }
                 if(c->workflow.mode==VS_MODE_MANUAL){c->workflow.action_approved=0;c->workflow.pending_request[0]=0;}
                 vs_trace(c,"directive-rejected",why);if(why_detail[0])vs_trace(c,"directive-detail",why_detail);
                 if(gate==-1||gate==-6||gate==-7){
@@ -1017,7 +1084,7 @@ char *vs_agent_turn(VSContext *c,const char *user){
                     vs_trace(c,"directive-rejected-limit","malformed-directive recovery attempts exhausted; stopping the turn to avoid a silent loop");
                     snprintf(report,sizeof(report),
                         "The agent stopped after %d recovery attempt(s) that all produced invalid or unactionable directives, so nothing was executed. Last rejection: %s%s. The offending response was: \"%.300s\". Re-issue the request so the model re-attempts with corrected [[VS_TOOL ...]] syntax (well-formed name=\"value\" attributes, task_id from the accepted plan where required), or adjust the plan and try again.",
-                        VS_MAX_MALFORMED_RECOVERIES,why,detail,ans);
+                        (gate==-1?VS_MAX_MALFORMED_RECOVERIES:VS_MAX_TASK_GATE_RECOVERIES),why,detail,ans);
                     free(ans);ans=dupstr(report);
                     if(!ans)ans=dupstr(why);
                     c->agent_stalled_on_malformed=1;

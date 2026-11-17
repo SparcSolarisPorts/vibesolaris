@@ -92,6 +92,10 @@ static long extract_long(const char *json,const char *needle){const char *p=strs
 static void capture_usage(VSContext *c,const char *json){
     long cached=0,cachew=0,in=0,out=0,total=0;int have=0,anthropic_style=0;char b[256];
     if(!c||!json)return;
+    /* Leave existing stats untouched when the payload carries no usage at
+       all (e.g. a non-streaming fallback body that omits the fields must not
+       zero out usage already captured from the stream). */
+    if(!strstr(json,"\"prompt_tokens\"")&&!strstr(json,"\"input_tokens\"")&&!strstr(json,"\"completion_tokens\"")&&!strstr(json,"\"output_tokens\"")&&!strstr(json,"\"total_tokens\"")&&!strstr(json,"\"cached_tokens\"")&&!strstr(json,"\"cache_read_input_tokens\"")&&!strstr(json,"\"cache_creation_input_tokens\"")&&!strstr(json,"\"cache_write_tokens\"")&&!strstr(json,"\"promptTokenCount\"")&&!strstr(json,"\"candidatesTokenCount\"")&&!strstr(json,"\"totalTokenCount\"")&&!strstr(json,"\"cachedContentTokenCount\""))return;
     cached=extract_long(json,"\"cached_tokens\"");
     if(!cached)cached=extract_long(json,"\"cache_read_input_tokens\"");
     if(!cached)cached=extract_long(json,"\"cachedContentTokenCount\"");
@@ -368,7 +372,9 @@ static char *build_claude_body(VSContext *c,const char *sys,const char *user,int
         else {t=vs_cached_read_file(c,c->attachments[i].path);if(t){t=bounded_attachment(c,t,c->attachments[i].path);if(!t)continue;badd(&b,",{\"type\":\"text\",\"text\":");x=(char*)malloc(strlen(c->attachments[i].path)+strlen(t)+32);if(x){sprintf(x,"Attached file: %s\n%s",c->attachments[i].path,t);bquoted(&b,x);free(x);}else bquoted(&b,t);badd(&b,"}");free(t);}}
     }
     badd(&b,"]}]");if(streaming)badd(&b,",\"stream\":true");
-    if(c->effort>0){badd(&b,",\"output_config\":{\"effort\":");bquoted(&b,c->effort==1?"low":c->effort==2?"medium":"high");badd(&b,"}");}
+    /* No output_config here: it is not an Anthropic Messages field, and
+       gateways have been observed to treat an unrecognized effort hint as a
+       request for thinking-only output, which the stream parser then drops. */
     badd(&b,"}");return bfinish(c,&b);
 }
 
@@ -381,7 +387,7 @@ typedef struct {
     size_t line_scanned;   /* bytes already known newline-free: skip rescanning
                               them on every chunk, keeping multi-chunk lines O(n)
                               instead of O(chunks x line_len). */
-    int saw_sse,done,error,callback_failed,usage_seen;
+    int saw_sse,done,error,callback_failed,usage_seen,saw_thinking;
     long stream_input,stream_output,stream_total,stream_cache_read,stream_cache_write;
     int stream_total_seen;
 } ProviderStream;
@@ -415,6 +421,7 @@ static void stream_event(ProviderStream *s,const char *data)
                 s->stream_output=extract_long(data,"\"output_tokens\"");s->usage_seen=1;
             }
         }
+        if(strstr(data,"content_block_delta")&&strstr(data,"thinking_delta"))s->saw_thinking=1;
         if(strstr(data,"content_block_delta")&&strstr(data,"text_delta")){
             part=extract_string_field(data,"\"text\"");if(part){stream_emit(s,part);free(part);}
         }
@@ -466,7 +473,13 @@ static void stream_capture_usage(ProviderStream *s){
     capture_usage(s->ctx,usage);
 }
 static int provider_stream_success(const ProviderStream *s)
-{return s&&s->saw_sse&&!s->error;}
+{return s&&s->saw_sse&&!s->error&&s->answer.len>0;}
+static void stream_empty_note(const ProviderStream *ps,VSContext *c){
+    char eb[320];
+    if(!ps||!c)return;
+    if(ps->saw_sse&&!ps->error&&ps->answer.len==0)
+        {snprintf(eb,sizeof(eb),"stream completed with no text content (%ld output token(s)%s); falling back to the non-streaming call",ps->stream_output,ps->saw_thinking?", thinking-only response":"; provider returned an empty completion");vs_trace(c,"stream-empty",eb);}
+}
 
 #if defined(__GNUC__)
 __attribute__((weak)) int vs_http_post_stream_ctx(VSContext *ctx,const char *url,const char *headers[],int nheaders,const char *body,long *status,VSHTTPChunkCallback callback,void *userdata){(void)ctx;(void)url;(void)headers;(void)nheaders;(void)body;(void)status;(void)callback;(void)userdata;return -1;}
@@ -654,7 +667,7 @@ char *vs_chat(VSContext *c,const char *user){
         vs_trace(c,"http-wait","request sent; waiting for provider response");
         {
             ProviderStream ps;memset(&ps,0,sizeof(ps));ps.ctx=c;ps.protocol=VS_PROTOCOL_ANTHROPIC;
-            if(binit(&ps.answer,256)==0){int src=vs_http_post_stream_ctx(c,endpoint,h,nh,body,&status,provider_stream_chunk,&ps);provider_stream_finish(&ps);if(src==0&&provider_stream_success(&ps)){stream_capture_usage(&ps);free(body);free(endpoint);free(sys);out=ps.error?dupstr(vs_cancel_requested(c)?"Stopped by user.":"Streaming provider response failed."):ps.answer.p;free(ps.line);if(out&&*out)vs_trace(c,"http-result","streaming provider response received");return out?out:dupstr("HTTP request failed");}if(ps.error&&ps.answer.len>0&&!ps.callback_failed){free(body);free(endpoint);free(sys);out=dupstr(vs_cancel_requested(c)?"Stopped by user.":"Streaming provider response failed.");free(ps.answer.p);free(ps.line);return out;}free(ps.answer.p);free(ps.line);}
+            if(binit(&ps.answer,256)==0){int src=vs_http_post_stream_ctx(c,endpoint,h,nh,body,&status,provider_stream_chunk,&ps);provider_stream_finish(&ps);if(src==0&&provider_stream_success(&ps)){stream_capture_usage(&ps);free(body);free(endpoint);free(sys);out=ps.error?dupstr(vs_cancel_requested(c)?"Stopped by user.":"Streaming provider response failed."):ps.answer.p;free(ps.line);if(out&&*out)vs_trace(c,"http-result","streaming provider response received");return out?out:dupstr("HTTP request failed");}if(ps.error&&ps.answer.len>0&&!ps.callback_failed){free(body);free(endpoint);free(sys);out=dupstr(vs_cancel_requested(c)?"Stopped by user.":"Streaming provider response failed.");free(ps.answer.p);free(ps.line);return out;}stream_empty_note(&ps,c);stream_capture_usage(&ps);free(ps.answer.p);free(ps.line);}
         }
         free(body);body=build_claude_body(c,sys,user,0);if(!body){free(endpoint);free(sys);return dupstr("Request is too large or memory is exhausted");}
         h[0]="Content-Type: application/json";
@@ -672,7 +685,7 @@ char *vs_chat(VSContext *c,const char *user){
         vs_trace(c,"http-wait","request sent; waiting for provider response");
         {
             ProviderStream ps;memset(&ps,0,sizeof(ps));ps.ctx=c;ps.protocol=VS_PROTOCOL_OPENAI;
-            if(binit(&ps.answer,256)==0){int src=vs_http_post_stream_ctx(c,endpoint,h,3,body,&status,provider_stream_chunk,&ps);provider_stream_finish(&ps);if(src==0&&provider_stream_success(&ps)){stream_capture_usage(&ps);free(body);free(endpoint);free(sys);out=ps.error?dupstr(vs_cancel_requested(c)?"Stopped by user.":"Streaming provider response failed"):ps.answer.p;free(ps.line);if(out&&*out)vs_trace(c,"http-result","streaming provider response received");return out?out:dupstr("HTTP request failed");}if(ps.error&&ps.answer.len>0&&!ps.callback_failed){free(body);free(endpoint);free(sys);out=dupstr(vs_cancel_requested(c)?"Stopped by user.":"Streaming provider response failed");free(ps.answer.p);free(ps.line);return out;}free(ps.answer.p);free(ps.line);}
+            if(binit(&ps.answer,256)==0){int src=vs_http_post_stream_ctx(c,endpoint,h,3,body,&status,provider_stream_chunk,&ps);provider_stream_finish(&ps);if(src==0&&provider_stream_success(&ps)){stream_capture_usage(&ps);free(body);free(endpoint);free(sys);out=ps.error?dupstr(vs_cancel_requested(c)?"Stopped by user.":"Streaming provider response failed"):ps.answer.p;free(ps.line);if(out&&*out)vs_trace(c,"http-result","streaming provider response received");return out?out:dupstr("HTTP request failed");}if(ps.error&&ps.answer.len>0&&!ps.callback_failed){free(body);free(endpoint);free(sys);out=dupstr(vs_cancel_requested(c)?"Stopped by user.":"Streaming provider response failed");free(ps.answer.p);free(ps.line);return out;}stream_empty_note(&ps,c);stream_capture_usage(&ps);free(ps.answer.p);free(ps.line);}
         }
         free(body);body=build_openai_body(c,sys,user,0);if(!body){free(endpoint);free(sys);return dupstr("Request is too large or memory is exhausted");}
         h[0]="Content-Type: application/json";h[1]=auth;
@@ -681,5 +694,8 @@ char *vs_chat(VSContext *c,const char *user){
     }
     free(endpoint);free(body);free(sys);
     if(!resp)return dupstr(vs_cancel_requested(c)?"Stopped by user.":"HTTP request failed");
-    capture_usage(c,resp);out=c->provider.protocol==VS_PROTOCOL_ANTHROPIC?extract_anthropic_text(resp):extract_text(resp);trace_output_reasoning(c,resp,out);free(resp);return out;
+    capture_usage(c,resp);out=c->provider.protocol==VS_PROTOCOL_ANTHROPIC?extract_anthropic_text(resp):extract_text(resp);
+    if(out&&*out){const char *q=out;while(*q==' '||*q=='\t'||*q=='\n'||*q=='\r')q++;if(!*q){free(out);out=NULL;}}
+    if(!out||!*out){free(out);vs_trace(c,"stream-empty","provider returned an empty completion (no text content); check the model/gateway configuration if this repeats");out=dupstr("The provider returned an empty response with no text content. If this repeats, check the model and gateway configuration.");return out;}
+    trace_output_reasoning(c,resp,out);free(resp);return out;
 }
