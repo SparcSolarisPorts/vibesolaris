@@ -143,6 +143,20 @@ static char *continuation_prompt(const char *task,const char *result,int plannin
     size_t n=strlen(task?task:"")+strlen(result?result:"")+strlen(checkpoint?checkpoint:"")+strlen(lead)+512;char *o=(char*)malloc(n);if(!o)return 0;
     snprintf(o,n,"ACTIVE_TASK:\n%s\n\nCOMPACTED_WORKING_STATE:\n%s\n\n%s\n%s\n\nContinue efficiently from this state. Use one or more VS_TOOL/VS_MCP directives, VS_NEED_USER for a genuine blocker, or VS_FINAL only when complete. Do not redo completed inspection.\n",task?task:"",checkpoint?checkpoint:"(none)",lead,result?result:"(no result)");return o;
 }
+/* No-marker recovery: the model keeps narrating without emitting any
+   [[VS_TOOL]]/[[VS_MCP]]/[[VS_FINAL]] marker, so nothing executes and the
+   turn cannot advance.  Quote its actual words back and demand concrete
+   directives.  Escalates with the consecutive count. */
+static char *no_marker_recovery_prompt(const char *task,const char *prev,int consecutive,const char *checkpoint){
+    size_t n=strlen(task?task:"")+strlen(prev?prev:"")+strlen(checkpoint?checkpoint:"")+1400;char *o=(char*)malloc(n);if(!o)return 0;
+    snprintf(o,n,
+        "PROTOCOL ERROR: your previous %d response(s) contained prose only — no [[VS_TOOL ...]], [[VS_MCP ...]], or [[VS_FINAL]] marker. Prose does not execute anything; the host cannot act on narration, so the turn makes no progress. This is recovery %d of %d; after that the turn stops.\n\n"
+        "Your last response was (verbatim, truncated):\n%.*s\n\n"
+        "ACTIVE_TASK:\n%s\n\nCOMPACTED_WORKING_STATE:\n%s\n\n"
+        "Emit concrete action NOW: one or more [[VS_TOOL ...]] directives on their own lines (each naming task_id=\"<id>\" from the accepted plan when side effects require one), or [[VS_FINAL]] only when the task is genuinely complete. Do not describe the work — issue the directives that do it.\n",
+        consecutive,consecutive,VS_MAX_NO_MARKER_RECOVERIES,700,prev?prev:"(empty)",task?task:"",checkpoint?checkpoint:"(none)");
+    return o;
+}
 /* Auto-mode plan deepening: sent back when a [[VS_PLAN]] arrives with too
    little read-only investigation behind it.  Asks the model to verify the
    draft against the real codebase before the plan is adopted, so the do
@@ -1018,7 +1032,25 @@ char *vs_agent_turn(VSContext *c,const char *user){
                     free(prompt);prompt=retry;continue;
                 }
             }
-            if(execution_mode||actual_tool_seen){plan_continues++;no_progress++;snprintf(step,sizeof(step),"execution response had no directive/final marker; continuing (%d consecutive) until the round ceiling",no_progress);vs_trace(c,"auto-continue",step);agent_history_add(c,"user",prompt);agent_history_add(c,"assistant",ans);next=continuation_prompt(task_anchor,last_tool_result,1,c->agent_checkpoint);free(prompt);prompt=next;if(!prompt){vs_trace(c,"memory-error","could not allocate continuation prompt");break;}continue;}
+            if(execution_mode||actual_tool_seen){
+                plan_continues++;no_progress++;
+                /* Surface what the model actually said, truncated, so the
+                   user can see why the round made no progress. */
+                {char prev[192];size_t pl=strlen(ans);if(pl>sizeof(prev)-1)pl=sizeof(prev)-1;memcpy(prev,ans,pl);prev[pl]=0;
+                 snprintf(step,sizeof(step),"response had no directive/final marker; it said: %.160s%s",prev,strlen(ans)>160?"...":"");vs_trace(c,"no-marker-detail",step);}
+                if(no_progress>=VS_MAX_NO_MARKER_RECOVERIES){
+                    /* Stop burning the round ceiling on narration: end the
+                       turn with a descriptive, actionable failure instead. */
+                    char report[1024];size_t rl;
+                    vs_trace(c,"no-marker-limit","model kept emitting prose without any executable marker; stopping the turn to avoid a silent round ceiling loop");
+                    rl=(size_t)snprintf(report,sizeof(report),
+                        "The agent stopped after %d consecutive responses that contained no [[VS_TOOL]]/[[VS_MCP]]/[[VS_FINAL]] marker, so nothing was executed. The last response said: \"%.300s%s\". To continue, the model must emit concrete [[VS_TOOL ...]] directives (each naming task_id from the accepted plan where required) or [[VS_FINAL]] when complete; describing the work in prose does not advance the task. Re-issue the request or adjust the plan and try again.",
+                        no_progress,ans,strlen(ans)>300?"...":"");
+                    free(ans);ans=dupstr(report);
+                    if(!ans){vs_trace(c,"memory-error","could not allocate no-marker failure report");break;}
+                    break;
+                }
+                snprintf(step,sizeof(step),"execution response had no directive/final marker; continuing (%d/%d) before the turn stops",no_progress,VS_MAX_NO_MARKER_RECOVERIES);vs_trace(c,"auto-continue",step);agent_history_add(c,"user",prompt);agent_history_add(c,"assistant",ans);next=no_marker_recovery_prompt(task_anchor,ans,no_progress,c->agent_checkpoint);free(prompt);prompt=next;if(!prompt){vs_trace(c,"memory-error","could not allocate no-marker recovery prompt");break;}continue;}
             if(plan_continues<(c->workflow.mode==VS_MODE_AUTO?VS_MAX_PLAN_CONTINUES*2:VS_MAX_PLAN_CONTINUES)&&should_auto_continue(original,ans)){plan_continues++;snprintf(step,sizeof(step),"planning-only response detected; continuing (%d/%d)",plan_continues,c->workflow.mode==VS_MODE_AUTO?VS_MAX_PLAN_CONTINUES*2:VS_MAX_PLAN_CONTINUES);vs_trace(c,"auto-continue",step);agent_history_add(c,"user",prompt);agent_history_add(c,"assistant",ans);next=continuation_prompt(task_anchor,0,1,c->agent_checkpoint);free(prompt);prompt=next;if(!prompt){vs_trace(c,"memory-error","could not allocate continuation prompt");break;}continue;}
             vs_trace(c,"agent","completed informational turn without tool work");break;
         }
