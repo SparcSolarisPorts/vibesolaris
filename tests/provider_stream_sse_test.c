@@ -224,8 +224,12 @@ int main(void){
     setup(VS_PROVIDER_CUSTOM,VS_PROTOCOL_OPENAI,"https://gateway.example.test/v1");
     feed(OPENAI_SSE);feed_slice=1;
     out=vs_chat(&ctx,"hi");free(out);
-    if(strstr(last_body,"\"tools\":[")){fprintf(stderr,"FAIL: OpenAI-protocol request unexpectedly carries an Anthropic tools array\n");fails++;}
-    else printf("ok: OpenAI-protocol requests are unaffected\n");
+    if(!strstr(last_body,"\"tools\":[")||!strstr(last_body,"\"type\":\"function\"")||!strstr(last_body,"\"name\":\"subagent\"")||!strstr(last_body,"\"name\":\"read\"")||!strstr(last_body,"\"tool_choice\":\"auto\"")){fprintf(stderr,"FAIL: custom OpenAI-protocol request lacks the native function tools array\n");fails++;}
+    else printf("ok: custom OpenAI-protocol requests expose the core directive set as native function tools\n");
+    if(strstr(last_body,"\"input_schema\"")){fprintf(stderr,"FAIL: OpenAI-protocol request carries an Anthropic-shaped tools array\n");fails++;}
+    else printf("ok: OpenAI-protocol tools use the function shape, not input_schema\n");
+    if(!strstr(last_body,"true}}}],\"tool_choice\"")){fprintf(stderr,"FAIL: native function tools array is not balanced before tool_choice\n");fails++;}
+    else printf("ok: native function tools array is balanced and well-formed\n");
 
     setup(VS_PROVIDER_CUSTOM,VS_PROTOCOL_OPENAI,"https://gateway.example.test/v1");
     feed(OPENAI_SSE);feed_slice=1;
@@ -244,6 +248,8 @@ int main(void){
     out=vs_chat(&ctx,"hi");free(out);
     if(ctx.provider_input_tokens!=100||ctx.provider_output_tokens!=10||ctx.provider_total_tokens!=111||ctx.provider_cache_read_tokens!=40){fprintf(stderr,"FAIL: OpenAI streamed usage accounting\n");fails++;}else printf("ok: OpenAI streamed usage accounting\n");
     if(!strstr(last_body,"\"stream_options\":{\"include_usage\":true}")){fprintf(stderr,"FAIL: OpenAI stream does not request usage\n");fails++;}
+    if(strstr(last_body,"\"tools\":[")){fprintf(stderr,"FAIL: first-party OpenAI request unexpectedly carries a tools array\n");fails++;}
+    else printf("ok: first-party OpenAI stays on the text-marker protocol\n");
     setup(VS_PROVIDER_CUSTOM,VS_PROTOCOL_OPENAI,"https://gateway.example.test/v1");feed(OPENAI_SSE);out=vs_chat(&ctx,"hi");free(out);
     if(strstr(last_body,"\"stream_options\"")){fprintf(stderr,"FAIL: custom gateway received stream_options\n");fails++;}
 

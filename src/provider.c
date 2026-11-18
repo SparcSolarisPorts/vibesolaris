@@ -617,6 +617,64 @@ static int openai_ext_cache(const VSContext *c,const char *model){return c->cach
    Anthropic API upstream: they need max_tokens and reject sampling/cache extras. */
 static int is_claude_model(const char *m){size_t i;static const char needle[]="claude";if(!m)return 0;for(;*m;m++){for(i=0;i<sizeof(needle)-1;i++){if(!m[i]||tolower((unsigned char)m[i])!=needle[i])break;}if(i==sizeof(needle)-1)return 1;}return 0;}
 
+/* Native tool table shared by both protocol body builders: exposed to
+   tool-trained models on CUSTOM gateways, Claude Code style.  Response
+   conversion (Anthropic tool_use, OpenAI tool_calls, MiniMax raw XML) already
+   turns native calls back into [[VS_TOOL ...]] directives, so the text-marker
+   protocol keeps working unchanged.  First-party providers stay text-only. */
+typedef struct { const char *name; const char *description; } VSNativeTool;
+static const VSNativeTool vs_native_tools[] = {
+    {"read","Read a file. Attributes: path, start_line, max_lines."},
+    {"list","List a directory tree. Attributes: path, depth, limit."},
+    {"search","Literal text search under a path. Attributes: path, query, limit, case_insensitive."},
+    {"glob","Find files by pattern. Attributes: path, pattern."},
+    {"grep","Regex search under a path. Attributes: path, pattern, context, limit, case_insensitive."},
+    {"run","Run a shell command and return its output. Attributes: task_id, cmd."},
+    {"write","Write a file. Attributes: task_id, path, content (use \\n escapes for newlines, \\\" for quotes)."},
+    {"edit","Exact-string replacement in a file. Attributes: task_id, path, search, replace."},
+    {"multi_edit","Several exact replacements in one call. Attributes: task_id, path, edits (search|replace;...)."},
+    {"subagent","Launch a subagent with its own context and the same tools; returns SUBAGENT_RESULT. Give it a complete self-contained task. Attributes: task_id, task."},
+    {"todo","Track subtasks. Attributes: task_id, items (a|b|c) or index plus status."},
+    {"plan_task_complete","Mark an accepted plan task complete with a summary. Attributes: task_id, summary."},
+    {"monitor","Run a background command. Attributes: task_id, cmd."},
+    {"monitor_output","Read a background command's recent output. Attributes: task_id, monitor_id."},
+    {"monitor_kill","Stop a background command. Attributes: task_id, monitor_id."},
+    {"web_search","Search the web. Attributes: query, count."},
+    {"web_fetch","Fetch a URL as text. Attributes: url, max_chars."},
+    {"graph","Build a code graph of files or fields. Attributes: mode, path."},
+    {"notebook_read","Read a notebook. Attributes: path."},
+    {"checkpoint","Save/restore working state. Attributes: action."},
+    {"task_list","List tasks. No attributes."}
+};
+#define VS_NATIVE_TOOL_COUNT (sizeof(vs_native_tools)/sizeof(vs_native_tools[0]))
+
+static void add_native_tools_anthropic(VSBuf *b){
+    size_t ti;
+    badd(b,",\"tools\":[");
+    for(ti=0;ti<VS_NATIVE_TOOL_COUNT;ti++){
+        if(ti)badd(b,",");
+        badd(b,"{\"name\":");bquoted(b,vs_native_tools[ti].name);
+        badd(b,",\"description\":");bquoted(b,vs_native_tools[ti].description);
+        badd(b,",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}}");
+    }
+    badd(b,"]");
+}
+
+/* OpenAI function-call shape, per the MiniMax tool calling guide:
+   {"type":"function","function":{"name","description","parameters"}} plus
+   tool_choice:"auto".  MiniMax-M2.x, vLLM and SGLang all accept this. */
+static void add_native_tools_openai(VSBuf *b){
+    size_t ti;
+    badd(b,",\"tools\":[");
+    for(ti=0;ti<VS_NATIVE_TOOL_COUNT;ti++){
+        if(ti)badd(b,",");
+        badd(b,"{\"type\":\"function\",\"function\":{\"name\":");bquoted(b,vs_native_tools[ti].name);
+        badd(b,",\"description\":");bquoted(b,vs_native_tools[ti].description);
+        badd(b,",\"parameters\":{\"type\":\"object\",\"additionalProperties\":true}}}");
+    }
+    badd(b,"],\"tool_choice\":\"auto\"}");
+}
+
 static char *build_openai_body(VSContext *c,const char *sys,const char *user,int streaming){
     VSBuf b;int i,first=1,astart;char *x,*t,*e;const char *mime;
     if(binit(&b,8192)!=0)return NULL;
@@ -636,6 +694,7 @@ static char *build_openai_body(VSContext *c,const char *sys,const char *user,int
         else {t=vs_cached_read_file(c,c->attachments[i].path);if(t){t=bounded_attachment(c,t,c->attachments[i].path);if(!t)continue;e=vs_json_escape(t);badd(&b,",{\"type\":\"text\",\"text\":\"Attached file: ");x=vs_json_escape(c->attachments[i].path);badd(&b,x);free(x);badd(&b,"\\n");badd(&b,e);badd(&b,"\"}");free(e);free(t);}}
     }
     badd(&b,"]}]");
+    if(c->provider.kind==VS_PROVIDER_CUSTOM)add_native_tools_openai(&b);
     if(streaming){badd(&b,",\"stream\":true");if(c->provider.kind==VS_PROVIDER_OPENAI)badd(&b,",\"stream_options\":{\"include_usage\":true}");}
     if(c->cache_enabled && !is_claude_model(c->provider.model)){badd(&b,",\"prompt_cache_key\":");bquoted(&b,c->cache_key);if(openai_ext_cache(c,c->provider.model))badd(&b,",\"prompt_cache_options\":{\"mode\":\"implicit\",\"ttl\":\"30m\"}");}
     /* Effort level — OpenAI-compatible providers that support output_config
@@ -660,35 +719,9 @@ static char *build_claude_body(VSContext *c,const char *sys,const char *user,int
     /* Custom gateways: expose the core directive set as NATIVE tools so
        tool-trained models get a first-class affordance for calling them
        (Claude Code's harness does this, which is why it delegates far more
-       reliably on the same model).  Native tool_use blocks in responses are
-       converted back into [[VS_TOOL ...]] directives by the extraction layer,
-       so the text-marker protocol keeps working unchanged.  First-party
-       Anthropic is left on the text protocol for now. */
-    if(c->provider.kind==VS_PROVIDER_CUSTOM){
-        static const char *native_tools=
-            "{\"name\":\"read\",\"description\":\"Read a file. Attributes: path, start_line, max_lines.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
-            "{\"name\":\"list\",\"description\":\"List a directory tree. Attributes: path, depth, limit.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
-            "{\"name\":\"search\",\"description\":\"Literal text search under a path. Attributes: path, query, limit, case_insensitive.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
-            "{\"name\":\"glob\",\"description\":\"Find files by pattern. Attributes: path, pattern.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
-            "{\"name\":\"grep\",\"description\":\"Regex search under a path. Attributes: path, pattern, context, limit, case_insensitive.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
-            "{\"name\":\"run\",\"description\":\"Run a shell command and return its output. Attributes: task_id, cmd.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
-            "{\"name\":\"write\",\"description\":\"Write a file. Attributes: task_id, path, content (use \\n escapes for newlines, \\\" for quotes).\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
-            "{\"name\":\"edit\",\"description\":\"Exact-string replacement in a file. Attributes: task_id, path, search, replace.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
-            "{\"name\":\"multi_edit\",\"description\":\"Several exact replacements in one call. Attributes: task_id, path, edits (search|replace;...).\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
-            "{\"name\":\"subagent\",\"description\":\"Launch a subagent with its own context and the same tools; returns SUBAGENT_RESULT. Give it a complete self-contained task. Attributes: task_id, task.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
-            "{\"name\":\"todo\",\"description\":\"Track subtasks. Attributes: task_id, items (a|b|c) or index plus status.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
-            "{\"name\":\"plan_task_complete\",\"description\":\"Mark an accepted plan task complete with a summary. Attributes: task_id, summary.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
-            "{\"name\":\"monitor\",\"description\":\"Run a background command. Attributes: task_id, cmd.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
-            "{\"name\":\"monitor_output\",\"description\":\"Read a background command's recent output. Attributes: task_id, monitor_id.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
-            "{\"name\":\"monitor_kill\",\"description\":\"Stop a background command. Attributes: task_id, monitor_id.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
-            "{\"name\":\"web_search\",\"description\":\"Search the web. Attributes: query, count.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
-            "{\"name\":\"web_fetch\",\"description\":\"Fetch a URL as text. Attributes: url, max_chars.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
-            "{\"name\":\"graph\",\"description\":\"Build a code graph of files or fields. Attributes: mode, path.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
-            "{\"name\":\"notebook_read\",\"description\":\"Read a notebook. Attributes: path.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
-            "{\"name\":\"checkpoint\",\"description\":\"Save/restore working state. Attributes: action.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
-            "{\"name\":\"task_list\",\"description\":\"List tasks. No attributes.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}}";
-        badd(&b,",\"tools\":[");badd(&b,native_tools);badd(&b,"]");
-    }
+       reliably on the same model).  First-party Anthropic is left on the
+       text protocol for now. */
+    if(c->provider.kind==VS_PROVIDER_CUSTOM)add_native_tools_anthropic(&b);
     badd(&b,",\"system\":[{\"type\":\"text\",\"text\":");bquoted(&b,sys);if(c->cache_enabled)badd(&b,",\"cache_control\":{\"type\":\"ephemeral\"}");badd(&b,"}],\"messages\":[");
     {int total_hist=c->history_count+c->agent_history_count,hist_idx=0;
     for(i=0;i<c->history_count;i++){if(vs_cancel_requested(c)){free(b.p);return NULL;}if(!first)badd(&b,",");first=0;hist_idx++;badd(&b,"{\"role\":");bquoted(&b,!strcmp(c->history[i].role,"assistant")?"assistant":"user");if(c->cache_enabled&&hist_idx==total_hist){badd(&b,",\"content\":[{\"type\":\"text\",\"text\":");bquoted(&b,c->history[i].content);badd(&b,",\"cache_control\":{\"type\":\"ephemeral\"}}]}");}else{badd(&b,",\"content\":");bquoted(&b,c->history[i].content);badd(&b,"}");}}
