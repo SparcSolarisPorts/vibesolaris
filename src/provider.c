@@ -1100,11 +1100,23 @@ static char *vs_chat_impl(VSContext *c,const char *user){
            before giving up; responses that carry text or tool calls never
            take this path.  Error/refusal bodies are left alone. */
         if(resp&&!strstr(resp,"\"type\":\"text\"")&&!strstr(resp,"\"type\":\"tool_use\"")
-           &&!strstr(resp,"\"type\":\"error\"")&&!strstr(resp,"\"stop_reason\":\"refusal\"")){
+           &&!strstr(resp,"\"type\":\"error\"")&&!strstr(resp,"\"stop_reason\":\"refusal\"")
+           &&!c->thinking_disabled_ignored){
             char *resp2=0;long st2=0;
             free(body);body=build_claude_body(c,sys,user,0,1);
             if(body){resp2=vs_http_post_ctx(c,endpoint,h,3,body,&st2);
-                if(resp2&&*resp2){char tb[160];snprintf(tb,sizeof(tb),"empty completion; retried with thinking disabled (status %ld)",st2);vs_trace(c,"thinking-disabled-retry",tb);free(resp);resp=resp2;trace_anthropic_shape(c,resp,"provider-shape-retry");}}}
+                if(resp2&&*resp2){
+                    /* Track gateways that ignore the disabled-thinking hint: their
+                       retry comes back thinking-only again, doubling every empty
+                       round for zero benefit.  After two consecutive futile
+                       retries, stop sending them (thinking-as-answer still
+                       surfaces any directives parked in the thinking). */
+                    if(!strstr(resp2,"\"type\":\"text\"")){
+                        c->thinking_retry_futile++;
+                        if(c->thinking_retry_futile>=2){c->thinking_disabled_ignored=1;vs_trace(c,"thinking-disabled-ignored","gateway returns thinking-only output even with thinking disabled; skipping future thinking-disabled retries");}
+                    }else c->thinking_retry_futile=0;
+                    {char tb[160];snprintf(tb,sizeof(tb),"empty completion; retried with thinking disabled (status %ld)",st2);vs_trace(c,"thinking-disabled-retry",tb);free(resp);resp=resp2;trace_anthropic_shape(c,resp,"provider-shape-retry");}}}
+        }else if(resp&&strstr(resp,"\"type\":\"text\""))c->thinking_retry_futile=0;
     }else{
         body=build_openai_body(c,sys,user,1);
         if(!body){free(endpoint);free(sys);return dupstr(vs_cancel_requested(c)?"Stopped by user.":"Request is too large or memory is exhausted; reduce attachments/context and retry.");}

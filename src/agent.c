@@ -518,9 +518,33 @@ static char *execute_tool(VSContext *c,const char *d,int *command_runner_confirm
 }
 
 static const char *earliest_directive(const char *s,int *is_mcp){const char *t=strstr(s,"[[VS_TOOL "),*m=strstr(s,"[[VS_MCP ");if(!t&&!m)return 0;if(m&&(!t||m<t)){*is_mcp=1;return m;}*is_mcp=0;return t;}
-static int directive_count(const char *s){int n=0,m;const char *p=s,*d,*e;while((d=earliest_directive(p,&m))!=0){e=strstr(d,"]]" );if(!e)break;n++;p=e+2;}return n;}
-static char *directive_signature(const char *s){const char *p=s,*d,*e;int m;size_t n=0;char *out;while((d=earliest_directive(p,&m))!=0){e=strstr(d,"]]" );if(!e)break;n+=(size_t)(e+2-d)+1;p=e+2;}if(!n)return dupstr("");out=(char*)malloc(n+1);if(!out)return 0;out[0]=0;p=s;while((d=earliest_directive(p,&m))!=0){size_t z;e=strstr(d,"]]" );if(!e)break;z=(size_t)(e+2-d);strncat(out,d,z);strcat(out,"\n");p=e+2;}return out;}
-static char *next_directive(const char **cursor,int *is_mcp){const char *d,*e;char *o;size_t n;if(!cursor||!*cursor)return 0;d=earliest_directive(*cursor,is_mcp);if(!d)return 0;e=strstr(d,"]]" );if(!e){*cursor=d+strlen(d);return 0;}n=(size_t)(e+2-d);o=(char*)malloc(n+1);if(!o)return 0;memcpy(o,d,n);o[n]=0;*cursor=e+2;return o;}
+static char *next_directive(const char **cursor,int *is_mcp);
+/* The model often MENTIONS a directive illustratively inside prose or
+   thinking ("then emit [[VS_TOOL read ...]]").  Such placeholders are not
+   actionable: treated as a directive they fail the whole batch with
+   'unknown operation "...]]"', which is exactly what the observed haiku
+   thinking loops degenerated into.  Recognize them by an operation token
+   containing "..." and skip them everywhere directives are scanned, so
+   they behave as the prose they are. */
+static int directive_op_placeholder(const char *d){
+    char op[32];const char *bp;size_t bi=0;int inq=0;
+    if(!d||strncmp(d,"[[VS_TOOL ",10))return 0;
+    bp=d+10;
+    while(bp[bi]&&bi<sizeof(op)-1&&!isspace((unsigned char)bp[bi])){op[bi]=bp[bi];bi++;}
+    op[bi]=0;
+    if(strstr(op,"..."))return 1;
+    /* A bare "..." OUTSIDE quoted values marks an illustrative mention
+       ("emit [[VS_TOOL read ...]]").  "..." inside a quoted value is real
+       content (e.g. cmd="mvn test ...") and stays executable. */
+    for(bp=d+10;bp[0]&&bp[1]&&bp[2];bp++){
+        if(*bp=='"'&&(bp==d+10||bp[-1]!='\\'))inq=!inq;
+        if(!inq&&bp[0]=='.'&&bp[1]=='.'&&bp[2]=='.')return 1;
+    }
+    return 0;
+}
+static int directive_count(const char *s){int n=0,m;const char *p=s;char *d;while((d=next_directive(&p,&m))!=0){n++;free(d);}return n;}
+static char *directive_signature(const char *s){const char *p=s;int m;size_t n=0;char *d,*out;while((d=next_directive(&p,&m))!=0){n+=strlen(d)+1;free(d);}if(!n)return dupstr("");out=(char*)malloc(n+1);if(!out)return 0;out[0]=0;p=s;while((d=next_directive(&p,&m))!=0){strcat(out,d);strcat(out,"\n");free(d);}return out;}
+static char *next_directive(const char **cursor,int *is_mcp){const char *d,*e;char *o;size_t n;if(!cursor||!*cursor)return 0;for(;;){d=earliest_directive(*cursor,is_mcp);if(!d)return 0;e=strstr(d,"]]" );if(!e){*cursor=d+strlen(d);return 0;}if(!*is_mcp&&directive_op_placeholder(d)){*cursor=e+2;continue;}break;}n=(size_t)(e+2-d);o=(char*)malloc(n+1);if(!o)return 0;memcpy(o,d,n);o[n]=0;*cursor=e+2;return o;}
 static int directive_known(const char *d,int is_mcp){
     static const char *ops[]={"read ","list ","search ","graph ","web_search ","web_fetch ","run ","write ","image ","subagent ","todo ","plan_task_complete ","computer_use_click ","computer_use_move ","computer_use_type ",
         "glob ","grep ","edit ","multi_edit ","notebook_read ","notebook_edit ","monitor ","monitor_output ","monitor_kill ",

@@ -6,7 +6,10 @@
       implementations instead of being rejected as unknown operations.
    2. A genuinely malformed batch (unknown op, truncated marker) no longer
       ends the agent turn: the model receives a precise ERROR and a re-emit
-      request, and the turn continues. */
+      request, and the turn continues.
+   3. An illustrative [[VS_TOOL ...]] placeholder mentioned inside prose is
+      skipped, not rejected as an unknown operation, and the real directives
+      in the same response still execute. */
 #include "vibesolaris.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,7 +20,7 @@
 static int chats=0,fails=0;
 static char root[512],file1[640],file2[640],filec[640];
 static int grep_seen=0,glob_seen=0,edit_seen=0,task_seen=0;
-static int recovery_unknown_seen=0,recovery_trunc_seen=0,recovery_badattr_seen=0,ask_seen=0;
+static int recovery_unknown_seen=0,recovery_trunc_seen=0,recovery_badattr_seen=0,ask_seen=0,placeholder_seen=0;
 
 #define CHECK(c,m) do{ if(!(c)){fprintf(stderr,"FAIL: %s\n",m);fails++;} else printf("ok: %s\n",m);}while(0)
 
@@ -54,6 +57,12 @@ char *vs_chat(VSContext*c,const char*prompt){
         return d("[[VS_TOOL ask_user_question task_id=\"1\" question=\"pick\" options=\"a|b\"]]");}
     if(chats==9){
         if(strstr(prompt,"VS_NEED_USER"))ask_seen=1;
+        /* an illustrative directive mention in prose ("[[VS_TOOL read ...]]")
+           must be skipped, not fail the batch; "..." inside a QUOTED value
+           (cmd="echo ...") must stay a real directive; the real read must run */
+        return d("Then I will emit [[VS_TOOL read ...]] like so, or run [[VS_TOOL run task_id=\"1\" cmd=\"echo ...\"]] instead.\n[[VS_TOOL read task_id=\"1\" path=\"definitely-missing-file.txt\"]]");}
+    if(chats==10){
+        if(strstr(prompt,"unable to read file")&&strstr(prompt,"directive 2")&&!strstr(prompt,"unknown operation"))placeholder_seen=1;
         return d("[[VS_FINAL]]extended tools ok");}
     return d("[[VS_FINAL]]unexpected");}
 
@@ -117,6 +126,7 @@ int main(void){
     CHECK(recovery_trunc_seen,"truncated marker produced the truncation recovery instead of ending the turn");
     CHECK(recovery_badattr_seen,"misspelled attribute produced a precise schema diagnostic instead of ending the turn");
     CHECK(ask_seen,"ask_user_question returned host guidance instead of killing the turn");
+    CHECK(placeholder_seen,"illustrative [[VS_TOOL ...]] mention was skipped while the real directive still ran");
 
     unlink(file1);unlink(file2);unlink(filec);rmdir(root);
     free(out);

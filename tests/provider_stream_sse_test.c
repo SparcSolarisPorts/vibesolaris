@@ -278,6 +278,24 @@ int main(void){
     if(out&&strstr(out,"native_tools")){fprintf(stderr,"FAIL: tools hint shown while native_tools is off\n");fails++;}
     else printf("ok: no tools hint when native_tools is already off\n");
     free(out);
+    /* A gateway that ignores the thinking-disabled retry stops being retried:
+       two consecutive futile retries set the flag, then one plain call suffices. */
+    setup(VS_PROVIDER_CUSTOM,VS_PROTOCOL_ANTHROPIC,"https://gateway.example.test/v1/messages");
+    recover_with_text=0;   /* the retry must also come back thinking-only */
+    snprintf(plain_response,sizeof(plain_response),"%s","{\"content\":[{\"type\":\"thinking\",\"thinking\":\"plan\"}],\"stop_reason\":\"end_turn\",\"usage\":{\"output_tokens\":7}}");
+    feed("");feed_slice=0;
+    out=vs_chat(&ctx,"hi");free(out);
+    if(ctx.thinking_disabled_ignored){fprintf(stderr,"FAIL: thinking-disabled retry disabled after a single futile retry\n");fails++;}
+    else printf("ok: one futile retry does not disable the retry path yet\n");
+    {int before=plain_calls;
+     out=vs_chat(&ctx,"hi");free(out);
+     if(!ctx.thinking_disabled_ignored){fprintf(stderr,"FAIL: two consecutive futile retries did not disable the retry\n");fails++;}
+     else printf("ok: two consecutive futile retries disable the thinking-disabled retry\n");
+     if(plain_calls-before!=2){fprintf(stderr,"FAIL: second round should still retry once (delta %d)\n",plain_calls-before);fails++;}
+     else printf("ok: the disabling round still used its final retry\n");
+     before=plain_calls;out=vs_chat(&ctx,"hi");free(out);
+     if(plain_calls-before!=1){fprintf(stderr,"FAIL: ignored gateway fired %d plain calls, want 1\n",plain_calls-before);fails++;}
+     else printf("ok: once ignored, an empty round costs one plain call, no retry\n");}
     snprintf(plain_response,sizeof(plain_response),"%s","{\"content\":[{\"type\":\"text\",\"text\":\"plain\"}]}");
 
     setup(VS_PROVIDER_CUSTOM,VS_PROTOCOL_OPENAI,"https://gateway.example.test/v1");

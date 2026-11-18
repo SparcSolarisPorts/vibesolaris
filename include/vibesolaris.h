@@ -1030,6 +1030,10 @@ typedef struct {
     int native_tools_enabled;   /* send the core directives as a native tools
                                    array to custom gateways; off = kill switch
                                    if a gateway mishandles it */
+    int thinking_disabled_ignored; /* the gateway returns thinking-only output
+                                   even with thinking disabled; skip the retry */
+    int thinking_retry_futile;     /* consecutive thinking-disabled retries
+                                   that still came back with no text */
     char cache_key[128];
     VSFileCacheEntry file_cache[VS_MAX_FILE_CACHE];
     int file_cache_count;
