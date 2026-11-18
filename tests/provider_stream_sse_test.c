@@ -12,7 +12,7 @@
 #include <string.h>
 
 /* ---------------- state owned by the streaming stub ---------------- */
-static char last_url[1024],last_body[16384],last_headers[4096];
+static char last_url[1024],last_body[65536],last_headers[4096];
 static char plain_response[8192]="{\"content\":[{\"type\":\"text\",\"text\":\"plain\"}]}";
 static int stream_calls=0,plain_calls=0;
 static int recover_with_text=1;          /* 0 => gateway ignores disabled-thinking */
@@ -209,6 +209,23 @@ int main(void){
     if(!strstr(last_headers,"Accept: text/event-stream")){fprintf(stderr,"FAIL: streaming request omits Accept: text/event-stream\n");fails++;}else printf("ok: streaming request asks for text/event-stream\n");
     if(!strstr(last_body,"\"stream\":true")){fprintf(stderr,"FAIL: streaming request body omits \"stream\":true\n");fails++;}else printf("ok: streaming request body sets \"stream\":true\n");
     if(strcmp(last_url,"https://gateway.example.test/v1/messages")!=0){fprintf(stderr,"FAIL: streaming endpoint was %s\n",last_url);fails++;}else printf("ok: streaming request targets the Anthropic messages endpoint\n");
+    if(!strstr(last_body,"\"tools\":[")||!strstr(last_body,"\"name\":\"subagent\"")||!strstr(last_body,"\"name\":\"read\"")){fprintf(stderr,"FAIL: custom Anthropic request lacks the native tools array\n");fails++;}
+    else printf("ok: custom Anthropic requests expose the core directive set as native tools\n");
+    if(!strstr(last_body,"true}}],\"system\"")){fprintf(stderr,"FAIL: native tools array is not balanced before the system field\n");fails++;}
+    else printf("ok: native tools array is balanced and well-formed\n");
+
+    /* First-party Anthropic and non-Anthropic protocols stay text-only. */
+    setup(VS_PROVIDER_CLAUDE,VS_PROTOCOL_ANTHROPIC,"https://api.anthropic.com/v1/messages");
+    snprintf(ctx.provider.api_key,sizeof(ctx.provider.api_key),"%s","sk-test-key");
+    feed(ANTHROPIC_SSE);feed_slice=1;
+    out=vs_chat(&ctx,"hi");free(out);
+    if(strstr(last_body,"\"tools\":[")){fprintf(stderr,"FAIL: first-party Anthropic request unexpectedly carries a tools array\n");fails++;}
+    else printf("ok: first-party Anthropic stays on the text-marker protocol\n");
+    setup(VS_PROVIDER_CUSTOM,VS_PROTOCOL_OPENAI,"https://gateway.example.test/v1");
+    feed(OPENAI_SSE);feed_slice=1;
+    out=vs_chat(&ctx,"hi");free(out);
+    if(strstr(last_body,"\"tools\":[")){fprintf(stderr,"FAIL: OpenAI-protocol request unexpectedly carries an Anthropic tools array\n");fails++;}
+    else printf("ok: OpenAI-protocol requests are unaffected\n");
 
     setup(VS_PROVIDER_CUSTOM,VS_PROTOCOL_OPENAI,"https://gateway.example.test/v1");
     feed(OPENAI_SSE);feed_slice=1;

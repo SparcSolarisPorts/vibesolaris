@@ -540,8 +540,13 @@ char *vs_build_system_prompt(const VSContext *c){
     const char *solaris=
         "SOLARIS POLICY: This host is SunOS/Solaris. Treat command-line utilities as Solaris/POSIX unless GNU behavior has been explicitly verified. Do not assume GNU-only options such as grep -P, sed -i/-r, find -printf, stat -c, readlink -f, date -d, xargs -r, or Linux-only commands such as systemctl, ip, apt, dnf, free, or nproc. Prefer VibeSolaris read/list/search whenever they can replace those utilities. For shell work use POSIX syntax; /usr/xpg4/bin/sh is preferred when available, /usr/xpg4/bin/grep supports -E/-F, and /usr/xpg4/bin/awk or nawk is preferable to old /usr/bin/awk. Solaris administration commonly uses svcs/svcadm, ipadm/dladm/netstat, pkg, psrinfo/isainfo/prtconf, pfiles/pargs/pldd, truss, and elfdump. Use Solaris make unless the project truly requires GNU make; probe gmake or /usr/gnu/bin before relying on GNU extensions.\n";
     const char *platform=(!strcmp(c->os_name,"SunOS")||strstr(c->os_name,"Solaris"))?solaris:"";
-    const char *subdoc=(c->subagent_depth<VS_MAX_SUBAGENT_DEPTH&&c->subagent_serial<VS_MAX_SUBAGENTS_PER_TURN)?
-        "SUBAGENTS: [[VS_TOOL subagent task=\"COMPLETE SELF-CONTAINED TASK\"]] starts an agent with a separate context and the same tools and returns its report as SUBAGENT_RESULT. The subagent automatically receives a bounded digest of the recent conversation and your open TODOs, but not the full transcript; still give it the full task text, because it cannot see anything outside the digest. For substantive work, proactively identify independent investigations, test analysis or reviews to delegate in parallel, even when you could perform each yourself. Give each a bounded complete task and incorporate and verify its results. After plan acceptance, batch multiple subagent directives alone with the same ready task_id to run them concurrently; manual mode permits only one directive per approval. Subagents have separate contexts but may share the filesystem: avoid overlapping concurrent writes and do not assume worktree isolation. Avoid delegation overhead for trivial work.\n\n":"";
+    /* Always advertised (never hidden when a per-turn limit is near): the
+       tool itself reports limit errors, and models delegate far more
+       reliably when the capability stays visible.  Concrete triggers mirror
+       what Claude Code's harness teaches: fan-out inspection and review work
+       go to subagents in parallel batches, trivial lookups do not. */
+    const char *subdoc=
+        "SUBAGENTS: [[VS_TOOL subagent task=\"COMPLETE SELF-CONTAINED TASK\"]] (also exposed to tool-aware providers as the native 'subagent' tool) starts an agent with a separate context and the same tools and returns its report as SUBAGENT_RESULT. The subagent automatically receives a bounded digest of the recent conversation and your open TODOs, but not the full transcript; still give it the full task text, because it cannot see anything outside the digest. DELEGATE, DO NOT SERIALIZE, when any trigger matches: (1) two or more independent investigations across different files, packages, or questions — launch them as parallel subagents in ONE batch instead of reading everything yourself step by step; (2) any review, audit, test-analysis, or 'check whether X' request — delegate it; (3) multi-part research whose result fits in a short report. Give each subagent a bounded, complete, verifiable task and incorporate and verify its results. After plan acceptance, batch multiple subagent directives alone with the same ready task_id to run them concurrently; manual mode permits only one directive per approval. Subagents have separate contexts but may share the filesystem: avoid overlapping concurrent writes and do not assume worktree isolation. Do NOT delegate trivial single-lookup work — a direct read is cheaper.\n\n";
     /* Build skills fragment from loaded inline skills */
     char skills_frag[2048];skills_frag[0]=0;
     if(c->skill_count>0){
@@ -652,6 +657,38 @@ static char *build_claude_body(VSContext *c,const char *sys,const char *user,int
        disabled retry recovers those; providers without the problem never
        send thinking-only completions, so this field stays unset for them. */
     if(no_thinking)badd(&b,",\"thinking\":{\"type\":\"disabled\"}");
+    /* Custom gateways: expose the core directive set as NATIVE tools so
+       tool-trained models get a first-class affordance for calling them
+       (Claude Code's harness does this, which is why it delegates far more
+       reliably on the same model).  Native tool_use blocks in responses are
+       converted back into [[VS_TOOL ...]] directives by the extraction layer,
+       so the text-marker protocol keeps working unchanged.  First-party
+       Anthropic is left on the text protocol for now. */
+    if(c->provider.kind==VS_PROVIDER_CUSTOM){
+        static const char *native_tools=
+            "{\"name\":\"read\",\"description\":\"Read a file. Attributes: path, start_line, max_lines.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
+            "{\"name\":\"list\",\"description\":\"List a directory tree. Attributes: path, depth, limit.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
+            "{\"name\":\"search\",\"description\":\"Literal text search under a path. Attributes: path, query, limit, case_insensitive.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
+            "{\"name\":\"glob\",\"description\":\"Find files by pattern. Attributes: path, pattern.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
+            "{\"name\":\"grep\",\"description\":\"Regex search under a path. Attributes: path, pattern, context, limit, case_insensitive.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
+            "{\"name\":\"run\",\"description\":\"Run a shell command and return its output. Attributes: task_id, cmd.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
+            "{\"name\":\"write\",\"description\":\"Write a file. Attributes: task_id, path, content (use \\n escapes for newlines, \\\" for quotes).\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
+            "{\"name\":\"edit\",\"description\":\"Exact-string replacement in a file. Attributes: task_id, path, search, replace.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
+            "{\"name\":\"multi_edit\",\"description\":\"Several exact replacements in one call. Attributes: task_id, path, edits (search|replace;...).\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
+            "{\"name\":\"subagent\",\"description\":\"Launch a subagent with its own context and the same tools; returns SUBAGENT_RESULT. Give it a complete self-contained task. Attributes: task_id, task.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
+            "{\"name\":\"todo\",\"description\":\"Track subtasks. Attributes: task_id, items (a|b|c) or index plus status.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
+            "{\"name\":\"plan_task_complete\",\"description\":\"Mark an accepted plan task complete with a summary. Attributes: task_id, summary.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
+            "{\"name\":\"monitor\",\"description\":\"Run a background command. Attributes: task_id, cmd.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
+            "{\"name\":\"monitor_output\",\"description\":\"Read a background command's recent output. Attributes: task_id, monitor_id.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
+            "{\"name\":\"monitor_kill\",\"description\":\"Stop a background command. Attributes: task_id, monitor_id.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
+            "{\"name\":\"web_search\",\"description\":\"Search the web. Attributes: query, count.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
+            "{\"name\":\"web_fetch\",\"description\":\"Fetch a URL as text. Attributes: url, max_chars.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
+            "{\"name\":\"graph\",\"description\":\"Build a code graph of files or fields. Attributes: mode, path.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
+            "{\"name\":\"notebook_read\",\"description\":\"Read a notebook. Attributes: path.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
+            "{\"name\":\"checkpoint\",\"description\":\"Save/restore working state. Attributes: action.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}},"
+            "{\"name\":\"task_list\",\"description\":\"List tasks. No attributes.\",\"input_schema\":{\"type\":\"object\",\"additionalProperties\":true}}";
+        badd(&b,",\"tools\":[");badd(&b,native_tools);badd(&b,"]");
+    }
     badd(&b,",\"system\":[{\"type\":\"text\",\"text\":");bquoted(&b,sys);if(c->cache_enabled)badd(&b,",\"cache_control\":{\"type\":\"ephemeral\"}");badd(&b,"}],\"messages\":[");
     {int total_hist=c->history_count+c->agent_history_count,hist_idx=0;
     for(i=0;i<c->history_count;i++){if(vs_cancel_requested(c)){free(b.p);return NULL;}if(!first)badd(&b,",");first=0;hist_idx++;badd(&b,"{\"role\":");bquoted(&b,!strcmp(c->history[i].role,"assistant")?"assistant":"user");if(c->cache_enabled&&hist_idx==total_hist){badd(&b,",\"content\":[{\"type\":\"text\",\"text\":");bquoted(&b,c->history[i].content);badd(&b,",\"cache_control\":{\"type\":\"ephemeral\"}}]}");}else{badd(&b,",\"content\":");bquoted(&b,c->history[i].content);badd(&b,"}");}}
