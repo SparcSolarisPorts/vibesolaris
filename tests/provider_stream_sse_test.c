@@ -246,6 +246,40 @@ int main(void){
     if(strstr(last_body,"\"tools\":[")||strstr(last_body,"\"tool_choice\"")){fprintf(stderr,"FAIL: disabled native_tools still emits a tools array (OpenAI)\n");fails++;}
     else printf("ok: native_tools off removes the tools array (OpenAI)\n");
 
+    /* A gateway rejection naming the tools array points at the kill switch. */
+    setup(VS_PROVIDER_CUSTOM,VS_PROTOCOL_ANTHROPIC,"https://gateway.example.test/v1/messages");
+    snprintf(plain_response,sizeof(plain_response),"%s","{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\" message\":\"Unknown field: tools\"}}");
+    feed("");feed_slice=0;
+    out=vs_chat(&ctx,"hi");
+    if(!out||!strstr(out,"native_tools")){fprintf(stderr,"FAIL: tools-rejection hint missing (Anthropic), got [%s]\n",out?out:"(null)");fails++;}
+    else printf("ok: tools-rejection error points at the native_tools kill switch (Anthropic)\n");
+    free(out);
+    setup(VS_PROVIDER_CUSTOM,VS_PROTOCOL_OPENAI,"https://gateway.example.test/v1");
+    snprintf(plain_response,sizeof(plain_response),"%s","{\"error\":{\"type\":\"invalid_request_error\",\"param\":\"tools\",\" message\":\"Unknown parameter: tools\"}}");
+    feed("");feed_slice=0;
+    out=vs_chat(&ctx,"hi");
+    if(!out||!strstr(out,"native_tools")){fprintf(stderr,"FAIL: tools-rejection hint missing (OpenAI), got [%s]\n",out?out:"(null)");fails++;}
+    else printf("ok: tools-rejection error points at the native_tools kill switch (OpenAI)\n");
+    free(out);
+    /* Errors unrelated to tools must not get the hint. */
+    setup(VS_PROVIDER_CUSTOM,VS_PROTOCOL_ANTHROPIC,"https://gateway.example.test/v1/messages");
+    snprintf(plain_response,sizeof(plain_response),"%s","{\"type\":\"error\",\"error\":{\"type\":\"overloaded\",\" message\":\"Overloaded\"}}");
+    feed("");feed_slice=0;
+    out=vs_chat(&ctx,"hi");
+    if(out&&strstr(out,"native_tools")){fprintf(stderr,"FAIL: unrelated provider error got the tools hint: [%s]\n",out);fails++;}
+    else printf("ok: errors unrelated to tools get no hint\n");
+    free(out);
+    /* And with the toggle off, even a tools-named error gets no hint. */
+    setup(VS_PROVIDER_CUSTOM,VS_PROTOCOL_ANTHROPIC,"https://gateway.example.test/v1/messages");
+    ctx.native_tools_enabled=0;
+    snprintf(plain_response,sizeof(plain_response),"%s","{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\" message\":\"Unknown field: tools\"}}");
+    feed("");feed_slice=0;
+    out=vs_chat(&ctx,"hi");
+    if(out&&strstr(out,"native_tools")){fprintf(stderr,"FAIL: tools hint shown while native_tools is off\n");fails++;}
+    else printf("ok: no tools hint when native_tools is already off\n");
+    free(out);
+    snprintf(plain_response,sizeof(plain_response),"%s","{\"content\":[{\"type\":\"text\",\"text\":\"plain\"}]}");
+
     setup(VS_PROVIDER_CUSTOM,VS_PROTOCOL_OPENAI,"https://gateway.example.test/v1");
     feed(OPENAI_SSE);feed_slice=1;
     out=vs_chat(&ctx,"hi");free(out);

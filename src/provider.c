@@ -991,6 +991,36 @@ static void trace_anthropic_shape(VSContext *c,const char *resp,const char *tag)
      vs_trace(c,tag,sb);}
     free(sr);
 }
+/* Gateways that do not support the native tools array reject the request,
+   typically a 400 whose error body names the tools/tool_choice field.
+   Detect that shape and append a pointer to the native_tools kill switch,
+   so both the user and the model see how to recover in one step. */
+static int mentions_tools_ci(const char *s){
+    const char *needle="tool";
+    if(!s)return 0;
+    for(;*s;s++){
+        size_t i;
+        for(i=0;needle[i];i++){
+            unsigned char a=(unsigned char)s[i];
+            if(!a)return 0;
+            if(tolower(a)!=(unsigned char)needle[i])break;
+        }
+        if(!needle[i])return 1;
+    }
+    return 0;
+}
+static void maybe_hint_native_tools_rejection(VSContext *c,const char *resp,char **out){
+    VSBuf b;
+    if(!c||!c->native_tools_enabled||!resp||!out||!*out||!**out)return;
+    if(!strstr(resp,"\"error\""))return;
+    if(!mentions_tools_ci(resp))return;
+    vs_trace(c,"native-tools-rejected","gateway rejected the request's native tools array; recovery: /native_tools off or native_tools=0, then retry");
+    if(binit(&b,256)!=0)return;
+    badd(&b,*out);
+    badd(&b,"\n\n(Hint: the provider rejected the request's native tools array. Kill switch: \"/native_tools off\" or native_tools=0 in the config, then retry.)");
+    {char *n=bfinish(NULL,&b);if(n){free(*out);*out=n;}}
+}
+
 static char *vs_chat_impl(VSContext *c,const char *user){
     char *sys=vs_build_system_prompt(c),*body,*resp,*out,*u,*endpoint;
     const char *h[5];
@@ -1093,6 +1123,7 @@ static char *vs_chat_impl(VSContext *c,const char *user){
     free(endpoint);free(body);free(sys);
     if(!resp)return dupstr(vs_cancel_requested(c)?"Stopped by user.":"HTTP request failed");
     capture_usage(c,resp);out=c->provider.protocol==VS_PROTOCOL_ANTHROPIC?extract_anthropic_answer(c,resp):extract_openai_answer(c,resp);
+    maybe_hint_native_tools_rejection(c,resp,&out);
     if(out&&*out){const char *q=out;while(*q==' '||*q=='\t'||*q=='\n'||*q=='\r')q++;if(!*q){free(out);out=NULL;}}
     if(!out||!*out){free(out);vs_trace(c,"stream-empty","provider returned an empty completion (no text content); check the model/gateway configuration if this repeats");out=dupstr("The provider returned an empty response with no text content. If this repeats, check the model and gateway configuration.");return out;}
     trace_output_reasoning(c,resp,out);free(resp);return out;
