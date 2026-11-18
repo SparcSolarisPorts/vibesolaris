@@ -1027,6 +1027,9 @@ typedef struct {
     int config_loading;
 
     int cache_enabled;
+    int native_tools_enabled;   /* send the core directives as a native tools
+                                   array to custom gateways; off = kill switch
+                                   if a gateway mishandles it */
     char cache_key[128];
     VSFileCacheEntry file_cache[VS_MAX_FILE_CACHE];
     int file_cache_count;

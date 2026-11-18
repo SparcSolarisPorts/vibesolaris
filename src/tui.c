@@ -917,6 +917,7 @@ static void cache_status(const VSContext *c)
 {
     cprintf(T_BOLD T_BLUE,"Cache status\n");
     printf("  cache=%s\n",c->cache_enabled ? "on" : "off");
+    printf("  native_tools=%s\n",c->native_tools_enabled ? "on" : "off");
     printf("  key=%s\n",c->cache_key);
     printf("  local_hits=%lu  local_misses=%lu\n",c->file_cache_hits,c->file_cache_misses);
     printf("  provider_cached_tokens=%ld  provider_cache_write_tokens=%ld\n",c->provider_cached_tokens,c->provider_cache_write_tokens);
@@ -1002,7 +1003,7 @@ static void show_banner(const VSContext *c)
 {
     cprintf(T_BOLD T_CYAN,"VibeSolaris %s TUI\n",VS_VERSION);
     cprintf(T_DIM,"  %s %s / %s\n",c->os_name,c->os_release,c->arch);
-    cprintf(T_BLUE,"  provider=%s  model=%s  protocol=%s  cache=%s\n",c->provider.name,c->provider.model,vs_protocol_name(c->provider.protocol),c->cache_enabled?"on":"off");
+    cprintf(T_BLUE,"  provider=%s  model=%s  protocol=%s  cache=%s  native_tools=%s\n",c->provider.name,c->provider.model,vs_protocol_name(c->provider.protocol),c->cache_enabled?"on":"off",c->native_tools_enabled?"on":"off");
     cprintf(T_DIM,"  Type / for a command dropdown (/help lists all). Tab completes; long output is compacted on screen.\n");
     cprintf(T_DIM,"  Enter sends · Ctrl+J newline · paste multiline text · /paste-image (macOS clipboard).\n");
 }
@@ -1178,6 +1179,12 @@ int main(int argc, char **argv)
             vs_cache_clear(&c);successf("local cache and cache statistics cleared\n");
         } else if (!strcmp(line, "/cache") || !strcmp(line, "/cache status")) {
             cache_status(&c);
+        } else if (!strcmp(line, "/native_tools on")) {
+            c.native_tools_enabled=1;(void)vs_persist_settings(&c);successf("native tools enabled (custom gateways receive the directive set as a native tools array)\n");
+        } else if (!strcmp(line, "/native_tools off")) {
+            c.native_tools_enabled=0;(void)vs_persist_settings(&c);warnf("native tools disabled (kill switch; text-marker protocol only)\n");
+        } else if (!strcmp(line, "/native_tools") || !strcmp(line, "/native_tools status")) {
+            printf("native_tools=%s (native tools array sent to custom gateways: %s)\n",c.native_tools_enabled?"on":"off",c.native_tools_enabled?"on":"off");
         } else if (!strcmp(line, "/history clear")) {
             vs_history_clear(&c);successf("conversation history cleared\n");
         } else if (!strcmp(line, "/history") || !strcmp(line, "/history status")) {

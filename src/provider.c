@@ -694,7 +694,7 @@ static char *build_openai_body(VSContext *c,const char *sys,const char *user,int
         else {t=vs_cached_read_file(c,c->attachments[i].path);if(t){t=bounded_attachment(c,t,c->attachments[i].path);if(!t)continue;e=vs_json_escape(t);badd(&b,",{\"type\":\"text\",\"text\":\"Attached file: ");x=vs_json_escape(c->attachments[i].path);badd(&b,x);free(x);badd(&b,"\\n");badd(&b,e);badd(&b,"\"}");free(e);free(t);}}
     }
     badd(&b,"]}]");
-    if(c->provider.kind==VS_PROVIDER_CUSTOM)add_native_tools_openai(&b);
+    if(c->provider.kind==VS_PROVIDER_CUSTOM&&c->native_tools_enabled)add_native_tools_openai(&b);
     if(streaming){badd(&b,",\"stream\":true");if(c->provider.kind==VS_PROVIDER_OPENAI)badd(&b,",\"stream_options\":{\"include_usage\":true}");}
     if(c->cache_enabled && !is_claude_model(c->provider.model)){badd(&b,",\"prompt_cache_key\":");bquoted(&b,c->cache_key);if(openai_ext_cache(c,c->provider.model))badd(&b,",\"prompt_cache_options\":{\"mode\":\"implicit\",\"ttl\":\"30m\"}");}
     /* Effort level — OpenAI-compatible providers that support output_config
@@ -721,7 +721,7 @@ static char *build_claude_body(VSContext *c,const char *sys,const char *user,int
        (Claude Code's harness does this, which is why it delegates far more
        reliably on the same model).  First-party Anthropic is left on the
        text protocol for now. */
-    if(c->provider.kind==VS_PROVIDER_CUSTOM)add_native_tools_anthropic(&b);
+    if(c->provider.kind==VS_PROVIDER_CUSTOM&&c->native_tools_enabled)add_native_tools_anthropic(&b);
     badd(&b,",\"system\":[{\"type\":\"text\",\"text\":");bquoted(&b,sys);if(c->cache_enabled)badd(&b,",\"cache_control\":{\"type\":\"ephemeral\"}");badd(&b,"}],\"messages\":[");
     {int total_hist=c->history_count+c->agent_history_count,hist_idx=0;
     for(i=0;i<c->history_count;i++){if(vs_cancel_requested(c)){free(b.p);return NULL;}if(!first)badd(&b,",");first=0;hist_idx++;badd(&b,"{\"role\":");bquoted(&b,!strcmp(c->history[i].role,"assistant")?"assistant":"user");if(c->cache_enabled&&hist_idx==total_hist){badd(&b,",\"content\":[{\"type\":\"text\",\"text\":");bquoted(&b,c->history[i].content);badd(&b,",\"cache_control\":{\"type\":\"ephemeral\"}}]}");}else{badd(&b,",\"content\":");bquoted(&b,c->history[i].content);badd(&b,"}");}}

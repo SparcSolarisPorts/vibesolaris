@@ -97,6 +97,7 @@ static void setup(VSProviderKind kind,VSProtocolKind protocol,const char *base){
     snprintf(plain_response,sizeof(plain_response),"%s","{\"content\":[{\"type\":\"text\",\"text\":\"plain\"}]}");
     emitted_len=0;emitted[0]=0;
     ctx.stream_callback=collect_stream;ctx.stream_callback_data=NULL;
+    ctx.native_tools_enabled=1;   /* runtime default; tests may override */
 }
 static void feed(const char *sse){feed_sse=sse;feed_len=strlen(sse);}
 
@@ -230,6 +231,20 @@ int main(void){
     else printf("ok: OpenAI-protocol tools use the function shape, not input_schema\n");
     if(!strstr(last_body,"true}}}],\"tool_choice\"")){fprintf(stderr,"FAIL: native function tools array is not balanced before tool_choice\n");fails++;}
     else printf("ok: native function tools array is balanced and well-formed\n");
+
+    /* The kill switch removes the tools array on both protocols. */
+    setup(VS_PROVIDER_CUSTOM,VS_PROTOCOL_ANTHROPIC,"https://gateway.example.test/v1/messages");
+    ctx.native_tools_enabled=0;
+    feed(ANTHROPIC_SSE);feed_slice=1;
+    out=vs_chat(&ctx,"hi");free(out);
+    if(strstr(last_body,"\"tools\":[")){fprintf(stderr,"FAIL: disabled native_tools still emits a tools array (Anthropic)\n");fails++;}
+    else printf("ok: native_tools off removes the tools array (Anthropic)\n");
+    setup(VS_PROVIDER_CUSTOM,VS_PROTOCOL_OPENAI,"https://gateway.example.test/v1");
+    ctx.native_tools_enabled=0;
+    feed(OPENAI_SSE);feed_slice=1;
+    out=vs_chat(&ctx,"hi");free(out);
+    if(strstr(last_body,"\"tools\":[")||strstr(last_body,"\"tool_choice\"")){fprintf(stderr,"FAIL: disabled native_tools still emits a tools array (OpenAI)\n");fails++;}
+    else printf("ok: native_tools off removes the tools array (OpenAI)\n");
 
     setup(VS_PROVIDER_CUSTOM,VS_PROTOCOL_OPENAI,"https://gateway.example.test/v1");
     feed(OPENAI_SSE);feed_slice=1;

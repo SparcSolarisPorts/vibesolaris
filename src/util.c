@@ -57,6 +57,7 @@ void vs_init(VSContext *ctx) {
     vs_detect_platform(ctx);
     vs_set_provider(ctx,"openai");
     ctx->cache_enabled=1;
+    ctx->native_tools_enabled=1;
     vs_oauth_defaults(ctx);
     {
         char global_err[256];
